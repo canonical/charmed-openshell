@@ -1,0 +1,76 @@
+name: openshell-gateway
+base: ubuntu@26.04
+build-base: ubuntu@26.04
+version: git
+summary: OpenShell gateway and LXD compute driver
+description: |
+  OCI rock bundling openshell-gateway (from NVIDIA/OpenShell) and
+  openshell-driver-lxd (from canonical/openshell-driver-lxd) under
+  Pebble. Built from pinned upstream revisions for amd64 and arm64.
+  Runs non-root by default (UID 584792). No baked Pebble service
+  layer — the charm supplies the authoritative runtime configuration.
+license: Apache-2.0
+
+platforms:
+  amd64:
+  arm64:
+
+run-user: _daemon_
+
+parts:
+  gateway:
+    plugin: rust
+    # Pinned to NVIDIA/OpenShell@a72711697ddd0c81878f45922d5708bdbff8bb25 (2026-07-07)
+    # The openshell-gateway binary is produced by the openshell-server crate.
+    source: https://github.com/NVIDIA/OpenShell.git
+    source-commit: a72711697ddd0c81878f45922d5708bdbff8bb25
+    source-subdir: crates/openshell-server
+    build-packages:
+      - pkg-config
+      - libssl-dev
+      - protobuf-compiler
+      - libprotobuf-dev
+      - libclang-dev
+      - cmake
+      - build-essential
+      - clang
+      - libz3-dev
+
+  driver-lxd:
+    plugin: rust
+    # Pinned to canonical/openshell-driver-lxd@e24758bdc957c80d1029a680a508e5327b34f272 (2026-07-03)
+    source: https://github.com/canonical/openshell-driver-lxd.git
+    source-commit: e24758bdc957c80d1029a680a508e5327b34f272
+    source-subdir: crates/openshell-driver-lxd
+    build-packages:
+      - pkg-config
+      - libssl-dev
+      - protobuf-compiler
+      - libprotobuf-dev
+      - cmake
+
+  runtime-deps:
+    plugin: nil
+    stage-packages:
+      - ca-certificates
+      - iproute2
+      # libssl3t64: runtime OpenSSL shared library required if either Rust binary
+      # links openssl-sys dynamically (the default when libssl-dev is a build dep).
+      # Included defensively; pure-Rust TLS (rustls/ring) would not need it, but
+      # its presence is harmless and avoids a "libssl.so.3: cannot open" failure.
+      - libssl3t64
+
+  config:
+    plugin: nil
+    after:
+      - gateway
+      - driver-lxd
+      - runtime-deps
+    override-build: |
+      craftctl default
+      install -d -m 0755 "${CRAFT_PART_INSTALL}/var/run/openshell"
+    permissions:
+      - path: var/run/openshell
+        owner: 584792
+        group: 584792
+        mode: "0755"
