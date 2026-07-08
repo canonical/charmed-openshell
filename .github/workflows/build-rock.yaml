@@ -13,6 +13,10 @@ on:
       - .github/workflows/build-rock.yaml
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Pack (${{ matrix.arch }})
