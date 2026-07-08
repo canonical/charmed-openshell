@@ -33,7 +33,7 @@ jobs:
       - name: Pack rock
         uses: canonical/craft-actions/rockcraft-pack@adff67a3dc8de1b95de1d25728bf83506ab701b2
         with:
-          working-directory: rocks/openshell-gateway
+          path: rocks/openshell-gateway
 
       - name: Run smoke tests
         run: rocks/openshell-gateway/tests/smoke.sh
