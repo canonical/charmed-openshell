@@ -52,6 +52,7 @@ parts:
       - ca-certificates
       - iproute2
       - libssl3t64
+      - libz3-4
 
   config:
     plugin: nil
