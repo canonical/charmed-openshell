@@ -20,8 +20,6 @@ run-user: _daemon_
 parts:
   gateway:
     plugin: rust
-    # Pinned to NVIDIA/OpenShell@a72711697ddd0c81878f45922d5708bdbff8bb25 (2026-07-07)
-    # The openshell-gateway binary is produced by the openshell-server crate.
     source: https://github.com/NVIDIA/OpenShell.git
     source-commit: a72711697ddd0c81878f45922d5708bdbff8bb25
     source-subdir: crates/openshell-server
@@ -38,7 +36,6 @@ parts:
 
   driver-lxd:
     plugin: rust
-    # Pinned to canonical/openshell-driver-lxd@e24758bdc957c80d1029a680a508e5327b34f272 (2026-07-03)
     source: https://github.com/canonical/openshell-driver-lxd.git
     source-commit: e24758bdc957c80d1029a680a508e5327b34f272
     source-subdir: crates/openshell-driver-lxd
@@ -54,10 +51,6 @@ parts:
     stage-packages:
       - ca-certificates
       - iproute2
-      # libssl3t64: runtime OpenSSL shared library required if either Rust binary
-      # links openssl-sys dynamically (the default when libssl-dev is a build dep).
-      # Included defensively; pure-Rust TLS (rustls/ring) would not need it, but
-      # its presence is harmless and avoids a "libssl.so.3: cannot open" failure.
       - libssl3t64
 
   config:
