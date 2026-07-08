@@ -51,6 +51,7 @@ jobs:
     name: Assemble multi-arch manifest
     needs: build
     runs-on: ubuntu-26.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout
@@ -74,13 +75,11 @@ jobs:
           sudo apt-get install -y skopeo
 
       - name: Log in to GHCR
-        if: github.ref == 'refs/heads/main'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push arch-specific images and assemble manifest
-        if: github.ref == 'refs/heads/main'
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/openshell-gateway"
           SHA="${{ github.sha }}"
@@ -103,7 +102,6 @@ jobs:
           docker manifest push "${IMAGE}:${SHA}"
 
       - name: Verify multi-arch manifest
-        if: github.ref == 'refs/heads/main'
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/openshell-gateway"
           SHA="${{ github.sha }}"
