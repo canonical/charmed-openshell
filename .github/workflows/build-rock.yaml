@@ -114,8 +114,8 @@ jobs:
           IMAGE="ghcr.io/${{ github.repository_owner }}/openshell-gateway"
           SHA="${{ github.sha }}"
           MANIFEST=$(docker manifest inspect "${IMAGE}:${SHA}")
-          echo "$MANIFEST" | grep -q '"architecture":"amd64"' \
+          echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"amd64"' \
             || (echo "ERROR: amd64 missing from manifest" && exit 1)
-          echo "$MANIFEST" | grep -q '"architecture":"arm64"' \
+          echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"arm64"' \
             || (echo "ERROR: arm64 missing from manifest" && exit 1)
           echo "Multi-arch manifest OK: both linux/amd64 and linux/arm64 present."
