@@ -92,16 +92,19 @@ jobs:
           IMAGE="ghcr.io/${{ github.repository_owner }}/openshell-gateway"
           SHA="${{ github.sha }}"
 
-          AMD64_ROCK=$(ls dist/amd64/*.rock | head -1)
-          ARM64_ROCK=$(ls dist/arm64/*.rock | head -1)
+          for ARCH in amd64 arm64; do
+            ROCK=$(ls dist/${ARCH}/*.rock | head -1)
+            skopeo copy \
+              "oci-archive:${ROCK}" \
+              "docker://${IMAGE}:${SHA}-${ARCH}"
+            skopeo copy \
+              "docker://${IMAGE}:${SHA}-${ARCH}" \
+              "docker://${IMAGE}:latest-${ARCH}"
+          done
 
           skopeo copy \
-            "oci-archive:${AMD64_ROCK}" \
-            "docker://${IMAGE}:${SHA}-amd64"
-
-          skopeo copy \
-            "oci-archive:${ARM64_ROCK}" \
-            "docker://${IMAGE}:${SHA}-arm64"
+            "docker://${IMAGE}:latest-amd64" \
+            "docker://${IMAGE}:latest"
 
           docker manifest create "${IMAGE}:${SHA}" \
             "${IMAGE}:${SHA}-amd64" \
