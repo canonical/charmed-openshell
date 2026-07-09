@@ -1,0 +1,65 @@
+name: openshell-gateway-k8s
+type: charm
+title: OpenShell Gateway K8s
+summary: Sidecar ops charm for the OpenShell gateway on Kubernetes.
+description: |
+  Deploys and manages the OpenShell gateway as a sidecar workload on Kubernetes.
+  Enforces RBAC-required-by-default: both oidc-admin-role and oidc-user-role must
+  be configured before the charm becomes active. TLS is always on; unauthenticated
+  access is never expressible.
+
+assumes:
+  - k8s-api
+  - juju >= 3.4
+
+base: ubuntu@24.04
+platforms:
+  ubuntu-24.04-amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+  ubuntu-24.04-arm64:
+    build-on: [arm64]
+    build-for: [arm64]
+
+parts:
+  charm:
+    plugin: charm
+    charm-requirements:
+      - requirements.txt
+
+resources:
+  gateway-image:
+    type: oci-image
+    description: OCI image for the OpenShell gateway workload (FD-001 rock).
+    # Placeholder tag; replace with the real ref once FD-001 publishes the rock.
+    upstream-source: ghcr.io/canonical/openshell-gateway:latest
+
+config:
+  options:
+    external-hostname:
+      type: string
+      description: >
+        External hostname advertised by the gateway. Leave unset to use the
+        default in-cluster address.
+    oidc-audience:
+      type: string
+      default: openshell-cli
+      description: Expected OIDC audience claim value.
+    oidc-roles-claim:
+      type: string
+      default: groups
+      description: OIDC token claim that carries role membership.
+    oidc-admin-role:
+      type: string
+      description: >
+        OIDC role value that grants admin access. Must be set together with
+        oidc-user-role (RBAC required by default).
+    oidc-user-role:
+      type: string
+      description: >
+        OIDC role value that grants regular user access. Must be set together
+        with oidc-admin-role (RBAC required by default).
+    log-level:
+      type: string
+      default: info
+      description: "Log verbosity level. One of: debug, info, warn, error."

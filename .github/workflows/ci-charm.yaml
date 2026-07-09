@@ -1,0 +1,73 @@
+name: CI (charm)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - charms/openshell-gateway-k8s/**
+      - .github/workflows/ci-charm.yaml
+  pull_request:
+    paths:
+      - charms/openshell-gateway-k8s/**
+      - .github/workflows/ci-charm.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run lint
+        run: |
+          tox -e lint
+        working-directory: charms/openshell-gateway-k8s
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run unit tests
+        run: |
+          tox -e unit
+        working-directory: charms/openshell-gateway-k8s
+
+  static:
+    name: Static type checks
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run static checks
+        run: |
+          tox -e static
+        working-directory: charms/openshell-gateway-k8s

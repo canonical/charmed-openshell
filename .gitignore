@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+
+# Test & coverage
+.coverage
+.tox/
+.pytest_cache/
+htmlcov/
+
+# Charm build artefacts
+*.charm
+
+# Accidental pip version-spec files (e.g. `pip install package==2.1` typos)
+=*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
