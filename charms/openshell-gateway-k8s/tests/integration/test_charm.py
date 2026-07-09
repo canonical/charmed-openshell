@@ -39,7 +39,9 @@ def charm_file() -> str:
 
     charmcraft = subprocess.run(["which", "charmcraft"], capture_output=True)
     if charmcraft.returncode != 0:
-        pytest.skip("CHARM_FILE not set and 'charmcraft' binary not found; skipping integration test")
+        pytest.skip(
+            "CHARM_FILE not set and 'charmcraft' binary not found; skipping integration test"
+        )
 
     result = subprocess.run(
         ["charmcraft", "pack", "--verbose"],
@@ -95,6 +97,7 @@ class TestRBACStatusContract:
         decoupled from container-readiness (ubuntu:24.04 is not pebble-capable
         so pebble-ready never fires).
         """
+
         def _blocked(status: jubilant.Status) -> bool:
             app = status.apps.get(APP_NAME)
             if app is None:

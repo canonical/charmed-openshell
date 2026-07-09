@@ -5,7 +5,8 @@ No ``ops`` imports — this module is testable with plain pytest and zero Juju.
 
 from __future__ import annotations
 
-from typing import Any, Literal, Mapping
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import pydantic
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -50,9 +51,7 @@ class GatewayConfig(pydantic.BaseModel):
     oidc_roles_claim: str = Field(default="groups", alias="oidc-roles-claim")
     oidc_admin_role: str | None = Field(default=None, alias="oidc-admin-role")
     oidc_user_role: str | None = Field(default=None, alias="oidc-user-role")
-    log_level: Literal["debug", "info", "warn", "error"] = Field(
-        default="info", alias="log-level"
-    )
+    log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
 
     # ------------------------------------------------------------------
     # Field validators
@@ -102,7 +101,7 @@ class GatewayConfig(pydantic.BaseModel):
     # ------------------------------------------------------------------
 
     @model_validator(mode="after")
-    def _rbac_roles_required(self) -> "GatewayConfig":
+    def _rbac_roles_required(self) -> GatewayConfig:
         """Enforce that both OIDC role fields are set together.
 
         Raises ``PydanticCustomError`` (not a bare ``ValueError``) so that

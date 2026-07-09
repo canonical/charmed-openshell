@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import pytest
 from ops import ActiveStatus, BlockedStatus
 from ops.testing import Context, State
 
 from charm import OpenshellGatewayK8sCharm
 
 RBAC_REQUIRED_MSG = "both oidc-admin-role and oidc-user-role must be set (RBAC required)"
-TOGETHER_ADMIN_MSG = "oidc-admin-role and oidc-user-role must be set together; got only oidc-admin-role"
-TOGETHER_USER_MSG = "oidc-admin-role and oidc-user-role must be set together; got only oidc-user-role"
+TOGETHER_ADMIN_MSG = (
+    "oidc-admin-role and oidc-user-role must be set together; got only oidc-admin-role"
+)
+TOGETHER_USER_MSG = (
+    "oidc-admin-role and oidc-user-role must be set together; got only oidc-user-role"
+)
 
 
 def _state(**config_values) -> State:

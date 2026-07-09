@@ -8,7 +8,6 @@ from pydantic import ValidationError
 from config_model import (
     BIND_ADDRESS,
     DRIVER_SOCKET,
-    DRIVERS,
     GATEWAY_PORT,
     GatewayConfig,
     load_config,
@@ -73,9 +72,7 @@ class TestConfigSurface:
 
     def test_extra_keys_ignored(self):
         """extra="ignore": unknown keys from future features do not break the model."""
-        cfg = GatewayConfig.model_validate(
-            {**BOTH_ROLES_MINIMAL, "future-option": "value"}
-        )
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "future-option": "value"})
         assert cfg.oidc_admin_role == "admin"
 
 
@@ -118,14 +115,17 @@ class TestRBACValidation:
             GatewayConfig.model_validate({})
         with pytest.raises(ValidationError) as exc_info_one:
             GatewayConfig.model_validate({"oidc-admin-role": "admin"})
-        assert (
-            exc_info_neither.value.errors()[0]["msg"]
-            != exc_info_one.value.errors()[0]["msg"]
-        )
+        assert exc_info_neither.value.errors()[0]["msg"] != exc_info_one.value.errors()[0]["msg"]
 
     @pytest.mark.parametrize(
         "field",
-        ["oidc-admin-role", "oidc-user-role", "external-hostname", "oidc-audience", "oidc-roles-claim"],
+        [
+            "oidc-admin-role",
+            "oidc-user-role",
+            "external-hostname",
+            "oidc-audience",
+            "oidc-roles-claim",
+        ],
     )
     def test_control_char_newline_rejected(self, field):
         base = {"oidc-admin-role": "admin", "oidc-user-role": "user"}
@@ -195,7 +195,12 @@ class TestLoadConfig:
 # VP-4: render_env
 # ---------------------------------------------------------------------------
 
-FIXED_KEYS = {"OPENSHELL_BIND_ADDRESS", "OPENSHELL_PORT", "OPENSHELL_DRIVERS", "OPENSHELL_LXD_SOCKET"}
+FIXED_KEYS = {
+    "OPENSHELL_BIND_ADDRESS",
+    "OPENSHELL_PORT",
+    "OPENSHELL_DRIVERS",
+    "OPENSHELL_LXD_SOCKET",
+}
 CONFIG_DERIVED_KEYS = {
     "OPENSHELL_OIDC_AUDIENCE",
     "OPENSHELL_OIDC_ROLES_CLAIM",
