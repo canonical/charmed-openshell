@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pydantic
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -28,8 +29,23 @@ BIND_ADDRESS: str = "0.0.0.0"  # noqa: S104 — intentional; see comment above
 
 GATEWAY_PORT: str = "8443"  # TLS-only listen port
 DRIVERS: str = "lxd"
-# Socket path created by the FD-001 rock on startup.
+# Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"
+# LXD REST API socket on the host (must be bind-mounted into the pod).
+LXD_HOST_SOCKET: str = "/var/snap/lxd/common/lxd/unix.socket"
+
+# ---------------------------------------------------------------------------
+# Filesystem path constants (container layout)
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH: str = "/etc/openshell/config.toml"
+JWT_DIR: str = "/etc/openshell/jwt"
+TLS_DIR: str = "/etc/openshell/tls"
+
+# Stable workload identity embedded in every minted JWT.  Must match the
+# openshell-server binary's expected default; cross-reference when
+# crates/openshell-server lands its config parser (FD-004).
+GATEWAY_ID: str = "openshell-gateway"
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +144,89 @@ class GatewayConfig(pydantic.BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# URI helpers — pure, side-effect-free
+# ---------------------------------------------------------------------------
+
+
+def append_sslmode(uri: str, *, have_ca: bool, tls_enabled: bool = True) -> str:
+    """Return *uri* with exactly one authoritative ``sslmode`` parameter.
+
+    Any existing ``sslmode`` value in the URI (e.g. an upstream
+    ``sslmode=disable``) is stripped before the authoritative value is
+    appended, so the result always carries a single ``sslmode`` and never
+    silently disables TLS via a duplicate parameter.
+
+    When *tls_enabled* is False (the database provider reports TLS is off),
+    ``sslmode=disable`` is used so the connection is not rejected by a server
+    that never negotiates TLS.
+    """
+    parts = urlsplit(uri)
+    params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k != "sslmode"]
+    if not tls_enabled:
+        sslmode = "disable"
+    elif have_ca:
+        sslmode = "verify-full"
+    else:
+        sslmode = "require"
+    params.append(("sslmode", sslmode))
+    return urlunsplit(parts._replace(query=urlencode(params)))
+
+
+# ---------------------------------------------------------------------------
+# Config-TOML renderer — pure, side-effect-free
+# ---------------------------------------------------------------------------
+
+
+def render_config_toml(
+    cfg: GatewayConfig,
+    *,
+    db_uri: str,
+    issuer_url: str,
+    tls_cert_path: str,
+    tls_key_path: str,
+    jwt_signing_key_path: str,
+    jwt_public_key_path: str,
+    jwt_kid: str,
+    redirect_uri: str,
+) -> str:
+    """Return the workload ``config.toml`` as a string.
+
+    Pure function — no filesystem access, no ``ops`` imports.  All paths are
+    passed in so the function is trivially unit-testable.
+
+    The binary uses ``[openshell.gateway]``, ``[openshell.gateway.tls]``, and
+    ``[openshell.gateway.oidc]`` sections.  The database URL is supplied via
+    the ``OPENSHELL_DB_URL`` env var (handled by the Pebble layer), not here.
+    The ``gateway_jwt`` section and ``redirect_uri`` are not part of the
+    server-side config for the current binary version.
+    """
+    assert cfg.oidc_admin_role is not None
+    assert cfg.oidc_user_role is not None
+
+    def q(v: str) -> str:
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    lines = [
+        "[openshell.gateway]",
+        f"bind_address = {q(BIND_ADDRESS + ':' + GATEWAY_PORT)}",
+        f"log_level = {q(cfg.log_level)}",
+        "",
+        "[openshell.gateway.tls]",
+        f"cert_path = {q(tls_cert_path)}",
+        f"key_path = {q(tls_key_path)}",
+        "",
+        "[openshell.gateway.oidc]",
+        f"issuer = {q(issuer_url)}",
+        f"audience = {q(cfg.oidc_audience)}",
+        f"roles_claim = {q(cfg.oidc_roles_claim)}",
+        f"admin_role = {q(cfg.oidc_admin_role)}",
+        f"user_role = {q(cfg.oidc_user_role)}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Env renderer — pure, config-only scope (FD-002)
 # ---------------------------------------------------------------------------
 
@@ -152,9 +251,9 @@ def render_env(cfg: GatewayConfig) -> dict[str, str]:
     env: dict[str, str] = {
         # Fixed constants
         "OPENSHELL_BIND_ADDRESS": BIND_ADDRESS,
-        "OPENSHELL_PORT": GATEWAY_PORT,
+        "OPENSHELL_SERVER_PORT": GATEWAY_PORT,
         "OPENSHELL_DRIVERS": DRIVERS,
-        "OPENSHELL_LXD_SOCKET": DRIVER_SOCKET,
+        "OPENSHELL_COMPUTE_DRIVER_SOCKET": DRIVER_SOCKET,
         # Config-derived
         "OPENSHELL_OIDC_AUDIENCE": cfg.oidc_audience,
         "OPENSHELL_OIDC_ROLES_CLAIM": cfg.oidc_roles_claim,

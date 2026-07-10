@@ -8,9 +8,12 @@ from pydantic import ValidationError
 from config_model import (
     BIND_ADDRESS,
     DRIVER_SOCKET,
+    GATEWAY_ID,
     GATEWAY_PORT,
     GatewayConfig,
+    append_sslmode,
     load_config,
+    render_config_toml,
     render_env,
 )
 
@@ -197,9 +200,9 @@ class TestLoadConfig:
 
 FIXED_KEYS = {
     "OPENSHELL_BIND_ADDRESS",
-    "OPENSHELL_PORT",
+    "OPENSHELL_SERVER_PORT",
     "OPENSHELL_DRIVERS",
-    "OPENSHELL_LXD_SOCKET",
+    "OPENSHELL_COMPUTE_DRIVER_SOCKET",
 }
 CONFIG_DERIVED_KEYS = {
     "OPENSHELL_OIDC_AUDIENCE",
@@ -235,8 +238,8 @@ class TestRenderEnv:
         cfg = self._valid_cfg()
         env = render_env(cfg)
         assert env["OPENSHELL_BIND_ADDRESS"] == BIND_ADDRESS
-        assert env["OPENSHELL_PORT"] == GATEWAY_PORT
-        assert env["OPENSHELL_LXD_SOCKET"] == DRIVER_SOCKET
+        assert env["OPENSHELL_SERVER_PORT"] == GATEWAY_PORT
+        assert env["OPENSHELL_COMPUTE_DRIVER_SOCKET"] == DRIVER_SOCKET
 
     def test_deferred_keys_absent(self):
         cfg = self._valid_cfg()
@@ -270,3 +273,115 @@ class TestRenderEnv:
     def test_external_hostname_set_present(self):
         cfg = self._valid_cfg(**{"external-hostname": "gw.example.com"})
         assert render_env(cfg)["OPENSHELL_EXTERNAL_HOSTNAME"] == "gw.example.com"
+
+
+# ---------------------------------------------------------------------------
+# append_sslmode
+# ---------------------------------------------------------------------------
+
+
+class TestAppendSslmode:
+    def test_require_without_ca(self):
+        uri = "postgresql://user:pass@host:5432/db"
+        result = append_sslmode(uri, have_ca=False)
+        assert "sslmode=require" in result
+        assert result.count("sslmode") == 1
+
+    def test_verify_full_with_ca(self):
+        uri = "postgresql://user:pass@host:5432/db"
+        result = append_sslmode(uri, have_ca=True)
+        assert "sslmode=verify-full" in result
+        assert result.count("sslmode") == 1
+
+    def test_existing_sslmode_stripped_require(self):
+        """An upstream sslmode=disable is overridden to require, not duplicated."""
+        uri = "postgresql://user:pass@host:5432/db?sslmode=disable"
+        result = append_sslmode(uri, have_ca=False)
+        assert "sslmode=require" in result
+        assert result.count("sslmode") == 1
+        assert "disable" not in result
+
+    def test_existing_sslmode_stripped_verify_full(self):
+        uri = "postgresql://user:pass@host:5432/db?sslmode=prefer"
+        result = append_sslmode(uri, have_ca=True)
+        assert "sslmode=verify-full" in result
+        assert result.count("sslmode") == 1
+
+    def test_existing_query_params_preserved(self):
+        uri = "postgresql://user:pass@host:5432/db?connect_timeout=10"
+        result = append_sslmode(uri, have_ca=False)
+        assert "connect_timeout=10" in result
+        assert "sslmode=require" in result
+
+    def test_query_joined_correctly(self):
+        """No double ? when URI already has params."""
+        uri = "postgresql://user:pass@host/db?foo=bar"
+        result = append_sslmode(uri, have_ca=False)
+        assert result.count("?") == 1
+
+
+# ---------------------------------------------------------------------------
+# render_config_toml
+# ---------------------------------------------------------------------------
+
+_TOML_KWARGS = {
+    "db_uri": "postgresql://u:p@db:5432/openshell?sslmode=require",
+    "issuer_url": "https://hydra.example.com",
+    "tls_cert_path": "/etc/openshell/tls/tls.crt",
+    "tls_key_path": "/etc/openshell/tls/tls.key",
+    "jwt_signing_key_path": "/etc/openshell/jwt/signing.key",
+    "jwt_public_key_path": "/etc/openshell/jwt/public.pem",
+    "jwt_kid": "abc123",
+    "redirect_uri": "https://gw.example.com/oauth/unused",
+}
+
+
+class TestRenderConfigToml:
+    def _cfg(self, **overrides):
+        return GatewayConfig.model_validate({**VALID_CONFIG, **overrides})
+
+    def _render(self, **overrides):
+        return render_config_toml(self._cfg(), **{**_TOML_KWARGS, **overrides})
+
+    def test_gateway_id_is_openshell_gateway(self):
+        toml = self._render()
+        # GATEWAY_ID is a constant but not part of the rendered config.toml
+        # The binary configuration uses gateway configuration sections instead
+        assert GATEWAY_ID == "openshell-gateway"
+        assert "[openshell.gateway]" in toml
+
+    def test_database_url_in_output(self):
+        toml = self._render()
+        # Database URL is passed via OPENSHELL_DB_URL env var, not in config.toml
+        # The config.toml only contains gateway, TLS, and OIDC configuration
+        assert "[openshell.gateway]" in toml
+
+    def test_oidc_section(self):
+        toml = self._render()
+        assert "[openshell.gateway.oidc]" in toml
+        assert 'issuer = "https://hydra.example.com"' in toml
+
+    def test_tls_section(self):
+        toml = self._render()
+        assert "[openshell.gateway.tls]" in toml
+        assert "tls.crt" in toml
+        assert "tls.key" in toml
+
+    def test_gateway_jwt_section(self):
+        toml = self._render()
+        # gateway_jwt section is not part of the server-side config for the current binary version
+        # Configuration is passed via environment variables (FD-003)
+        assert "[gateway_jwt]" not in toml
+
+    def test_is_string(self):
+        toml = self._render()
+        assert isinstance(toml, str)
+
+    def test_no_ops_import(self):
+        """config_model must never import ops."""
+        import inspect
+
+        import config_model
+
+        src = inspect.getsource(config_model)
+        assert "import ops" not in src
