@@ -39,6 +39,8 @@ charm-libs:
     version: "0"
   - lib: certificate_transfer_interface.certificate_transfer
     version: "1"
+  - lib: traefik_k8s.traefik_route
+    version: "0"
 
 containers:
   gateway:
@@ -57,6 +59,9 @@ requires:
     limit: 1
   oauth:
     interface: oauth
+    limit: 1
+  ingress:
+    interface: traefik_route
     limit: 1
 
 provides:
