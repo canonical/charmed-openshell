@@ -1,7 +1,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
 addopts = "--tb=short"
-pythonpath = ["src"]
+pythonpath = ["src", "lib"]
 
 [tool.coverage.run]
 source = ["src"]
@@ -9,6 +9,9 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+
+[tool.pyright]
+extraPaths = ["lib"]
 
 [tool.ruff]
 line-length = 99

@@ -26,6 +26,48 @@ parts:
     plugin: charm
     charm-requirements:
       - requirements.txt
+    build-packages:
+      - libssl-dev
+      - pkg-config
+
+charm-libs:
+  - lib: data_platform_libs.data_interfaces
+    version: "0"
+  - lib: tls_certificates_interface.tls_certificates
+    version: "4"
+  - lib: hydra.oauth
+    version: "0"
+  - lib: certificate_transfer_interface.certificate_transfer
+    version: "1"
+
+containers:
+  gateway:
+    resource: gateway-image
+
+peers:
+  gateway-peers:
+    interface: gateway_peers
+
+requires:
+  database:
+    interface: postgresql_client
+    limit: 1
+  certificates:
+    interface: tls-certificates
+    limit: 1
+  oauth:
+    interface: oauth
+    limit: 1
+
+provides:
+  send-ca-cert:
+    interface: certificate_transfer
+
+actions:
+  get-oidc-client-config:
+    description: Return the OIDC client configuration for CLI consumers.
+  get-gateway-status:
+    description: Report the current readiness and configuration state of the gateway.
 
 resources:
   gateway-image:
