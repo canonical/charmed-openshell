@@ -1,3 +1,5 @@
+#!/usr/bin/env -S LD_LIBRARY_PATH=lib python3
+
 """OpenShell Gateway K8s charm."""
 
 from __future__ import annotations
