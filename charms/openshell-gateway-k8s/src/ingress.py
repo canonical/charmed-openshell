@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from typing import cast
@@ -20,6 +21,15 @@ _HOSTNAME_RE = re.compile(
 
 def _valid_hostname(value: str) -> bool:
     return bool(_HOSTNAME_RE.fullmatch(value))
+
+
+def _is_ip_address(value: str) -> bool:
+    """Return True if *value* is a valid IPv4 or IPv6 address."""
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 class GatewayIngress(ops.Object):
@@ -80,11 +90,15 @@ class GatewayIngress(ops.Object):
     def _resolved_hostname(self) -> tuple[str | None, bool]:
         """Return (lowercased-hostname-or-None, is_valid).
 
-        None means unset (wildcard fallback). is_valid=False means the raw
-        value failed RFC 1123 validation and the route must not be submitted.
+        None means unset (wildcard fallback). An IP address is treated as
+        valid but maps to the wildcard SNI rule; the TLS layer adds the IP as
+        a SAN independently. is_valid=False means the raw value is neither a
+        hostname nor an IP and the route must not be submitted.
         """
         raw = str(self._charm.config.get("external-hostname") or "").strip()
         if not raw:
+            return None, True
+        if _is_ip_address(raw):
             return None, True
         if _valid_hostname(raw):
             return raw.lower(), True

@@ -7,7 +7,7 @@ from ops import ActiveStatus, BlockedStatus
 from ops.testing import Container, Context, Relation, State, TCPPort
 
 from charm import CONTAINER_NAME, OpenshellGatewayK8sCharm
-from ingress import GatewayIngress, _valid_hostname
+from ingress import GatewayIngress, _is_ip_address, _valid_hostname
 
 # Minimal valid config so the charm's config validator doesn't block _reconcile.
 _ROLES = {"oidc-admin-role": "admin", "oidc-user-role": "user"}
@@ -79,6 +79,28 @@ class TestConfigAssembly:
         assert _valid_hostname("foo`)||(HostSNI(`*") is False
         assert _valid_hostname("my.host.com") is True
         assert _valid_hostname("") is False
+
+    def test_ip_address_treated_as_valid_for_wildcard_sni(self):
+        class _FakeCharm:
+            class app:  # noqa: N801
+                name = "openshell-gateway-k8s"
+
+            class model:  # noqa: N801
+                name = "test-model"
+
+            config = {"external-hostname": "10.43.45.0"}
+
+        ig = object.__new__(GatewayIngress)
+        ig._charm = _FakeCharm()
+        hostname, valid = GatewayIngress._resolved_hostname(ig)
+        assert hostname is None
+        assert valid is True
+
+    def test_ip_helper(self):
+        assert _is_ip_address("10.43.45.0") is True
+        assert _is_ip_address("2001:db8::1") is True
+        assert _is_ip_address("my.host.com") is False
+        assert _is_ip_address("") is False
 
 
 # ---------------------------------------------------------------------------

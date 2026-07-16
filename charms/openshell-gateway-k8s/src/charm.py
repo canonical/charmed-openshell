@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
 from dataclasses import dataclass
@@ -124,13 +125,26 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             f"{self.app.name}.{self.model.name}.svc.cluster.local",
             "localhost",
         ]
+        sans_ip: list[str] = ["127.0.0.1"]
         if self._model_cfg and self._model_cfg.external_hostname:
-            sans_dns.insert(0, self._model_cfg.external_hostname)
+            if self._is_ip_address(self._model_cfg.external_hostname):
+                sans_ip.insert(0, self._model_cfg.external_hostname)
+            else:
+                sans_dns.insert(0, self._model_cfg.external_hostname)
         return CertificateRequestAttributes(
             common_name=f"{self.app.name}.{self.model.name}.svc.cluster.local",
             sans_dns=sans_dns,
-            sans_ip=["127.0.0.1"],
+            sans_ip=sans_ip,
         )
+
+    @staticmethod
+    def _is_ip_address(value: str) -> bool:
+        """Return True if *value* is a valid IPv4 or IPv6 address."""
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return True
 
     def _redirect_uri(self) -> str:
         if self._model_cfg and self._model_cfg.external_hostname:
