@@ -18,7 +18,7 @@ build-charm:
 test-charm: build-charm
     cd charms/openshell-gateway-k8s && tox
 
-integration-test-charm *args: build-charm push-rock
-    cd charms/openshell-gateway-k8s && GATEWAY_IMAGE="{{ROCK_REGISTRY}}/{{ROCK_NAME}}:latest" tox -e integration -- {{args}}
+integration-test-charm *args:
+    cd charms/openshell-gateway-k8s && tox -e integration -- {{args}}
 
 all: test-rock test-charm
