@@ -7,7 +7,9 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
+import logging
 from dataclasses import dataclass
 
 import ops
@@ -40,6 +42,9 @@ from config_model import (
     render_config_toml,
     render_env,
 )
+from ingress import GatewayIngress
+
+logger = logging.getLogger(__name__)
 
 CONTAINER_NAME = "gateway"
 SERVICE_NAME = "gateway"
@@ -85,6 +90,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             relation_name="oauth",
         )
         self.ca_transfer = CertificateTransferProvides(self, "send-ca-cert")
+        self.ingress = GatewayIngress(self)
 
         # Every convergence trigger routes to _reconcile.
         for event in (
@@ -119,13 +125,26 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             f"{self.app.name}.{self.model.name}.svc.cluster.local",
             "localhost",
         ]
+        sans_ip: list[str] = ["127.0.0.1"]
         if self._model_cfg and self._model_cfg.external_hostname:
-            sans_dns.insert(0, self._model_cfg.external_hostname)
+            if self._is_ip_address(self._model_cfg.external_hostname):
+                sans_ip.insert(0, self._model_cfg.external_hostname)
+            else:
+                sans_dns.insert(0, self._model_cfg.external_hostname)
         return CertificateRequestAttributes(
             common_name=f"{self.app.name}.{self.model.name}.svc.cluster.local",
             sans_dns=sans_dns,
-            sans_ip=["127.0.0.1"],
+            sans_ip=sans_ip,
         )
+
+    @staticmethod
+    def _is_ip_address(value: str) -> bool:
+        """Return True if *value* is a valid IPv4 or IPv6 address."""
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return True
 
     def _redirect_uri(self) -> str:
         if self._model_cfg and self._model_cfg.external_hostname:
@@ -399,6 +418,36 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if not container.can_connect():
             return
 
+        # Re-register cert request when SANs have changed, and re-register the
+        # oauth client when redirect_uri has changed. These must run *before*
+        # the readiness gate below: a config change (e.g. external-hostname)
+        # can invalidate the currently assigned certificate by changing its
+        # desired SANs, which makes _tls_material() return None below. If
+        # re-registration only ran after the gate, the charm would never
+        # request a matching certificate again once tls_cert is None — a
+        # permanent deadlock recoverable only by removing/re-adding the
+        # certificates relation. Re-registering unconditionally up front
+        # avoids that trap.
+        new_attrs = self._cert_request_attributes()
+        new_sans = sorted(list(new_attrs.sans_dns or []) + list(new_attrs.sans_ip or []))
+        if new_sans != sorted(self._stored.last_cert_sans):
+            self.certificates.certificate_requests = [new_attrs]
+            # Merely reassigning certificate_requests does not send anything:
+            # TLSCertificatesRequiresV4 only sends/cleans up CSRs from its
+            # internal _configure(), which the library wires up to
+            # relation-created/-changed, secret-expired/-remove, and any
+            # explicit refresh_events (none are passed here). Since this
+            # charm reconciles from arbitrary events (e.g. config-changed),
+            # we must call sync() ourselves so a changed CSR is actually
+            # transmitted instead of silently sitting unsent forever.
+            self.certificates.sync()
+            self._stored.last_cert_sans = new_sans
+
+        new_redirect = self._redirect_uri()
+        if new_redirect != self._stored.last_redirect_uri:
+            self.oauth.update_client_config(self._oauth_client_config())
+            self._stored.last_redirect_uri = new_redirect
+
         db_uri = self._database_uri()
         tls_cert, tls_key = self._tls_material()
         issuer = self._oauth_issuer()
@@ -421,24 +470,28 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             issuer_url=issuer,
         )
         container.add_layer(CONTAINER_NAME, self._pebble_layer(db_uri), combine=True)
-        container.replan()
+        try:
+            container.replan()
+        except ops.pebble.ChangeError:
+            # The workload can legitimately crash-loop for a while after a
+            # config/relation change (e.g. it needs to re-resolve an OIDC
+            # issuer that isn't reachable yet). Pebble's replan raises
+            # ChangeError when the service exits quickly during the start
+            # attempt it makes as part of replanning, but the new layer/
+            # config has already been applied and pebble will keep retrying
+            # the service in the background on its own backoff schedule.
+            # Letting this exception propagate would fail the hook (leaving
+            # the unit in error state, needing a manual `juju resolved`) even
+            # though nothing is actually wrong with the charm's reconciliation
+            # — so log and continue instead of crashing.
+            logger.warning(
+                "workload service failed to start immediately after replan; "
+                "it will keep retrying via its own backoff",
+            )
 
         # Re-publish CA to any joined send-ca-cert relations.
         for rel in self.model.relations.get("send-ca-cert", []):
             self.ca_transfer.add_certificates({ca_pem}, relation_id=rel.id)
-
-        # Re-register cert request when SANs have changed.
-        new_attrs = self._cert_request_attributes()
-        new_sans = sorted(list(new_attrs.sans_dns or []) + list(new_attrs.sans_ip or []))
-        if new_sans != sorted(self._stored.last_cert_sans):
-            self.certificates.certificate_requests = [new_attrs]
-            self._stored.last_cert_sans = new_sans
-
-        # Re-register oauth client when redirect_uri has changed.
-        new_redirect = self._redirect_uri()
-        if new_redirect != self._stored.last_redirect_uri:
-            self.oauth.update_client_config(self._oauth_client_config())
-            self._stored.last_redirect_uri = new_redirect
 
     def _on_collect_unit_status(self, event: ops.CollectStatusEvent) -> None:
         if self._config_error:

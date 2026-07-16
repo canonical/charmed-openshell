@@ -9,10 +9,10 @@ ROCK_DIR="${ROCK_DIR:-rocks/openshell-gateway}"
 IMAGE="openshell-gateway:test"
 
 # ---------------------------------------------------------------------------
-# Guard: Docker daemon must be available.
+# Guard: Docker daemon must be available to the current user (no sudo).
 # ---------------------------------------------------------------------------
 docker info > /dev/null 2>&1 \
-  || { echo "ERROR: Docker daemon is not available — smoke test requires docker" >&2; exit 1; }
+  || { echo "ERROR: Docker daemon is not available to the current user — smoke test requires docker (ensure the user is in the 'docker' group or Docker is rootless)" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Locate packed rock and load it into the local Docker daemon.
@@ -26,7 +26,11 @@ echo "Using rock: ${ROCK_FILE}"
 
 SKOPEO=$(command -v skopeo 2>/dev/null || echo /snap/bin/rockcraft.skopeo)
 echo "Using skopeo: ${SKOPEO}"
-sudo "${SKOPEO}" copy "oci-archive:${ROCK_FILE}" "docker-daemon:${IMAGE}"
+# --insecure-policy is required because the rockcraft.skopeo snap does not ship
+# a default /etc/containers/policy.json. We are copying a locally-built OCI
+# archive into the local Docker daemon, so signature policy enforcement is not
+# applicable here.
+"${SKOPEO}" copy --insecure-policy "oci-archive:${ROCK_FILE}" "docker-daemon:${IMAGE}"
 
 # ---------------------------------------------------------------------------
 # Helper: run a one-shot command inside the image.

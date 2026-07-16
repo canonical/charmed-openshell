@@ -1,0 +1,7 @@
+pytest
+pytest-cov
+PyYAML
+ops[testing] >= 2.1, < 3
+pydantic >= 2, < 3
+cryptography
+jsonschema

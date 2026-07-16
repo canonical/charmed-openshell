@@ -6,6 +6,7 @@ import os
 import stat
 from unittest.mock import MagicMock, patch
 
+from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, WaitingStatus
 from ops.testing import Container, Context, PeerRelation, Relation, State
 
@@ -237,6 +238,48 @@ class TestActiveScenario:
 
         result = append_sslmode("postgresql://u:p@h/db", have_ca=True)
         assert "sslmode=verify-full" in result and result.count("sslmode") == 1
+
+
+# ---------------------------------------------------------------------------
+# External hostname: IP addresses become IP SANs, not DNS SANs
+# ---------------------------------------------------------------------------
+
+
+class TestExternalHostnameIp:
+    def _request_attrs(self, external_hostname: str):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        config = {**BOTH_ROLES, "external-hostname": external_hostname}
+        state = State(
+            config=config,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations(),
+        )
+        p_db, _tls, p_issuer, p_jwt1, p_jwt2 = _all_ready_patches()
+        with (
+            patch.object(
+                TLSCertificatesRequiresV4,
+                "get_assigned_certificate",
+                return_value=(None, None),
+            ) as mock_cert,
+            p_db,
+            p_issuer,
+            p_jwt1,
+            p_jwt2,
+        ):
+            ctx.run(ctx.on.config_changed(), state)
+        args = mock_cert.call_args
+        assert args is not None, "get_assigned_certificate was not called"
+        return args[0][0]
+
+    def test_ip_hostname_is_sans_ip_not_sans_dns(self):
+        attrs = self._request_attrs("10.43.45.0")
+        assert "10.43.45.0" in attrs.sans_ip
+        assert "10.43.45.0" not in attrs.sans_dns
+
+    def test_dns_hostname_is_sans_dns(self):
+        attrs = self._request_attrs("gateway.example.com")
+        assert "gateway.example.com" in attrs.sans_dns
+        assert "gateway.example.com" not in attrs.sans_ip
 
 
 # ---------------------------------------------------------------------------
