@@ -1,0 +1,33 @@
+juju:
+  channel: 3/stable
+  extra-bootstrap-args: --config bootstrap-timeout=1800
+  model-defaults:
+    logging-config: <root>=INFO; unit=DEBUG
+    test-mode: "true"
+    automatically-retry-hooks: "false"
+
+providers:
+  lxd:
+    enable: true
+  k8s:
+    enable: true
+    bootstrap: true
+    bootstrap-constraints:
+      root-disk: "10G"
+    features:
+      load-balancer:
+        l2-mode: "true"
+        cidrs: "10.43.45.0/28"
+      local-storage: {}
+      network: {}
+
+host:
+  packages:
+    - skopeo
+  snaps:
+    charmcraft:
+    rockcraft:
+    registry:
+      channel: latest/stable
+    openshell:
+      channel: latest/stable
