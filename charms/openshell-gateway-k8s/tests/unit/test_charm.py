@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import os
 import stat
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import yaml
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, WaitingStatus
 from ops.testing import Container, Context, PeerRelation, Relation, State
 
 from charm import (
+    APPLIED_HASH_KEY,
     CONTAINER_NAME,
+    DRIVER_SERVICE_NAME,
     GATEWAY_CMD,
     PEER_RELATION,
+    RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
 )
@@ -531,3 +536,176 @@ class TestSecretAccessErrors:
         charm_mock.model.get_secret.side_effect = ops.ModelError("access denied")
         result = OpenshellGatewayK8sCharm._read_jwt_keypair(charm_mock)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Rolling restart coordination
+# ---------------------------------------------------------------------------
+
+
+def _restart_relation():
+    return PeerRelation(RESTART_RELATION)
+
+
+class TestRollingRestartMetadata:
+    def test_restart_relation_and_action_declared(self):
+        meta_path = Path(__file__).parent.parent.parent / "charmcraft.yaml"
+        meta = yaml.safe_load(meta_path.read_text())
+        assert "restart" in meta.get("peers", {})
+        assert meta["peers"]["restart"]["interface"] == "rolling_op"
+        assert "restart" in meta.get("actions", {})
+
+
+class TestWorkloadConfigHash:
+    def test_hash_is_order_independent_and_sensitive(self):
+        charm = object.__new__(OpenshellGatewayK8sCharm)
+        layer = {
+            "summary": "gateway layer",
+            "services": {
+                "driver-lxd": {
+                    "override": "replace",
+                    "command": "/usr/bin/openshell-driver-lxd",
+                    "startup": "enabled",
+                },
+                "gateway": {
+                    "override": "replace",
+                    "command": "/usr/bin/openshell-gateway",
+                    "startup": "enabled",
+                    "after": ["driver-lxd"],
+                },
+            },
+        }
+        toml = "[openshell.gateway]\nkey = 'value'\n"
+        cert = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----"
+        h1 = charm._workload_config_hash(layer, toml, cert)
+
+        # Reordered dict keys inside the layer produce the same hash.
+        layer2 = {
+            "summary": "gateway layer",
+            "services": {
+                "gateway": {
+                    "startup": "enabled",
+                    "command": "/usr/bin/openshell-gateway",
+                    "override": "replace",
+                    "after": ["driver-lxd"],
+                },
+                "driver-lxd": {
+                    "command": "/usr/bin/openshell-driver-lxd",
+                    "override": "replace",
+                    "startup": "enabled",
+                },
+            },
+        }
+        h2 = charm._workload_config_hash(layer2, toml, cert)
+        assert h1 == h2
+
+        # Changing any component changes the hash.
+        assert charm._workload_config_hash(layer, toml + "#", cert) != h1
+        assert charm._workload_config_hash(layer, toml, cert + "X") != h1
+
+
+class TestRollingRestartLifecycle:
+    def _ready_state(self):
+        peer_rel = _restart_relation()
+        return State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                peer_rel,
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+            ],
+        )
+
+    def test_first_reconcile_records_hash_no_restart(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], patch("ops.model.Container.restart") as restart_mock:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        peer_rel = next(r for r in out.relations if r.endpoint == RESTART_RELATION)
+        assert APPLIED_HASH_KEY in peer_rel.local_unit_data
+        restart_mock.assert_not_called()
+
+    def test_steady_state_no_restart(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        with p[0], p[1], p[2], p[3], p[4], patch("ops.model.Container.restart") as restart_mock:
+            out2 = ctx.run(ctx.on.config_changed(), out1)
+
+        peer_rel = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
+        hash1 = peer_rel.local_unit_data.get(APPLIED_HASH_KEY)
+        assert hash1 is not None
+        restart_mock.assert_not_called()
+
+    def test_config_change_triggers_lock(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        # Change a config option that flows into the rendered TOML.
+        state2 = State(
+            config={**BOTH_ROLES, "log-level": "debug"},
+            leader=True,
+            containers=list(out1.containers),
+            relations=list(out1.relations),
+        )
+        with p[0], p[1], p[2], p[3], p[4], patch("ops.model.Container.restart") as restart_mock:
+            out2 = ctx.run(ctx.on.config_changed(), state2)
+
+        restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        peer_rel = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
+        assert APPLIED_HASH_KEY in peer_rel.local_unit_data
+
+    def test_upgrade_charm_acquires_lock(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], patch("ops.model.Container.restart") as restart_mock:
+            out = ctx.run(ctx.on.upgrade_charm(), state)
+
+        restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        peer_rel = next(r for r in out.relations if r.endpoint == RESTART_RELATION)
+        assert APPLIED_HASH_KEY in peer_rel.local_unit_data
+
+    def test_cert_rotation_triggers_lock(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        rotated_cert = MagicMock(
+            certificate="-----BEGIN CERTIFICATE-----\nROTATED\n-----END CERTIFICATE-----",
+            ca="-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----",
+        )
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_tls_material",
+                return_value=(rotated_cert, _FAKE_TLS_KEY),
+            ),
+            patch("ops.model.Container.restart") as restart_mock,
+        ):
+            out2 = ctx.run(ctx.on.config_changed(), out1)
+
+        restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
+        peer_rel2 = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
+        assert (
+            peer_rel2.local_unit_data[APPLIED_HASH_KEY]
+            != peer_rel1.local_unit_data[APPLIED_HASH_KEY]
+        )

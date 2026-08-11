@@ -18,6 +18,7 @@ from charms.certificate_transfer_interface.v1.certificate_transfer import (
 )
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.hydra.v0.oauth import ClientConfig, OAuthRequirer
+from charms.rolling_ops.v0.rollingops import RollingOpsManager
 from charms.tls_certificates_interface.v4.tls_certificates import (
     CertificateRequestAttributes,
     TLSCertificatesRequiresV4,
@@ -50,6 +51,8 @@ CONTAINER_NAME = "gateway"
 SERVICE_NAME = "gateway"
 DRIVER_SERVICE_NAME = "driver-lxd"
 PEER_RELATION = "gateway-peers"
+RESTART_RELATION = "restart"
+APPLIED_HASH_KEY = "applied-config-hash"
 PEER_SECRET_LABEL = "gateway-jwt"
 PEER_SECRET_ID_KEY = "jwt-secret-id"  # app data key used to share secret ID with all units
 STATIC_REDIRECT_URI = "https://openshell.invalid/unused"
@@ -91,6 +94,15 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         )
         self.ca_transfer = CertificateTransferProvides(self, "send-ca-cert")
         self.ingress = GatewayIngress(self)
+
+        # Rolling restart coordination. The manager wires its own relation and
+        # lock events; the action and upgrade-charm events are handled locally
+        # so we can emit the library's acquire_lock event.
+        self.restart_manager = RollingOpsManager(
+            self, relation=RESTART_RELATION, callback=self._restart_workload
+        )
+        self.framework.observe(self.on.restart_action, self._on_restart_action)
+        self.framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
 
         # Every convergence trigger routes to _reconcile.
         for event in (
@@ -360,6 +372,26 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             },
         }
 
+    def _render_config_toml(
+        self,
+        db_uri: str,
+        issuer_url: str,
+        jwt_kid: str,
+    ) -> str:
+        """Render gateway.toml from the current desired state."""
+        assert self._model_cfg is not None
+        return render_config_toml(
+            self._model_cfg,
+            db_uri=db_uri,
+            issuer_url=issuer_url,
+            tls_cert_path=f"{TLS_DIR}/tls.crt",
+            tls_key_path=f"{TLS_DIR}/tls.key",
+            jwt_signing_key_path=f"{JWT_DIR}/signing.key",
+            jwt_public_key_path=f"{JWT_DIR}/public.pem",
+            jwt_kid=jwt_kid,
+            redirect_uri=self._redirect_uri(),
+        )
+
     def _write_container_files(
         self,
         container: ops.Container,
@@ -371,8 +403,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         jwt_public_key_pem: str,
         jwt_kid: str,
         issuer_url: str,
-    ) -> None:
-        assert self._model_cfg is not None
+    ) -> str:
+        """Push all rendered files to the container and return the rendered config TOML."""
         container.push(
             f"{JWT_DIR}/signing.key", jwt_signing_key_pem, make_dirs=True, permissions=0o600
         )
@@ -396,20 +428,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             proc.wait_output()
         except Exception:
             pass  # best-effort; OIDC discovery will fail if this does
-        config_toml = render_config_toml(
-            self._model_cfg,
-            db_uri=db_uri,
-            issuer_url=issuer_url,
-            tls_cert_path=f"{TLS_DIR}/tls.crt",
-            tls_key_path=f"{TLS_DIR}/tls.key",
-            jwt_signing_key_path=f"{JWT_DIR}/signing.key",
-            jwt_public_key_path=f"{JWT_DIR}/public.pem",
-            jwt_kid=jwt_kid,
-            redirect_uri=self._redirect_uri(),
-        )
+        config_toml = self._render_config_toml(db_uri, issuer_url, jwt_kid)
         container.push(CONFIG_PATH, config_toml, make_dirs=True, permissions=0o600)
+        return config_toml
 
-    def _reconcile(self, _event: ops.EventBase) -> None:
+    def _reconcile(self, event: ops.EventBase) -> None:
         """Re-derive desired state from scratch and converge."""
         if self._config_error:
             return
@@ -458,7 +481,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return
 
         ca_pem = str(tls_cert.ca)
-        self._write_container_files(
+        config_toml = self._write_container_files(
             container,
             db_uri=db_uri,
             tls_cert_pem=str(tls_cert.certificate),
@@ -469,7 +492,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt_kid=jwt["kid"],
             issuer_url=issuer,
         )
-        container.add_layer(CONTAINER_NAME, self._pebble_layer(db_uri), combine=True)
+        layer = self._pebble_layer(db_uri)
+        container.add_layer(CONTAINER_NAME, layer, combine=True)
         try:
             container.replan()
         except ops.pebble.ChangeError:
@@ -489,9 +513,82 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 "it will keep retrying via its own backoff",
             )
 
+        desired_hash = self._workload_config_hash(layer, config_toml, str(tls_cert.certificate))
+        self._ensure_restart_state(event, desired_hash)
+
         # Re-publish CA to any joined send-ca-cert relations.
         for rel in self.model.relations.get("send-ca-cert", []):
             self.ca_transfer.add_certificates({ca_pem}, relation_id=rel.id)
+
+    def _workload_config_hash(
+        self,
+        layer: ops.pebble.LayerDict,
+        config_toml: str,
+        tls_cert_pem: str,
+    ) -> str:
+        """Return a deterministic hex SHA-256 of the workload inputs."""
+        payload = json.dumps(layer, sort_keys=True) + config_toml + tls_cert_pem
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _applied_hash(self) -> str | None:
+        """Return the last applied workload hash, or None before first start."""
+        rel = self.model.get_relation(RESTART_RELATION)
+        if rel is None:
+            return None
+        return rel.data[self.unit].get(APPLIED_HASH_KEY)
+
+    def _set_applied_hash(self, value: str) -> None:
+        """Persist the applied workload hash in this unit's peer databag."""
+        rel = self.model.get_relation(RESTART_RELATION)
+        if rel is None:
+            return
+        rel.data[self.unit][APPLIED_HASH_KEY] = value
+
+    def _ensure_restart_state(self, event: ops.EventBase, desired_hash: str) -> None:
+        """Coordinate rolling restarts after convergence.
+
+        First start records the hash immediately (cold unit, no coordination
+        needed). Subsequent reconciles acquire the rolling-ops lock only when
+        the rendered workload configuration has changed.
+        """
+        if self._applied_hash() is None:
+            # First successful convergence: the service is already running via
+            # replan(), so just record the hash without taking the lock.
+            self._set_applied_hash(desired_hash)
+            return
+
+        if desired_hash != self._applied_hash():
+            self.on[RESTART_RELATION].acquire_lock.emit()
+
+    def _restart_workload(self, event: ops.EventBase) -> None:
+        """Rolling-ops lock callback: restart the workload and refresh the hash."""
+        container = self.unit.get_container(CONTAINER_NAME)
+        if not container.can_connect():
+            return
+
+        # Re-derive the desired hash from live state so this callback is safe
+        # even when invoked in a later hook after the original reconcile.
+        db_uri = self._database_uri()
+        tls_cert, tls_key = self._tls_material()
+        issuer = self._oauth_issuer()
+        jwt = self._ensure_jwt_keypair()
+        if db_uri is None or tls_cert is None or tls_key is None or issuer is None or jwt is None:
+            return
+
+        layer = self._pebble_layer(db_uri)
+        config_toml = self._render_config_toml(db_uri, issuer, jwt["kid"])
+        container.restart(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        self._set_applied_hash(
+            self._workload_config_hash(layer, config_toml, str(tls_cert.certificate))
+        )
+
+    def _on_restart_action(self, event: ops.ActionEvent) -> None:
+        """Operator-initiated rolling restart."""
+        self.on[RESTART_RELATION].acquire_lock.emit()
+
+    def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent) -> None:
+        """Force a rolling restart on charm upgrade (image may have changed)."""
+        self.on[RESTART_RELATION].acquire_lock.emit()
 
     def _on_collect_unit_status(self, event: ops.CollectStatusEvent) -> None:
         if self._config_error:

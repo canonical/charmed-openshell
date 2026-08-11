@@ -41,6 +41,8 @@ charm-libs:
     version: "1"
   - lib: traefik_k8s.traefik_route
     version: "0"
+  - lib: rolling_ops.rolling_ops
+    version: "0"
 
 containers:
   gateway:
@@ -49,6 +51,8 @@ containers:
 peers:
   gateway-peers:
     interface: gateway_peers
+  restart:
+    interface: rolling_op
 
 requires:
   database:
@@ -73,6 +77,8 @@ actions:
     description: Return the OIDC client configuration for CLI consumers.
   get-gateway-status:
     description: Report the current readiness and configuration state of the gateway.
+  restart:
+    description: Roll a restart of the gateway workload across all units, one at a time.
 
 resources:
   gateway-image:
