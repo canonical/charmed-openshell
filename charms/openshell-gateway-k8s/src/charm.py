@@ -35,6 +35,7 @@ from ops import ActiveStatus, BlockedStatus, WaitingStatus
 from config_model import (
     CONFIG_PATH,
     DRIVER_SOCKET,
+    GATEWAY_PORT,
     JWT_DIR,
     LXD_HOST_SOCKET,
     TLS_DIR,
@@ -58,6 +59,12 @@ PEER_SECRET_ID_KEY = "jwt-secret-id"  # app data key used to share secret ID wit
 STATIC_REDIRECT_URI = "https://openshell.invalid/unused"
 DATABASE_NAME = "openshell"
 GATEWAY_CMD = "/usr/bin/openshell-gateway --config /etc/openshell/config.toml"
+
+READINESS_CHECK_NAME = "gateway-ready"
+DRIVER_CHECK_NAME = "driver-ready"
+CHECK_PERIOD = "3s"
+CHECK_TIMEOUT = "3s"
+CHECK_THRESHOLD = 2
 
 
 def _generate_jwt_keypair() -> dict[str, str]:
@@ -379,6 +386,23 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                     "startup": "enabled",
                     "after": [DRIVER_SERVICE_NAME],
                     "environment": env,
+                },
+            },
+            "checks": {
+                READINESS_CHECK_NAME: {
+                    "override": "replace",
+                    "level": "ready",
+                    "period": CHECK_PERIOD,
+                    "timeout": CHECK_TIMEOUT,
+                    "threshold": CHECK_THRESHOLD,
+                    "tcp": {"port": int(GATEWAY_PORT), "host": "127.0.0.1"},
+                },
+                DRIVER_CHECK_NAME: {
+                    "override": "replace",
+                    "period": CHECK_PERIOD,
+                    "timeout": CHECK_TIMEOUT,
+                    "threshold": CHECK_THRESHOLD,
+                    "exec": {"command": f"test -S {DRIVER_SOCKET}"},
                 },
             },
         }

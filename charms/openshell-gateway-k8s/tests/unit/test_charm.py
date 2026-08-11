@@ -7,23 +7,31 @@ import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import ops.pebble
 import yaml
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, WaitingStatus
 from ops.testing import Container, Context, PeerRelation, Relation, Secret, State
 
+import config_model
 from charm import (
     APPLIED_HASH_KEY,
+    CHECK_PERIOD,
+    CHECK_THRESHOLD,
+    CHECK_TIMEOUT,
     CONTAINER_NAME,
+    DRIVER_CHECK_NAME,
     DRIVER_SERVICE_NAME,
     GATEWAY_CMD,
     PEER_RELATION,
     PEER_SECRET_ID_KEY,
+    READINESS_CHECK_NAME,
     RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
     _generate_jwt_keypair,
 )
+from config_model import DRIVER_SOCKET, GATEWAY_PORT
 
 RBAC_REQUIRED_MSG = "both oidc-admin-role and oidc-user-role must be set (RBAC required)"
 TOGETHER_ADMIN_MSG = (
@@ -769,3 +777,69 @@ class TestRollingRestartLifecycle:
             peer_rel2.local_unit_data[APPLIED_HASH_KEY]
             != peer_rel1.local_unit_data[APPLIED_HASH_KEY]
         )
+
+
+class TestPebbleChecks:
+    def test_readiness_check_constants(self):
+        assert READINESS_CHECK_NAME == "gateway-ready"
+        assert DRIVER_CHECK_NAME == "driver-ready"
+        assert int(GATEWAY_PORT) == 8443
+        assert CHECK_PERIOD == "3s"
+        assert CHECK_TIMEOUT == "3s"
+        assert CHECK_THRESHOLD == 2
+        assert DRIVER_SOCKET == "/var/run/openshell/lxd.sock"
+
+    def _pebble_layer(self) -> ops.pebble.LayerDict:
+        charm = object.__new__(OpenshellGatewayK8sCharm)
+        charm._model_cfg = config_model.GatewayConfig(**BOTH_ROLES)
+        return charm._pebble_layer(_DB_URI)
+
+    def test_pebble_layer_has_readiness_check(self):
+        from typing import Any, cast
+
+        layer = self._pebble_layer()
+
+        assert "checks" in layer
+        checks = layer["checks"]
+        assert set(checks) == {READINESS_CHECK_NAME, DRIVER_CHECK_NAME}
+
+        gateway_check = cast(dict[str, Any], checks[READINESS_CHECK_NAME])
+        assert gateway_check["override"] == "replace"
+        assert gateway_check["level"] == "ready"
+        assert gateway_check["period"] == CHECK_PERIOD
+        assert gateway_check["timeout"] == CHECK_TIMEOUT
+        assert gateway_check["threshold"] == CHECK_THRESHOLD
+        assert gateway_check["tcp"] == {"port": int(GATEWAY_PORT), "host": "127.0.0.1"}
+        assert "exec" not in gateway_check
+
+        driver_check = cast(dict[str, Any], checks[DRIVER_CHECK_NAME])
+        assert driver_check["override"] == "replace"
+        assert "level" not in driver_check
+        assert driver_check["period"] == CHECK_PERIOD
+        assert driver_check["timeout"] == CHECK_TIMEOUT
+        assert driver_check["threshold"] == CHECK_THRESHOLD
+        assert driver_check["exec"] == {"command": f"test -S {DRIVER_SOCKET}"}
+        assert "tcp" not in driver_check
+
+    def test_pebble_layer_round_trips_through_ops_layer(self):
+        layer = self._pebble_layer()
+        ops.pebble.Layer(layer)
+
+    def test_hash_covers_checks(self):
+        from typing import Any, cast
+
+        charm = object.__new__(OpenshellGatewayK8sCharm)
+        layer_with_checks = cast(dict[str, Any], self._pebble_layer())
+        layer_without_checks = cast(
+            ops.pebble.LayerDict,
+            {
+                "summary": layer_with_checks["summary"],
+                "services": layer_with_checks["services"],
+            },
+        )
+        toml = "[openshell.gateway]\nkey = 'value'\n"
+        cert = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----"
+
+        h_with = charm._workload_config_hash(layer_with_checks, toml, cert)
+        h_without = charm._workload_config_hash(layer_without_checks, toml, cert)
+        assert h_with != h_without
