@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import yaml
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, WaitingStatus
-from ops.testing import Container, Context, PeerRelation, Relation, State
+from ops.testing import Container, Context, PeerRelation, Relation, Secret, State
 
 from charm import (
     APPLIED_HASH_KEY,
@@ -18,9 +18,11 @@ from charm import (
     DRIVER_SERVICE_NAME,
     GATEWAY_CMD,
     PEER_RELATION,
+    PEER_SECRET_ID_KEY,
     RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
+    _generate_jwt_keypair,
 )
 
 RBAC_REQUIRED_MSG = "both oidc-admin-role and oidc-user-role must be set (RBAC required)"
@@ -380,6 +382,13 @@ class TestJwtKeypair:
         )
         assert pub.startswith("-----BEGIN PUBLIC KEY-----")
 
+    def test_generate_jwt_keypair_shape(self):
+        material = _generate_jwt_keypair()
+        assert set(material.keys()) == {"signing-key", "public-key", "kid"}
+        assert material["signing-key"].startswith("-----BEGIN PRIVATE KEY-----")
+        assert material["public-key"].startswith("-----BEGIN PUBLIC KEY-----")
+        assert material["kid"]
+
     def test_pushed_signing_key_starts_with_pem_header(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
@@ -460,6 +469,57 @@ class TestIdempotency:
         with p[0], p[1], p[2], p[3], p[4]:
             out2 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), out1)
         assert out2 is not None
+
+
+# ---------------------------------------------------------------------------
+# JWT key rotation convergence
+# ---------------------------------------------------------------------------
+
+
+class TestJwtRotationConvergence:
+    def _all_ready_state_with_secret(self, secret):
+        peer_rel = PeerRelation(
+            PEER_RELATION,
+            local_app_data={PEER_SECRET_ID_KEY: secret.id},
+        )
+        return State(
+            config=BOTH_ROLES,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                peer_rel,
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+            ],
+            secrets=[secret],
+            leader=True,
+        )
+
+    def test_secret_changed_rewrites_jwt_files_and_replans(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        old_jwt = {
+            "signing-key": "-----BEGIN PRIVATE KEY-----\nOLDSIGN\n-----END PRIVATE KEY-----",
+            "public-key": "-----BEGIN PUBLIC KEY-----\nOLDPUB\n-----END PUBLIC KEY-----",
+            "kid": "oldkid",
+        }
+        new_jwt = {
+            "signing-key": "-----BEGIN PRIVATE KEY-----\nNEWSIGN\n-----END PRIVATE KEY-----",
+            "public-key": "-----BEGIN PUBLIC KEY-----\nNEWPUB\n-----END PUBLIC KEY-----",
+            "kid": "newkid",
+        }
+        secret = Secret(tracked_content=old_jwt, latest_content=new_jwt)
+        state = self._all_ready_state_with_secret(secret)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2]:
+            out = ctx.run(ctx.on.secret_changed(secret), state)
+        fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
+        assert (fs / "etc" / "openshell" / "jwt" / "signing.key").read_text() == new_jwt[
+            "signing-key"
+        ]
+        assert (fs / "etc" / "openshell" / "jwt" / "public.pem").read_text() == new_jwt[
+            "public-key"
+        ]
+        assert SERVICE_NAME in out.get_container(CONTAINER_NAME).plan.services
 
 
 # ---------------------------------------------------------------------------

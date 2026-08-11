@@ -60,6 +60,37 @@ DATABASE_NAME = "openshell"
 GATEWAY_CMD = "/usr/bin/openshell-gateway --config /etc/openshell/config.toml"
 
 
+def _generate_jwt_keypair() -> dict[str, str]:
+    """Generate a fresh Ed25519 JWT signing keypair and return secret content.
+
+    Returns a dict with exactly the keys used in the peer secret:
+    ``signing-key`` (PKCS8 PEM), ``public-key`` (SubjectPublicKeyInfo PEM),
+    and ``kid`` (base64url-unpadded SHA-256 of a canonical JWK).
+    """
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    signing_key_pem = private_key.private_bytes(
+        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+    ).decode()
+    public_key_pem = public_key.public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+    ).decode()
+
+    raw_pub = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    x = base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode()
+    jwk_json = json.dumps(
+        {"crv": "Ed25519", "kty": "OKP", "x": x},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    kid = (
+        base64.urlsafe_b64encode(hashlib.sha256(jwk_json.encode()).digest()).rstrip(b"=").decode()
+    )
+
+    return {"signing-key": signing_key_pem, "public-key": public_key_pem, "kid": kid}
+
+
 @dataclass
 class _Gap:
     message: str
@@ -131,6 +162,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.on.get_oidc_client_config_action, self._on_get_oidc_client_config
         )
         self.framework.observe(self.on.get_gateway_status_action, self._on_get_gateway_status)
+        self.framework.observe(
+            self.on.rotate_jwt_signing_key_action, self._on_rotate_jwt_signing_key
+        )
 
     def _cert_request_attributes(self) -> CertificateRequestAttributes:
         sans_dns: list[str] = [
@@ -248,31 +282,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             if existing is not None:
                 secret_id = existing.id
             else:
-                private_key = Ed25519PrivateKey.generate()
-                public_key = private_key.public_key()
-
-                signing_key_pem = private_key.private_bytes(
-                    Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
-                ).decode()
-                public_key_pem = public_key.public_bytes(
-                    Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
-                ).decode()
-
-                raw_pub = public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
-                x = base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode()
-                jwk_json = json.dumps(
-                    {"crv": "Ed25519", "kty": "OKP", "x": x},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                kid = (
-                    base64.urlsafe_b64encode(hashlib.sha256(jwk_json.encode()).digest())
-                    .rstrip(b"=")
-                    .decode()
-                )
-
                 new_secret = self.app.add_secret(
-                    {"signing-key": signing_key_pem, "public-key": public_key_pem, "kid": kid},
+                    _generate_jwt_keypair(),
                     label=PEER_SECRET_LABEL,
                 )
                 secret_id = new_secret.id
@@ -644,6 +655,43 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 "readiness-gaps": ", ".join(g.message for g in gaps) or "none",
             }
         )
+
+    def _on_rotate_jwt_signing_key(self, event: ops.ActionEvent) -> None:
+        """Rotate the JWT signing keypair to a new revision of the peer secret."""
+        if not self.unit.is_leader():
+            event.fail("rotate-jwt-signing-key must run on the leader unit")
+            return
+
+        peer_rel = self.model.get_relation(PEER_RELATION)
+        if peer_rel is None:
+            event.fail(
+                "JWT signing-key secret not initialised yet; wait for the charm to become ready"
+            )
+            return
+
+        secret_id = peer_rel.data[self.app].get(PEER_SECRET_ID_KEY)
+        secret: ops.Secret | None = None
+        if secret_id:
+            try:
+                secret = self.model.get_secret(id=secret_id)
+            except (ops.SecretNotFoundError, ops.ModelError):
+                secret = None
+        if secret is None:
+            try:
+                secret = self.model.get_secret(label=PEER_SECRET_LABEL)
+            except (ops.SecretNotFoundError, ops.ModelError):
+                secret = None
+
+        if secret is None:
+            event.fail(
+                "JWT signing-key secret not initialised yet; wait for the charm to become ready"
+            )
+            return
+
+        new_material = _generate_jwt_keypair()
+        secret.set_content(new_material)
+        self._reconcile(event)
+        event.set_results({"kid": new_material["kid"]})
 
 
 if __name__ == "__main__":

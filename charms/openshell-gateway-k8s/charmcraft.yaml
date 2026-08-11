@@ -79,6 +79,10 @@ actions:
     description: Report the current readiness and configuration state of the gateway.
   restart:
     description: Roll a restart of the gateway workload across all units, one at a time.
+  rotate-jwt-signing-key:
+    description: >
+      Generate a new Ed25519 JWT signing keypair and publish it as a new
+      revision of the gateway's shared signing-key secret. Leader unit only.
 
 resources:
   gateway-image:

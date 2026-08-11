@@ -4,18 +4,23 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from ops.testing import Container, Context, PeerRelation, Relation, State
+from ops.testing import Container, Context, PeerRelation, Relation, Secret, State
 
 from charm import (
     APPLIED_HASH_KEY,
     CONTAINER_NAME,
     DRIVER_SERVICE_NAME,
+    PEER_RELATION,
+    PEER_SECRET_ID_KEY,
     RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
 )
 
 BOTH_ROLES = {"oidc-admin-role": "admin", "oidc-user-role": "user"}
+
+_FAKE_DB_URI = "postgresql://user:pass@db/openshell?sslmode=require"
+_FAKE_OAUTH_ISSUER = "https://hydra.example.com"
 
 _FAKE_TLS_CERT = MagicMock(
     certificate="-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----",
@@ -157,3 +162,101 @@ class TestRestartAction:
         restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
         peer_rel = next(r for r in out.relations if r.endpoint == RESTART_RELATION)
         assert APPLIED_HASH_KEY in peer_rel.local_unit_data
+
+
+class TestRotateJwtSigningKey:
+    _OLD_JWT = {
+        "signing-key": "-----BEGIN PRIVATE KEY-----\nOLDSIGN\n-----END PRIVATE KEY-----",
+        "public-key": "-----BEGIN PUBLIC KEY-----\nOLDPUB\n-----END PUBLIC KEY-----",
+        "kid": "oldkid",
+    }
+
+    def _state_with_secret(self, secret, leader=False):
+        peer_rel = PeerRelation(
+            PEER_RELATION,
+            local_app_data={PEER_SECRET_ID_KEY: secret.id},
+        )
+        return State(
+            config=BOTH_ROLES,
+            containers=[Container(CONTAINER_NAME, can_connect=True)],
+            relations=[peer_rel],
+            secrets=[secret],
+            leader=leader,
+        )
+
+    def test_non_leader_fails(self):
+        import pytest
+        from ops._private.harness import ActionFailed
+
+        ctx = Context(OpenshellGatewayK8sCharm)
+        secret = Secret(tracked_content=self._OLD_JWT, owner="app")
+        state = self._state_with_secret(secret, leader=False)
+        with pytest.raises(ActionFailed) as exc_info:
+            ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
+        assert exc_info.value.message == "rotate-jwt-signing-key must run on the leader unit"
+        assert secret.latest_content == self._OLD_JWT
+
+    def test_uninitialised_secret_fails(self):
+        import pytest
+        from ops._private.harness import ActionFailed
+
+        ctx = Context(OpenshellGatewayK8sCharm)
+        peer_rel = PeerRelation(PEER_RELATION, local_app_data={})
+        state = State(
+            config=BOTH_ROLES,
+            containers=[Container(CONTAINER_NAME, can_connect=True)],
+            relations=[peer_rel],
+            leader=True,
+        )
+        with pytest.raises(ActionFailed) as exc_info:
+            ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
+        assert (
+            exc_info.value.message
+            == "JWT signing-key secret not initialised yet; wait for the charm to become ready"
+        )
+        assert not ctx._output_state.secrets
+
+    def test_leader_creates_revision_and_returns_new_kid(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        secret = Secret(tracked_content=self._OLD_JWT, owner="app")
+        state = self._state_with_secret(secret, leader=True)
+        with (
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=None),
+            patch.object(OpenshellGatewayK8sCharm, "_tls_material", return_value=(None, None)),
+            patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=None),
+        ):
+            out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
+        results = ctx.action_results
+        assert results["kid"] != self._OLD_JWT["kid"]
+        assert results["kid"]
+        updated_secret = next(s for s in out.secrets if s.id == secret.id)
+        assert updated_secret.latest_content["kid"] == results["kid"]
+
+    def test_leader_rotation_replans_when_ready(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        secret = Secret(tracked_content=self._OLD_JWT, owner="app")
+        state = self._state_with_secret(secret, leader=True)
+        with (
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_FAKE_DB_URI),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_tls_material",
+                return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_FAKE_OAUTH_ISSUER
+            ),
+        ):
+            out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
+        results = ctx.action_results
+        updated_secret = next(s for s in out.secrets if s.id == secret.id)
+        assert updated_secret.latest_content["kid"] == results["kid"]
+        assert results["kid"] != self._OLD_JWT["kid"]
+        fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
+        assert (
+            fs / "etc" / "openshell" / "jwt" / "signing.key"
+        ).read_text() == updated_secret.latest_content["signing-key"]
+        assert (
+            fs / "etc" / "openshell" / "jwt" / "public.pem"
+        ).read_text() == updated_secret.latest_content["public-key"]
+        assert SERVICE_NAME in out.get_container(CONTAINER_NAME).plan.services
