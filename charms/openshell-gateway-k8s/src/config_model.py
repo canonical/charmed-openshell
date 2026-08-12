@@ -47,6 +47,13 @@ TLS_DIR: str = "/etc/openshell/tls"
 # crates/openshell-server lands its config parser (FD-004).
 GATEWAY_ID: str = "openshell-gateway"
 
+# Default minted-token lifetime for shared Kubernetes deployments.
+JWT_TTL_SECS: int = 3600
+
+# Path to the key-id file delivered alongside the JWT signing/public key
+# material.  The charm writes the kid here and the renderer emits the path.
+JWT_KID_PATH: str = f"{JWT_DIR}/kid"
+
 
 # ---------------------------------------------------------------------------
 # Pydantic v2 config model
@@ -68,6 +75,8 @@ class GatewayConfig(pydantic.BaseModel):
     oidc_admin_role: str | None = Field(default=None, alias="oidc-admin-role")
     oidc_user_role: str | None = Field(default=None, alias="oidc-user-role")
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
+    gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
+    jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
 
     # ------------------------------------------------------------------
     # Field validators
@@ -92,6 +101,7 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_roles_claim",
         "oidc_admin_role",
         "oidc_user_role",
+        "gateway_id",
         mode="after",
     )
     @classmethod
@@ -186,7 +196,7 @@ def render_config_toml(
     tls_key_path: str,
     jwt_signing_key_path: str,
     jwt_public_key_path: str,
-    jwt_kid: str,
+    jwt_kid_path: str,
     redirect_uri: str,
 ) -> str:
     """Return the workload ``config.toml`` as a string.
@@ -194,11 +204,12 @@ def render_config_toml(
     Pure function — no filesystem access, no ``ops`` imports.  All paths are
     passed in so the function is trivially unit-testable.
 
-    The binary uses ``[openshell.gateway]``, ``[openshell.gateway.tls]``, and
-    ``[openshell.gateway.oidc]`` sections.  The database URL is supplied via
-    the ``OPENSHELL_DB_URL`` env var (handled by the Pebble layer), not here.
-    The ``gateway_jwt`` section and ``redirect_uri`` are not part of the
-    server-side config for the current binary version.
+    The binary uses ``[openshell.gateway]``, ``[openshell.gateway.tls]``,
+    ``[openshell.gateway.oidc]``, and ``[openshell.gateway.gateway_jwt]``
+    sections.  The database URL is supplied via the ``OPENSHELL_DB_URL`` env
+    var (handled by the Pebble layer), not here.  ``redirect_uri`` is kept as
+    an argument for backwards compatibility but is not rendered in this
+    version.
     """
     assert cfg.oidc_admin_role is not None
     assert cfg.oidc_user_role is not None
@@ -222,6 +233,13 @@ def render_config_toml(
         f"admin_role = {q(cfg.oidc_admin_role)}",
         f"user_role = {q(cfg.oidc_user_role)}",
         "",
+        "[openshell.gateway.gateway_jwt]",
+        f"signing_key_path = {q(jwt_signing_key_path)}",
+        f"public_key_path = {q(jwt_public_key_path)}",
+        f"kid_path = {q(jwt_kid_path)}",
+        f"gateway_id = {q(cfg.gateway_id)}",
+        f"ttl_secs = {cfg.jwt_ttl_secs}",
+        "",
     ]
     return "\n".join(lines)
 
@@ -239,7 +257,7 @@ def render_env(cfg: GatewayConfig) -> dict[str, str]:
     - ``OPENSHELL_DB_URL`` (relation-sourced, FD-003)
     - TLS certificate paths (FD-003)
     - OIDC issuer URL (FD-003)
-    - All ``config.toml`` / ``gateway_jwt.*`` assembly (FD-003/FD-006)
+    - ``gateway_jwt.*`` assembly (rendered into ``config.toml`` by FD-005)
     - ``OPENSHELL_ALLOW_UNAUTHENTICATED`` (option deliberately absent)
     - ``OPENSHELL_DISABLE_TLS`` (option deliberately absent)
     """

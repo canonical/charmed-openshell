@@ -220,20 +220,24 @@ class TestActiveScenario:
         assert SERVICE_NAME in plan.services
         assert plan.services[SERVICE_NAME].command == GATEWAY_CMD
 
-    def test_config_toml_pushed_with_gateway_id(self):
+    def test_config_toml_pushed_with_gateway_jwt(self):
         out, ctx = self._run_pebble_ready()
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         config_path = fs / "etc" / "openshell" / "config.toml"
         assert config_path.exists()
-        # The config.toml contains gateway configuration sections, not gateway_id field
-        # Verify that the openshell.gateway section is present
-        assert "[openshell.gateway]" in config_path.read_text()
+        text = config_path.read_text()
+        assert "[openshell.gateway]" in text
+        assert "[openshell.gateway.gateway_jwt]" in text
+        assert 'gateway_id = "openshell-gateway"' in text
+        assert "ttl_secs = 3600" in text
 
     def test_jwt_files_pushed(self):
         out, ctx = self._run_pebble_ready()
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         assert (fs / "etc" / "openshell" / "jwt" / "signing.key").exists()
         assert (fs / "etc" / "openshell" / "jwt" / "public.pem").exists()
+        assert (fs / "etc" / "openshell" / "jwt" / "kid").exists()
+        assert (fs / "etc" / "openshell" / "jwt" / "kid").read_text() == _FAKE_JWT["kid"]
 
     def test_tls_files_pushed(self):
         out, ctx = self._run_pebble_ready()

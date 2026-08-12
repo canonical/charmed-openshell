@@ -411,7 +411,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self,
         db_uri: str,
         issuer_url: str,
-        jwt_kid: str,
     ) -> str:
         """Render gateway.toml from the current desired state."""
         assert self._model_cfg is not None
@@ -423,7 +422,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             tls_key_path=f"{TLS_DIR}/tls.key",
             jwt_signing_key_path=f"{JWT_DIR}/signing.key",
             jwt_public_key_path=f"{JWT_DIR}/public.pem",
-            jwt_kid=jwt_kid,
+            jwt_kid_path=f"{JWT_DIR}/kid",
             redirect_uri=self._redirect_uri(),
         )
 
@@ -446,6 +445,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         container.push(
             f"{JWT_DIR}/public.pem", jwt_public_key_pem, make_dirs=True, permissions=0o644
         )
+        # Key ID is delivered as a path-oriented file, matching how the other
+        # JWT material is exposed to the workload.
+        container.push(f"{JWT_DIR}/kid", jwt_kid, make_dirs=True, permissions=0o644)
         container.push(f"{TLS_DIR}/tls.crt", tls_cert_pem, make_dirs=True, permissions=0o644)
         container.push(f"{TLS_DIR}/tls.key", tls_key_pem, make_dirs=True, permissions=0o600)
         container.push(f"{TLS_DIR}/ca.crt", tls_ca_pem, make_dirs=True, permissions=0o644)
@@ -463,7 +465,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             proc.wait_output()
         except Exception:
             pass  # best-effort; OIDC discovery will fail if this does
-        config_toml = self._render_config_toml(db_uri, issuer_url, jwt_kid)
+        config_toml = self._render_config_toml(db_uri, issuer_url)
         container.push(CONFIG_PATH, config_toml, make_dirs=True, permissions=0o600)
         return config_toml
 
@@ -611,7 +613,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return
 
         layer = self._pebble_layer(db_uri)
-        config_toml = self._render_config_toml(db_uri, issuer, jwt["kid"])
+        config_toml = self._render_config_toml(db_uri, issuer)
         container.restart(SERVICE_NAME, DRIVER_SERVICE_NAME)
         self._set_applied_hash(
             self._workload_config_hash(layer, config_toml, str(tls_cert.certificate))

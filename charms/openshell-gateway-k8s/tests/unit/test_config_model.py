@@ -42,7 +42,7 @@ BOTH_ROLES_MINIMAL = {
 
 
 class TestConfigSurface:
-    def test_parse_all_six_keys(self):
+    def test_parse_all_eight_keys(self):
         cfg = GatewayConfig.model_validate(VALID_CONFIG)
         assert cfg.external_hostname == "gateway.example.com"
         assert cfg.oidc_audience == "openshell-cli"
@@ -50,6 +50,8 @@ class TestConfigSurface:
         assert cfg.oidc_admin_role == "admin"
         assert cfg.oidc_user_role == "user"
         assert cfg.log_level == "info"
+        assert cfg.gateway_id == "openshell-gateway"
+        assert cfg.jwt_ttl_secs == 3600
 
     def test_no_disable_tls_field(self):
         # These options must never be declared as fields anywhere.
@@ -128,6 +130,7 @@ class TestRBACValidation:
             "external-hostname",
             "oidc-audience",
             "oidc-roles-claim",
+            "gateway-id",
         ],
     )
     def test_control_char_newline_rejected(self, field):
@@ -155,6 +158,19 @@ class TestRBACValidation:
         """Empty string in a non-optional field is NOT normalised — it fails validation."""
         with pytest.raises(ValidationError):
             GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "log-level": ""})
+
+    @pytest.mark.parametrize("value", [0, -1, -3600])
+    def test_jwt_ttl_secs_must_be_positive(self, value):
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "jwt-ttl-secs": value})
+
+    def test_jwt_ttl_secs_rejects_non_integer(self):
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "jwt-ttl-secs": "one-hour"})
+
+    def test_gateway_id_empty_rejected(self):
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "gateway-id": ""})
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +347,7 @@ _TOML_KWARGS = {
     "tls_key_path": "/etc/openshell/tls/tls.key",
     "jwt_signing_key_path": "/etc/openshell/jwt/signing.key",
     "jwt_public_key_path": "/etc/openshell/jwt/public.pem",
-    "jwt_kid": "abc123",
+    "jwt_kid_path": "/etc/openshell/jwt/kid",
     "redirect_uri": "https://gw.example.com/oauth/unused",
 }
 
@@ -343,17 +359,23 @@ class TestRenderConfigToml:
     def _render(self, **overrides):
         return render_config_toml(self._cfg(), **{**_TOML_KWARGS, **overrides})
 
-    def test_gateway_id_is_openshell_gateway(self):
+    def test_gateway_id_defaults_to_constant(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.gateway_id == GATEWAY_ID == "openshell-gateway"
+
+    def test_gateway_id_is_rendered(self):
         toml = self._render()
-        # GATEWAY_ID is a constant but not part of the rendered config.toml
-        # The binary configuration uses gateway configuration sections instead
-        assert GATEWAY_ID == "openshell-gateway"
-        assert "[openshell.gateway]" in toml
+        assert f'gateway_id = "{GATEWAY_ID}"' in toml
+
+    def test_gateway_id_can_be_overridden(self):
+        cfg = GatewayConfig.model_validate({**VALID_CONFIG, "gateway-id": "custom-gateway"})
+        toml = render_config_toml(cfg, **_TOML_KWARGS)
+        assert 'gateway_id = "custom-gateway"' in toml
 
     def test_database_url_in_output(self):
         toml = self._render()
         # Database URL is passed via OPENSHELL_DB_URL env var, not in config.toml
-        # The config.toml only contains gateway, TLS, and OIDC configuration
+        # The config.toml only contains gateway, TLS, OIDC, and gateway_jwt configuration
         assert "[openshell.gateway]" in toml
 
     def test_oidc_section(self):
@@ -368,10 +390,27 @@ class TestRenderConfigToml:
         assert "tls.key" in toml
 
     def test_gateway_jwt_section(self):
+        import tomllib
+
         toml = self._render()
-        # gateway_jwt section is not part of the server-side config for the current binary version
-        # Configuration is passed via environment variables (FD-003)
-        assert "[gateway_jwt]" not in toml
+        parsed = tomllib.loads(toml)
+        section = parsed["openshell"]["gateway"]["gateway_jwt"]
+        assert section["signing_key_path"] == _TOML_KWARGS["jwt_signing_key_path"]
+        assert section["public_key_path"] == _TOML_KWARGS["jwt_public_key_path"]
+        assert section["kid_path"] == _TOML_KWARGS["jwt_kid_path"]
+        assert section["gateway_id"] == GATEWAY_ID
+        assert section["ttl_secs"] == 3600
+        assert isinstance(section["ttl_secs"], int)
+        assert section["ttl_secs"] > 0
+
+    def test_jwt_ttl_secs_defaults_to_one_hour(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.jwt_ttl_secs == 3600
+
+    def test_jwt_ttl_secs_can_be_overridden(self):
+        cfg = GatewayConfig.model_validate({**VALID_CONFIG, "jwt-ttl-secs": 7200})
+        toml = render_config_toml(cfg, **_TOML_KWARGS)
+        assert "ttl_secs = 7200" in toml
 
     def test_is_string(self):
         toml = self._render()

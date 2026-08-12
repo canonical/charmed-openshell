@@ -120,3 +120,16 @@ config:
       type: string
       default: info
       description: "Log verbosity level. One of: debug, info, warn, error."
+    gateway-id:
+      type: string
+      default: openshell-gateway
+      description: >
+        Stable identity for this gateway deployment, embedded in every minted
+        JWT. Must match the value expected by sandbox supervisors that verify
+        gateway-issued tokens.
+    jwt-ttl-secs:
+      type: int
+      default: 3600
+      description: >
+        Lifetime, in seconds, of tokens minted by the gateway for sandbox
+        supervisor authentication. Must be a positive integer.
