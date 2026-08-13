@@ -260,3 +260,63 @@ class TestRotateJwtSigningKey:
             fs / "etc" / "openshell" / "jwt" / "public.pem"
         ).read_text() == updated_secret.latest_content["public-key"]
         assert SERVICE_NAME in out.get_container(CONTAINER_NAME).plan.services
+
+    def test_leader_rotation_invalidates_hash_and_restarts_workload(self):
+        """Running rotate-jwt-signing-key changes the workload hash and triggers a restart."""
+        ctx = Context(OpenshellGatewayK8sCharm)
+        secret = Secret(tracked_content=self._OLD_JWT, owner="app")
+        peer_rel = PeerRelation(
+            PEER_RELATION,
+            local_app_data={PEER_SECRET_ID_KEY: secret.id},
+        )
+        restart_rel = PeerRelation(RESTART_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[Container(CONTAINER_NAME, can_connect=True)],
+            relations=[
+                peer_rel,
+                restart_rel,
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+            ],
+            secrets=[secret],
+        )
+        with (
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_FAKE_DB_URI),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_tls_material",
+                return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_FAKE_OAUTH_ISSUER
+            ),
+            patch("ops.model.Container.restart") as restart_mock,
+        ):
+            out1 = ctx.run(ctx.on.pebble_ready(Container(CONTAINER_NAME, can_connect=True)), state)
+
+        peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
+        hash_before = peer_rel1.local_unit_data[APPLIED_HASH_KEY]
+
+        with (
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_FAKE_DB_URI),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_tls_material",
+                return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_FAKE_OAUTH_ISSUER
+            ),
+            patch("ops.model.Container.restart") as restart_mock,
+        ):
+            out2 = ctx.run(ctx.on.action("rotate-jwt-signing-key"), out1)
+
+        results = ctx.action_results
+        assert results["kid"] != self._OLD_JWT["kid"]
+        restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        peer_rel2 = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
+        hash_after = peer_rel2.local_unit_data[APPLIED_HASH_KEY]
+        assert hash_after != hash_before

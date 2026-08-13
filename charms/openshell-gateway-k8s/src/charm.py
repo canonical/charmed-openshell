@@ -550,7 +550,14 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 "it will keep retrying via its own backoff",
             )
 
-        desired_hash = self._workload_config_hash(layer, config_toml, str(tls_cert.certificate))
+        desired_hash = self._workload_config_hash(
+            layer,
+            config_toml,
+            str(tls_cert.certificate),
+            jwt["signing-key"],
+            jwt["public-key"],
+            jwt["kid"],
+        )
         self._ensure_restart_state(event, desired_hash)
 
         # Re-publish CA to any joined send-ca-cert relations.
@@ -562,9 +569,19 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         layer: ops.pebble.LayerDict,
         config_toml: str,
         tls_cert_pem: str,
+        jwt_signing_key_pem: str,
+        jwt_public_key_pem: str,
+        jwt_kid: str,
     ) -> str:
         """Return a deterministic hex SHA-256 of the workload inputs."""
-        payload = json.dumps(layer, sort_keys=True) + config_toml + tls_cert_pem
+        payload = (
+            json.dumps(layer, sort_keys=True)
+            + config_toml
+            + tls_cert_pem
+            + jwt_signing_key_pem
+            + jwt_public_key_pem
+            + jwt_kid
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _applied_hash(self) -> str | None:
@@ -616,7 +633,14 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         config_toml = self._render_config_toml(db_uri, issuer)
         container.restart(SERVICE_NAME, DRIVER_SERVICE_NAME)
         self._set_applied_hash(
-            self._workload_config_hash(layer, config_toml, str(tls_cert.certificate))
+            self._workload_config_hash(
+                layer,
+                config_toml,
+                str(tls_cert.certificate),
+                jwt["signing-key"],
+                jwt["public-key"],
+                jwt["kid"],
+            )
         )
 
     def _on_restart_action(self, event: ops.ActionEvent) -> None:

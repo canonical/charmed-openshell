@@ -649,7 +649,10 @@ class TestWorkloadConfigHash:
         }
         toml = "[openshell.gateway]\nkey = 'value'\n"
         cert = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----"
-        h1 = charm._workload_config_hash(layer, toml, cert)
+        signing = "-----BEGIN PRIVATE KEY-----\nSIGN\n-----END PRIVATE KEY-----"
+        public = "-----BEGIN PUBLIC KEY-----\nPUB\n-----END PUBLIC KEY-----"
+        kid = "kid1"
+        h1 = charm._workload_config_hash(layer, toml, cert, signing, public, kid)
 
         # Reordered dict keys inside the layer produce the same hash.
         layer2 = {
@@ -668,12 +671,15 @@ class TestWorkloadConfigHash:
                 },
             },
         }
-        h2 = charm._workload_config_hash(layer2, toml, cert)
+        h2 = charm._workload_config_hash(layer2, toml, cert, signing, public, kid)
         assert h1 == h2
 
         # Changing any component changes the hash.
-        assert charm._workload_config_hash(layer, toml + "#", cert) != h1
-        assert charm._workload_config_hash(layer, toml, cert + "X") != h1
+        assert charm._workload_config_hash(layer, toml + "#", cert, signing, public, kid) != h1
+        assert charm._workload_config_hash(layer, toml, cert + "X", signing, public, kid) != h1
+        assert charm._workload_config_hash(layer, toml, cert, signing + "X", public, kid) != h1
+        assert charm._workload_config_hash(layer, toml, cert, signing, public + "X", kid) != h1
+        assert charm._workload_config_hash(layer, toml, cert, signing, public, kid + "X") != h1
 
 
 class TestRollingRestartLifecycle:
@@ -782,6 +788,68 @@ class TestRollingRestartLifecycle:
             != peer_rel1.local_unit_data[APPLIED_HASH_KEY]
         )
 
+    def test_jwt_rotation_triggers_lock(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        rotated_jwt = {
+            "signing-key": "-----BEGIN PRIVATE KEY-----\nROTATED\n-----END PRIVATE KEY-----",
+            "public-key": "-----BEGIN PUBLIC KEY-----\nROTATED\n-----END PUBLIC KEY-----",
+            "kid": "rotatedkid",
+        }
+        with (
+            p[0],
+            p[1],
+            p[2],
+            patch.object(
+                OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=rotated_jwt
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=rotated_jwt),
+            patch("ops.model.Container.restart") as restart_mock,
+        ):
+            out2 = ctx.run(ctx.on.config_changed(), out1)
+
+        restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
+        peer_rel2 = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
+        assert (
+            peer_rel2.local_unit_data[APPLIED_HASH_KEY]
+            != peer_rel1.local_unit_data[APPLIED_HASH_KEY]
+        )
+
+    def test_jwt_rotation_writes_kid_file(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4]:
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        rotated_jwt = {
+            "signing-key": "-----BEGIN PRIVATE KEY-----\nROTATED\n-----END PRIVATE KEY-----",
+            "public-key": "-----BEGIN PUBLIC KEY-----\nROTATED\n-----END PUBLIC KEY-----",
+            "kid": "rotatedkid",
+        }
+        with (
+            p[0],
+            p[1],
+            p[2],
+            patch.object(
+                OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=rotated_jwt
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=rotated_jwt),
+            patch("ops.model.Container.restart"),
+        ):
+            out2 = ctx.run(ctx.on.config_changed(), out1)
+
+        fs = out2.get_container(CONTAINER_NAME).get_filesystem(ctx)
+        assert (fs / "etc" / "openshell" / "jwt" / "kid").read_text() == rotated_jwt["kid"]
+        assert (fs / "etc" / "openshell" / "jwt" / "public.pem").read_text() == rotated_jwt[
+            "public-key"
+        ]
+
 
 class TestPebbleChecks:
     def test_readiness_check_constants(self):
@@ -844,6 +912,11 @@ class TestPebbleChecks:
         toml = "[openshell.gateway]\nkey = 'value'\n"
         cert = "-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----"
 
-        h_with = charm._workload_config_hash(layer_with_checks, toml, cert)
-        h_without = charm._workload_config_hash(layer_without_checks, toml, cert)
+        signing = "-----BEGIN PRIVATE KEY-----\nSIGN\n-----END PRIVATE KEY-----"
+        public = "-----BEGIN PUBLIC KEY-----\nPUB\n-----END PUBLIC KEY-----"
+        kid = "kid1"
+        h_with = charm._workload_config_hash(layer_with_checks, toml, cert, signing, public, kid)
+        h_without = charm._workload_config_hash(
+            layer_without_checks, toml, cert, signing, public, kid
+        )
         assert h_with != h_without
