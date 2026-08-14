@@ -24,3 +24,20 @@ def test_config_options_declared():
     assert "default-projects" in options
     assert "trust-name-prefix" in options
     assert options["trust-name-prefix"]["default"] == "juju-relation"
+
+
+def test_relations_declared():
+    with open("charmcraft.yaml") as f:
+        metadata = yaml.safe_load(f)
+
+    assert metadata["provides"]["https"]["interface"] == "lxd-https"
+    assert metadata["peers"]["integrator-peers"]["interface"] == "integrator_peers"
+
+
+def test_actions_declared():
+    with open("charmcraft.yaml") as f:
+        metadata = yaml.safe_load(f)
+
+    actions = metadata["actions"]
+    assert "get-connection-info" in actions
+    assert "list-trusted-clients" in actions

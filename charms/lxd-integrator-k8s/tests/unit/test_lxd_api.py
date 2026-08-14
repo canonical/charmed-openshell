@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from lxd_api import LxdApiError, LxdClient, LxdConnectionError, VerificationError
+from lxd_api import LxdApiError, LxdClient, LxdConnectionError, VerificationError, pem_fingerprint
 from verification_mode import VerificationMode
 
 
@@ -292,3 +292,70 @@ def test_all_endpoints_exhausted(cert_pair):
     )
     with pytest.raises(LxdConnectionError):
         client.get_server_info()
+
+
+def test_pem_fingerprint_matches_lxd_field(cert_pair):
+    cert_pem, _key_pem, cert_der = cert_pair
+    expected = hashlib.sha256(cert_der).hexdigest()
+    assert pem_fingerprint(cert_pem) == expected
+
+
+def test_get_current_identity(cert_pair):
+    cert_pem, key_pem, cert_der = cert_pair
+    fingerprint = hashlib.sha256(cert_der).hexdigest()
+    conn = FakeConnection(
+        cert_der,
+        json.dumps({"metadata": {"type": "Client certificate", "name": "integrator"}}).encode(),
+    )
+    client = LxdClient(
+        endpoints=(("localhost", 8443),),
+        verification_mode=VerificationMode.FINGERPRINT,
+        server_pin=fingerprint,
+        client_cert=cert_pem,
+        client_key=key_pem,
+        connection_factory=lambda _h, _p: conn,
+    )
+    assert client.get_current_identity() == {
+        "type": "Client certificate",
+        "name": "integrator",
+    }
+
+
+def test_add_trusted_certificate_sets_restricted(cert_pair):
+    cert_pem, key_pem, cert_der = cert_pair
+    fingerprint = hashlib.sha256(cert_der).hexdigest()
+    conn = FakeConnection(cert_der, json.dumps({"metadata": {}}).encode())
+    client = LxdClient(
+        endpoints=(("localhost", 8443),),
+        verification_mode=VerificationMode.FINGERPRINT,
+        server_pin=fingerprint,
+        client_cert=cert_pem,
+        client_key=key_pem,
+        connection_factory=lambda _h, _p: conn,
+    )
+    client.add_trusted_certificate(cert_pem, "test", projects=["default"])
+    assert conn.requests
+    method, path, body, _headers = conn.requests[0]
+    assert method == "POST"
+    assert path == "/1.0/certificates"
+    payload = json.loads(body or b"{}")
+    assert payload["restricted"] is True
+    assert payload["projects"] == ["default"]
+
+
+def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
+    cert_pem, key_pem, cert_der = cert_pair
+    fingerprint = hashlib.sha256(cert_der).hexdigest()
+    conn = FakeConnection(cert_der, json.dumps({"metadata": {}}).encode())
+    client = LxdClient(
+        endpoints=(("localhost", 8443),),
+        verification_mode=VerificationMode.FINGERPRINT,
+        server_pin=fingerprint,
+        client_cert=cert_pem,
+        client_key=key_pem,
+        connection_factory=lambda _h, _p: conn,
+    )
+    client.add_trusted_certificate(cert_pem, "test", projects=[])
+    payload = json.loads(conn.requests[0][2] or b"{}")
+    assert "restricted" not in payload
+    assert payload["projects"] == []

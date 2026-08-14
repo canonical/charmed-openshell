@@ -93,3 +93,40 @@ def test_load_config_error():
     assert model is None
     assert err is not None
     assert not err.startswith("Value error")
+
+
+def test_empty_trust_name_prefix_rejected():
+    _, err = load_config(
+        {
+            "lxd-endpoints": "localhost",
+            "client-cert": "C",
+            "client-key": "K",
+            "server-cert": "S",
+            "trust-name-prefix": "   ",
+        }
+    )
+    assert "trust-name-prefix cannot be empty" in err
+
+
+def test_parsed_projects():
+    cfg = IntegratorConfig.model_validate(
+        {
+            "lxd-endpoints": "localhost",
+            "client-cert": "C",
+            "client-key": "K",
+            "server-cert": "S",
+            "default-projects": "a, b ,",
+        }
+    )
+    assert cfg.parsed_projects == ["a", "b"]
+
+    cfg_empty = IntegratorConfig.model_validate(
+        {
+            "lxd-endpoints": "localhost",
+            "client-cert": "C",
+            "client-key": "K",
+            "server-cert": "S",
+            "default-projects": "",
+        }
+    )
+    assert cfg_empty.parsed_projects == []

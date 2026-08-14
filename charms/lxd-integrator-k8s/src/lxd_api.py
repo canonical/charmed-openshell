@@ -38,6 +38,14 @@ class LxdConnectionError(Exception):
 ConnectionFactory = Callable[[str, int], http.client.HTTPSConnection]
 
 
+def pem_fingerprint(cert_pem: str) -> str:
+    """Return the lowercase SHA-256 hex digest of a PEM certificate's DER form.
+
+    This matches the ``fingerprint`` field LXD stores in trust entries.
+    """
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert_pem)).hexdigest()
+
+
 class LxdClient:
     """Stateful LXD API client with connection-per-call semantics.
 
@@ -151,6 +159,14 @@ class LxdClient:
             return {}
         return metadata
 
+    def get_current_identity(self) -> dict:
+        """Return the ``metadata`` object from ``GET /1.0/auth/identities/current``."""
+        response = self._request("GET", "/1.0/auth/identities/current")
+        metadata = response.get("metadata", {})
+        if not isinstance(metadata, dict):
+            return {}
+        return metadata
+
     def list_trusted_certificates(self) -> list[dict]:
         """Return the trust list from ``GET /1.0/certificates``."""
         response = self._request("GET", "/1.0/certificates")
@@ -177,6 +193,8 @@ class LxdClient:
         }
         if projects is not None:
             data["projects"] = projects
+            if projects:
+                data["restricted"] = True
         if trust_token is not None:
             data["trust_token"] = trust_token
 

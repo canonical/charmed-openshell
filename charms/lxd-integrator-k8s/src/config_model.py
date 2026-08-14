@@ -72,6 +72,17 @@ class IntegratorConfig(pydantic.BaseModel):
             return None
         return v
 
+    @field_validator("trust_name_prefix", mode="after")
+    @classmethod
+    def _trust_name_prefix_non_empty(cls, v: str) -> str:
+        """Reject an empty or whitespace-only trust name prefix."""
+        if v.strip() == "":
+            raise PydanticCustomError(
+                "trust_name_prefix_empty",
+                "trust-name-prefix cannot be empty",
+            )
+        return v
+
     @field_validator("lxd_endpoints", mode="after")
     @classmethod
     def _endpoints_valid(cls, v: str) -> str:
@@ -120,6 +131,13 @@ class IntegratorConfig(pydantic.BaseModel):
     def endpoints(self) -> tuple[tuple[str, int], ...]:
         """Preference-ordered endpoint list parsed from ``lxd-endpoints``."""
         return parse_endpoints(self.lxd_endpoints)
+
+    @property
+    def parsed_projects(self) -> list[str]:
+        """Default projects split into a stripped, non-empty list."""
+        if self.default_projects is None:
+            return []
+        return [part.strip() for part in self.default_projects.split(",") if part.strip()]
 
     @property
     def verification_mode(self) -> VerificationMode:

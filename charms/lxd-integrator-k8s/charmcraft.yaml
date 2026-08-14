@@ -4,13 +4,31 @@ title: LXD Integrator K8s
 summary: Workload-less integrator charm for unmanaged LXD servers.
 description: |
   Holds administrative LXD credentials for unmanaged LXD servers. This
-  workload-less charm validates configuration and exposes a minimal LXD REST
-  client; relation-based trust-store management is deferred to the follow-on
-  feature.
+  workload-less charm registers requirer certificates in the LXD trust store
+  and publishes connection information over the lxd-https interface.
 
 assumes:
   - k8s-api
   - juju >= 3.4
+
+provides:
+  https:
+    interface: lxd-https
+
+peers:
+  integrator-peers:
+    interface: integrator_peers
+
+actions:
+  get-connection-info:
+    description: |
+      Report whether the configured client certificate is trusted by LXD, the
+      configured endpoint, the server certificate fingerprint, and the addresses
+      published to requirers. Fails cleanly when LXD is unreachable.
+  list-trusted-clients:
+    description: |
+      List trust-store entries owned by this charm (matching trust-name-prefix).
+      Fails cleanly when LXD is unreachable.
 
 base: ubuntu@24.04
 platforms:
