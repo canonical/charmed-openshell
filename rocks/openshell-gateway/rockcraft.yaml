@@ -37,7 +37,7 @@ parts:
   driver-lxd:
     plugin: rust
     source: https://github.com/canonical/openshell-driver-lxd.git
-    source-commit: e24758bdc957c80d1029a680a508e5327b34f272
+    source-commit: e591558cd2cf9f62a8d942f328d3c9a2627f1f73
     source-subdir: crates/openshell-driver-lxd
     build-packages:
       - pkg-config

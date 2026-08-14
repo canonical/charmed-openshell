@@ -44,8 +44,13 @@ run_in_rock() {
 # ---------------------------------------------------------------------------
 echo "==> Check: openshell-gateway --help"
 docker run --rm --entrypoint /usr/bin/openshell-gateway "${IMAGE}" --help
+
 echo "==> Check: openshell-driver-lxd --help"
-docker run --rm --entrypoint /usr/bin/openshell-driver-lxd "${IMAGE}" --help
+DRIVER_HELP=$(docker run --rm --entrypoint /usr/bin/openshell-driver-lxd "${IMAGE}" --help)
+
+echo "==> Check: openshell-driver-lxd advertises --lxd-url"
+grep -q -- '--lxd-url' <<<"${DRIVER_HELP}" \
+  || { echo "ERROR: openshell-driver-lxd --help does not advertise --lxd-url; driver pin regressed to a build without the LXD client" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 2. Binaries exist at expected stable paths.
