@@ -1,0 +1,62 @@
+name: lxd-integrator-k8s
+type: charm
+title: LXD Integrator K8s
+summary: Workload-less integrator charm for unmanaged LXD servers.
+description: |
+  Holds administrative LXD credentials for unmanaged LXD servers. This
+  workload-less charm validates configuration and exposes a minimal LXD REST
+  client; relation-based trust-store management is deferred to the follow-on
+  feature.
+
+assumes:
+  - k8s-api
+  - juju >= 3.4
+
+base: ubuntu@24.04
+platforms:
+  ubuntu-24.04-amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+  ubuntu-24.04-arm64:
+    build-on: [arm64]
+    build-for: [arm64]
+
+parts:
+  charm:
+    plugin: charm
+    charm-requirements:
+      - requirements.txt
+    build-packages:
+      - libssl-dev
+      - pkg-config
+
+config:
+  options:
+    lxd-endpoints:
+      type: string
+      description: |
+        Comma-separated list of LXD HTTPS API endpoints, most-preferred first.
+        IPv6 literals must be bracketed, e.g. "[::1]:8443". The default LXD
+        port 8443 is used when a port is omitted.
+    lxd-credentials:
+      type: secret
+      description: |
+        Juju secret containing the integrator's LXD credentials. Expected keys:
+        client-cert and client-key. Exactly one of the server-cert key in this
+        secret or the lxd-server-fingerprint config option must be set. The
+        trust-token key is optional and used once when adding a trusted client.
+    lxd-server-fingerprint:
+      type: string
+      description: |
+        SHA-256 fingerprint (hex) of the LXD server's TLS certificate. Exactly
+        one of lxd-server-fingerprint or the server-cert key in the
+        lxd-credentials secret must be provided.
+    default-projects:
+      type: string
+      description: |
+        Comma-separated list of default LXD projects to advertise to requirers.
+    trust-name-prefix:
+      type: string
+      default: juju-relation
+      description: |
+        Prefix used when registering trusted client certificates in LXD.
