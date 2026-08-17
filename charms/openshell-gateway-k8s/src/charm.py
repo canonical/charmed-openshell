@@ -537,6 +537,14 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if DRIVER_SERVICE_NAME in services and services[DRIVER_SERVICE_NAME].is_running():
             container.stop(DRIVER_SERVICE_NAME)
 
+    def _gateway_endpoint(self) -> str:
+        """Return the dial-back URL sandbox supervisors use to reach this gateway.
+
+        Built from the charm's in-cluster Kubernetes service name so it matches
+        the SAN on the gateway's TLS certificate.
+        """
+        return f"https://{self.app.name}.{self.model.name}.svc.cluster.local:8443"
+
     def _pebble_layer(
         self, db_uri: str, lxd_connection: _LxdConnection | None
     ) -> ops.pebble.LayerDict:
@@ -550,6 +558,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 default_image=self._model_cfg.lxd_sandbox_image,
                 operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
                 log_level=self._model_cfg.log_level,
+                gateway_endpoint=self._gateway_endpoint(),
             )
         else:
             # No connection yet: keep the service defined but unable to start,

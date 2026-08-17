@@ -11,7 +11,7 @@ import ops.pebble
 import yaml
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, WaitingStatus
-from ops.testing import Container, Context, PeerRelation, Relation, Secret, State
+from ops.testing import Container, Context, Model, PeerRelation, Relation, Secret, State
 
 import config_model
 from charm import (
@@ -334,6 +334,45 @@ class TestExternalHostnameIp:
         attrs = self._request_attrs("gateway.example.com")
         assert "gateway.example.com" in attrs.sans_dns
         assert "gateway.example.com" not in attrs.sans_ip
+
+
+class TestGatewayEndpoint:
+    def test_endpoint_host_is_cluster_service_dns_san(self):
+        """The driver dial-back endpoint matches a SAN on the gateway TLS cert."""
+        ctx = Context(OpenshellGatewayK8sCharm, app_name="osgw")
+        state = State(
+            config=BOTH_ROLES,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations(),
+            model=Model(name="stg"),
+        )
+        with (
+            patch.object(
+                TLSCertificatesRequiresV4,
+                "get_assigned_certificate",
+                return_value=(None, None),
+            ) as mock_cert,
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_DB_URI),
+            patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
+            patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+        ):
+            ctx.run(ctx.on.config_changed(), state)
+        args = mock_cert.call_args
+        assert args is not None, "get_assigned_certificate was not called"
+        attrs = args[0][0]
+        assert "osgw.stg.svc.cluster.local" in attrs.sans_dns
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1046,9 @@ class TestPebbleChecks:
     def _pebble_layer(self) -> ops.pebble.LayerDict:
         charm = object.__new__(OpenshellGatewayK8sCharm)
         charm._model_cfg = config_model.GatewayConfig(**BOTH_ROLES)
+        # _gateway_endpoint reads self.app/self.model; bypass it for this
+        # structural test.
+        charm._gateway_endpoint = lambda: "https://test.test.svc.cluster.local:8443"
         return charm._pebble_layer(_DB_URI, _LXD_CONN)
 
     def test_pebble_layer_has_readiness_check(self):
@@ -1414,7 +1456,7 @@ class TestLxdFilesAndLayer:
         assert mode_cert == 0o644, f"client.crt mode {oct(mode_cert)} != 0o644"
 
     def test_driver_layer_uses_remote_args(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
+        ctx = Context(OpenshellGatewayK8sCharm, app_name="my-gateway")
         lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
@@ -1427,6 +1469,7 @@ class TestLxdFilesAndLayer:
                 PeerRelation(PEER_RELATION),
                 lxd_rel,
             ],
+            model=Model(name="prod"),
         )
         p = _all_ready_patches()
         with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
@@ -1440,6 +1483,7 @@ class TestLxdFilesAndLayer:
         assert "--default-image openshell-sandbox" in cmd
         assert "--operation-timeout-secs 60" in cmd
         assert "--log-level info" in cmd
+        assert "--gateway-endpoint https://my-gateway.prod.svc.cluster.local:8443" in cmd
         assert "--lxd-socket" not in cmd
 
     def test_driver_layer_socket_only_when_no_connection(self):

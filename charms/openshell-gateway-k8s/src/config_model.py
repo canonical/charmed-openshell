@@ -332,11 +332,16 @@ def render_driver_command(
     default_image: str,
     operation_timeout_secs: int,
     log_level: str,
+    gateway_endpoint: str,
 ) -> str:
     """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
 
     The local unix-socket path is intentionally absent; the driver is wired to
     a remote LXD over HTTPS using the provider's address and pinned CA.
+
+    ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
+    flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
+    (scheme + host + port) reachable by sandbox supervisors.
     """
     return (
         f"/usr/bin/openshell-driver-lxd"
@@ -348,6 +353,7 @@ def render_driver_command(
         f" --default-image {default_image}"
         f" --operation-timeout-secs {operation_timeout_secs}"
         f" --log-level {log_level}"
+        f" --gateway-endpoint {gateway_endpoint}"
     )
 
 

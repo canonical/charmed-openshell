@@ -45,6 +45,11 @@ parts:
       - protobuf-compiler
       - libprotobuf-dev
       - cmake
+    override-build: |
+      # Carried patch for --gateway-endpoint (FD-015). Remove once the flag
+      # lands upstream in canonical/openshell-driver-lxd.
+      patch -p1 < "${CRAFT_PROJECT_DIR}/patches/gateway-endpoint.patch"
+      craftctl default
 
   runtime-deps:
     plugin: nil

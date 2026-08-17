@@ -52,6 +52,10 @@ echo "==> Check: openshell-driver-lxd advertises --lxd-url"
 grep -q -- '--lxd-url' <<<"${DRIVER_HELP}" \
   || { echo "ERROR: openshell-driver-lxd --help does not advertise --lxd-url; driver pin regressed to a build without the LXD client" >&2; exit 1; }
 
+echo "==> Check: openshell-driver-lxd advertises --gateway-endpoint"
+grep -q -- '--gateway-endpoint' <<<"${DRIVER_HELP}" \
+  || { echo "ERROR: openshell-driver-lxd --help does not advertise --gateway-endpoint; driver build regressed" >&2; exit 1; }
+
 # ---------------------------------------------------------------------------
 # 2. Binaries exist at expected stable paths.
 # ---------------------------------------------------------------------------

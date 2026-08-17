@@ -460,6 +460,7 @@ class TestRenderDriverCommand:
             "openshell-sandbox",
             60,
             "info",
+            "https://openshell-gateway.my-model.svc.cluster.local:8443",
         )
         assert cmd == (
             "/usr/bin/openshell-driver-lxd"
@@ -471,13 +472,32 @@ class TestRenderDriverCommand:
             " --default-image openshell-sandbox"
             " --operation-timeout-secs 60"
             " --log-level info"
+            " --gateway-endpoint https://openshell-gateway.my-model.svc.cluster.local:8443"
         )
 
     def test_rendered_command_has_no_socket_reference(self):
-        cmd = render_driver_command("https://10.0.0.1:8443", "openshell-sandbox", 60, "info")
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://openshell-gateway.my-model.svc.cluster.local:8443",
+        )
         assert "--lxd-socket" not in cmd
         assert "LXD_HOST_SOCKET" not in cmd
         assert "/var/snap/lxd" not in cmd
+
+    def test_gateway_endpoint_verbatim(self):
+        """The endpoint is emitted exactly as supplied, preserving scheme/host/port."""
+        endpoint = "https://custom.svc.cluster.local:8443"
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            endpoint,
+        )
+        assert f"--gateway-endpoint {endpoint}" in cmd
 
 
 class TestParseLxdAddress:
