@@ -10,10 +10,15 @@ from config_model import (
     DRIVER_SOCKET,
     GATEWAY_ID,
     GATEWAY_PORT,
+    LXD_CLIENT_CERT_PATH,
+    LXD_CLIENT_KEY_PATH,
+    LXD_SERVER_CA_PATH,
     GatewayConfig,
+    _parse_lxd_address,
     append_sslmode,
     load_config,
     render_config_toml,
+    render_driver_command,
     render_env,
 )
 
@@ -52,6 +57,23 @@ class TestConfigSurface:
         assert cfg.log_level == "info"
         assert cfg.gateway_id == "openshell-gateway"
         assert cfg.jwt_ttl_secs == 3600
+
+    def test_lxd_config_defaults(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.lxd_projects is None
+        assert cfg.lxd_sandbox_image == "openshell-sandbox"
+        assert cfg.lxd_operation_timeout_secs == 60
+
+    def test_lxd_projects_empty_string_normalised(self):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "lxd-projects": ""})
+        assert cfg.lxd_projects is None
+
+    @pytest.mark.parametrize("field", ["lxd-projects", "lxd-sandbox-image"])
+    def test_lxd_string_fields_reject_control_chars(self, field):
+        base = {**BOTH_ROLES_MINIMAL}
+        base[field] = "bad\nvalue"
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate(base)
 
     def test_no_disable_tls_field(self):
         # These options must never be declared as fields anywhere.
@@ -424,3 +446,78 @@ class TestRenderConfigToml:
 
         src = inspect.getsource(config_model)
         assert "import ops" not in src
+
+
+# ---------------------------------------------------------------------------
+# LXD driver command rendering
+# ---------------------------------------------------------------------------
+
+
+class TestRenderDriverCommand:
+    def test_golden_command(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+        )
+        assert cmd == (
+            "/usr/bin/openshell-driver-lxd"
+            f" --socket {DRIVER_SOCKET}"
+            " --lxd-url https://10.0.0.1:8443"
+            f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
+            f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
+            f" --lxd-server-ca {LXD_SERVER_CA_PATH}"
+            " --default-image openshell-sandbox"
+            " --operation-timeout-secs 60"
+            " --log-level info"
+        )
+
+    def test_rendered_command_has_no_socket_reference(self):
+        cmd = render_driver_command("https://10.0.0.1:8443", "openshell-sandbox", 60, "info")
+        assert "--lxd-socket" not in cmd
+        assert "LXD_HOST_SOCKET" not in cmd
+        assert "/var/snap/lxd" not in cmd
+
+
+class TestParseLxdAddress:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("10.0.0.1:8443", "10.0.0.1:8443"),
+            ("  10.0.0.1:8443  ", "10.0.0.1:8443"),
+            ("[::1]:8443", "[::1]:8443"),
+            ("lxd.local:8443", "lxd.local:8443"),
+            ("lxd-1.cluster.local:12345", "lxd-1.cluster.local:12345"),
+            ("10.0.0.1:1", "10.0.0.1:1"),
+            ("10.0.0.1:65535", "10.0.0.1:65535"),
+        ],
+    )
+    def test_valid_addresses(self, raw, expected):
+        assert _parse_lxd_address(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "10.0.0.1",
+            "10.0.0.1:",
+            ":8443",
+            "10.0.0.1:0",
+            "10.0.0.1:65536",
+            "10.0.0.1:abc",
+            "10.0.0.1 8443",
+            "10.0.0.1\t8443",
+            "10.0.0.1:8443;rm -rf",
+            "$(x):8443",
+            "10.0.0.1:8443\n",
+            "10.0.0.1:8443\x00",
+            "10.0.0.1/path:8443",
+            "[::1",  # missing bracket
+            "[::1]:",  # missing port
+            "[]:8443",  # empty host
+        ],
+    )
+    def test_rejects_injection(self, raw):
+        assert _parse_lxd_address(raw) is None

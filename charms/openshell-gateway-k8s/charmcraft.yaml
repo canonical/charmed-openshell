@@ -67,6 +67,9 @@ requires:
   ingress:
     interface: traefik_route
     limit: 1
+  lxd:
+    interface: lxd-https
+    limit: 1
 
 provides:
   send-ca-cert:
@@ -75,6 +78,8 @@ provides:
 actions:
   get-oidc-client-config:
     description: Return the OIDC client configuration for CLI consumers.
+  get-lxd-client-cert:
+    description: Return this application's LXD client certificate and the provider's fingerprint.
   get-gateway-status:
     description: Report the current readiness and configuration state of the gateway.
   restart:
@@ -133,3 +138,18 @@ config:
       description: >
         Lifetime, in seconds, of tokens minted by the gateway for sandbox
         supervisor authentication. Must be a positive integer.
+    lxd-projects:
+      type: string
+      description: >
+        Comma-separated list of LXD projects to restrict the gateway to.
+        Leave unset to allow all projects.
+    lxd-sandbox-image:
+      type: string
+      default: openshell-sandbox
+      description: Default image alias passed to the LXD driver as --default-image.
+    lxd-operation-timeout-secs:
+      type: int
+      default: 60
+      description: >
+        Timeout, in seconds, for LXD driver operations. Must be a positive
+        integer.

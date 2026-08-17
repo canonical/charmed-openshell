@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import datetime
 import hashlib
 import ipaddress
 import json
@@ -23,6 +24,9 @@ from charms.tls_certificates_interface.v4.tls_certificates import (
     CertificateRequestAttributes,
     TLSCertificatesRequiresV4,
 )
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
@@ -37,11 +41,15 @@ from config_model import (
     DRIVER_SOCKET,
     GATEWAY_PORT,
     JWT_DIR,
-    LXD_HOST_SOCKET,
+    LXD_CLIENT_CERT_PATH,
+    LXD_CLIENT_KEY_PATH,
+    LXD_SERVER_CA_PATH,
     TLS_DIR,
     GatewayConfig,
+    _parse_lxd_address,
     load_config,
     render_config_toml,
+    render_driver_command,
     render_env,
 )
 from ingress import GatewayIngress
@@ -56,6 +64,10 @@ RESTART_RELATION = "restart"
 APPLIED_HASH_KEY = "applied-config-hash"
 PEER_SECRET_LABEL = "gateway-jwt"
 PEER_SECRET_ID_KEY = "jwt-secret-id"  # app data key used to share secret ID with all units
+PEER_LXD_SECRET_LABEL = "lxd-client-identity"
+PEER_LXD_SECRET_ID_KEY = "lxd-secret-id"
+LXD_INTERFACE_VERSION = "1.0"
+LXD_RELATION = "lxd"
 STATIC_REDIRECT_URI = "https://openshell.invalid/unused"
 DATABASE_NAME = "openshell"
 GATEWAY_CMD = "/usr/bin/openshell-gateway --config /etc/openshell/config.toml"
@@ -65,6 +77,13 @@ DRIVER_CHECK_NAME = "driver-ready"
 CHECK_PERIOD = "3s"
 CHECK_TIMEOUT = "3s"
 CHECK_THRESHOLD = 2
+
+
+@dataclass
+class _LxdConnection:
+    url: str
+    server_ca: str
+    fingerprint: str
 
 
 def _generate_jwt_keypair() -> dict[str, str]:
@@ -156,6 +175,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.certificates.on.certificate_available,
             self.oauth.on.oauth_info_changed,
             self.oauth.on.oauth_info_removed,
+            self.on[LXD_RELATION].relation_changed,
+            self.on[LXD_RELATION].relation_joined,
         ):
             self.framework.observe(event, self._reconcile)
 
@@ -163,11 +184,13 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self.framework.observe(self.on.database_relation_broken, self._reconcile)
         self.framework.observe(self.on.certificates_relation_broken, self._reconcile)
         self.framework.observe(self.on.oauth_relation_broken, self._reconcile)
+        self.framework.observe(self.on.lxd_relation_broken, self._reconcile)
 
         self.framework.observe(self.on.collect_unit_status, self._on_collect_unit_status)
         self.framework.observe(
             self.on.get_oidc_client_config_action, self._on_get_oidc_client_config
         )
+        self.framework.observe(self.on.get_lxd_client_cert_action, self._on_get_lxd_client_cert)
         self.framework.observe(self.on.get_gateway_status_action, self._on_get_gateway_status)
         self.framework.observe(
             self.on.rotate_jwt_signing_key_action, self._on_rotate_jwt_signing_key
@@ -302,6 +325,149 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         return self._read_jwt_keypair()
 
+    def _read_lxd_client_identity(self) -> dict | None:
+        """Read the LXD client identity secret using the ID stored in peer relation data.
+
+        Falls back to label-based lookup for forward compat. Returns the secret
+        content dict (``certificate`` and ``private-key``), or None if absent.
+        """
+        peer_rel = self.model.get_relation(PEER_RELATION)
+        if peer_rel is None:
+            return None
+        secret_id = peer_rel.data[self.app].get(PEER_LXD_SECRET_ID_KEY)
+        if secret_id:
+            try:
+                return self.model.get_secret(id=secret_id).get_content(refresh=True)
+            except (ops.SecretNotFoundError, ops.ModelError):
+                return None
+        try:
+            return self.model.get_secret(label=PEER_LXD_SECRET_LABEL).get_content(refresh=True)
+        except (ops.SecretNotFoundError, ops.ModelError):
+            return None
+
+    def _generate_lxd_client_identity(self) -> dict[str, str]:
+        """Generate a self-signed EC P-384 client certificate for LXD mTLS.
+
+        Returns a dict with ``certificate`` (PEM) and ``private-key`` (PEM).
+        The CN is ``<app>-<model UUID>`` so the provider can identify the source
+        application in the LXD trust store.
+        """
+        private_key = ec.generate_private_key(ec.SECP384R1())
+        subject = issuer = x509.Name(
+            [x509.NameAttribute(x509.NameOID.COMMON_NAME, f"{self.app.name}-{self.model.uuid}")]
+        )
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.UTC))
+            .not_valid_after(datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3650))
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(private_key.public_key()),
+                critical=False,
+            )
+            .sign(private_key, hashes.SHA384())
+        )
+
+        certificate_pem = cert.public_bytes(Encoding.PEM).decode()
+        private_key_pem = private_key.private_bytes(
+            Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+        ).decode()
+
+        return {"certificate": certificate_pem, "private-key": private_key_pem}
+
+    def _ensure_lxd_client_identity(self) -> dict | None:
+        """Mint (leader, first call) or read the LXD client identity from the peer secret.
+
+        Stores the secret ID in peer relation app data so all units can reach it
+        via ``_read_lxd_client_identity``. Only called from `_reconcile`.
+        """
+        peer_rel = self.model.get_relation(PEER_RELATION)
+        if peer_rel is None:
+            return None
+
+        secret_id = peer_rel.data[self.app].get(PEER_LXD_SECRET_ID_KEY)
+
+        if self.unit.is_leader() and not secret_id:
+            existing: ops.Secret | None = None
+            with contextlib.suppress(ops.SecretNotFoundError):
+                existing = self.model.get_secret(label=PEER_LXD_SECRET_LABEL)
+
+            if existing is not None:
+                secret_id = existing.id
+            else:
+                new_secret = self.app.add_secret(
+                    self._generate_lxd_client_identity(),
+                    label=PEER_LXD_SECRET_LABEL,
+                )
+                secret_id = new_secret.id
+
+            if secret_id is not None:
+                peer_rel.data[self.app][PEER_LXD_SECRET_ID_KEY] = secret_id
+
+        return self._read_lxd_client_identity()
+
+    def _lxd_connection(self) -> _LxdConnection | None:
+        """Consume the provider's lxd-https databag and return a validated connection.
+
+        Prefers the app bag, then falls back to the unit bag. Returns None unless
+        both ``addresses`` and ``certificate`` are published and the first address
+        passes sanitisation.
+        """
+        rel = self.model.get_relation(LXD_RELATION)
+        if rel is None:
+            return None
+
+        data = rel.data.get(rel.app, {}) or {}
+        if not data:
+            unit = next(iter(rel.units), None)
+            data = rel.data.get(unit, {}) if unit is not None else {}
+
+        addresses_raw = data.get("addresses", "")
+        server_ca = data.get("certificate", "")
+        fingerprint = data.get("certificate_fingerprint", "")
+
+        if not addresses_raw or not server_ca:
+            return None
+
+        # addresses may be a comma-separated list or a JSON list. A single
+        # bracketed IPv6 value such as "[::1]:8443" is not a JSON list, so on
+        # decode failure we fall back to plain comma splitting.
+        addresses = addresses_raw
+        if addresses_raw.startswith("["):
+            with contextlib.suppress(json.JSONDecodeError):
+                addresses = ",".join(json.loads(addresses_raw))
+
+        first = addresses.split(",")[0].strip()
+        parsed = _parse_lxd_address(first)
+        if parsed is None:
+            return None
+
+        return _LxdConnection(
+            url=f"https://{parsed}",
+            server_ca=server_ca,
+            fingerprint=fingerprint,
+        )
+
+    def _publish_lxd_databag(self, identity: dict[str, str]) -> None:
+        """Publish this requirer's certificate and version on the lxd relation.
+
+        Leader-gated: non-leaders must not write app data.
+        """
+        if not self.unit.is_leader():
+            return
+        rel = self.model.get_relation(LXD_RELATION)
+        if rel is None:
+            return
+        rel.data[self.app]["version"] = LXD_INTERFACE_VERSION
+        rel.data[self.app]["certificate"] = identity["certificate"]
+        if self._model_cfg and self._model_cfg.lxd_projects:
+            rel.data[self.app]["projects"] = self._model_cfg.lxd_projects
+        else:
+            rel.data[self.app].pop("projects", None)
+
     def _readiness_gaps(self) -> list[_Gap]:
         """Return the list of readiness gaps; empty means the unit can be Active.
 
@@ -333,6 +499,13 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if self._read_jwt_keypair() is None:
             gaps.append(_Gap("waiting for JWT keypair", "waiting"))
 
+        if not self.model.get_relation(LXD_RELATION):
+            gaps.append(_Gap("lxd relation missing", "blocked"))
+        elif self._read_lxd_client_identity() is None:
+            gaps.append(_Gap("waiting for lxd client identity", "waiting"))
+        elif self._lxd_connection() is None:
+            gaps.append(_Gap("waiting for lxd connection details", "waiting"))
+
         return gaps
 
     def _stop_workload(self, container: ops.Container) -> None:
@@ -351,7 +524,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                     },
                     DRIVER_SERVICE_NAME: {
                         "override": "replace",
-                        "command": "/usr/bin/openshell-driver-lxd",
+                        "command": "/usr/bin/openshell-driver-lxd --socket " + DRIVER_SOCKET,
                         "startup": "disabled",
                     },
                 },
@@ -364,20 +537,31 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if DRIVER_SERVICE_NAME in services and services[DRIVER_SERVICE_NAME].is_running():
             container.stop(DRIVER_SERVICE_NAME)
 
-    def _pebble_layer(self, db_uri: str) -> ops.pebble.LayerDict:
+    def _pebble_layer(
+        self, db_uri: str, lxd_connection: _LxdConnection | None
+    ) -> ops.pebble.LayerDict:
         assert self._model_cfg is not None
         env = render_env(self._model_cfg)
         env["OPENSHELL_DB_URL"] = db_uri
+
+        if lxd_connection is not None:
+            driver_command = render_driver_command(
+                url=lxd_connection.url,
+                default_image=self._model_cfg.lxd_sandbox_image,
+                operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
+                log_level=self._model_cfg.log_level,
+            )
+        else:
+            # No connection yet: keep the service defined but unable to start,
+            # so the readiness gap (not this layer) governs status.
+            driver_command = f"/usr/bin/openshell-driver-lxd --socket {DRIVER_SOCKET}"
+
         return {
             "summary": "gateway layer",
             "services": {
                 DRIVER_SERVICE_NAME: {
                     "override": "replace",
-                    "command": (
-                        f"/usr/bin/openshell-driver-lxd"
-                        f" --socket {DRIVER_SOCKET}"
-                        f" --lxd-socket {LXD_HOST_SOCKET}"
-                    ),
+                    "command": driver_command,
                     "startup": "enabled",
                 },
                 SERVICE_NAME: {
@@ -437,6 +621,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         jwt_public_key_pem: str,
         jwt_kid: str,
         issuer_url: str,
+        lxd_client_cert_pem: str,
+        lxd_client_key_pem: str,
+        lxd_server_ca_pem: str,
     ) -> str:
         """Push all rendered files to the container and return the rendered config TOML."""
         container.push(
@@ -465,6 +652,14 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             proc.wait_output()
         except Exception:
             pass  # best-effort; OIDC discovery will fail if this does
+
+        # LXD mTLS material for the remote HTTPS driver.
+        container.push(
+            LXD_CLIENT_CERT_PATH, lxd_client_cert_pem, make_dirs=True, permissions=0o644
+        )
+        container.push(LXD_CLIENT_KEY_PATH, lxd_client_key_pem, make_dirs=True, permissions=0o600)
+        container.push(LXD_SERVER_CA_PATH, lxd_server_ca_pem, make_dirs=True, permissions=0o644)
+
         config_toml = self._render_config_toml(db_uri, issuer_url)
         container.push(CONFIG_PATH, config_toml, make_dirs=True, permissions=0o600)
         return config_toml
@@ -512,8 +707,24 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         tls_cert, tls_key = self._tls_material()
         issuer = self._oauth_issuer()
         jwt = self._ensure_jwt_keypair()
+        lxd_identity = self._ensure_lxd_client_identity()
+        lxd_conn = self._lxd_connection()
 
-        if db_uri is None or tls_cert is None or tls_key is None or issuer is None or jwt is None:
+        # Publish the requirer databag as soon as the identity exists and the
+        # relation is present, even if the provider has not yet published its
+        # connection details or other mandatory relations are still missing.
+        if self._model_cfg is not None and lxd_identity is not None:
+            self._publish_lxd_databag(lxd_identity)
+
+        if (
+            db_uri is None
+            or tls_cert is None
+            or tls_key is None
+            or issuer is None
+            or jwt is None
+            or lxd_identity is None
+            or lxd_conn is None
+        ):
             self._stop_workload(container)
             return
 
@@ -528,8 +739,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt_public_key_pem=jwt["public-key"],
             jwt_kid=jwt["kid"],
             issuer_url=issuer,
+            lxd_client_cert_pem=lxd_identity["certificate"],
+            lxd_client_key_pem=lxd_identity["private-key"],
+            lxd_server_ca_pem=lxd_conn.server_ca,
         )
-        layer = self._pebble_layer(db_uri)
+        layer = self._pebble_layer(db_uri, lxd_conn)
         container.add_layer(CONTAINER_NAME, layer, combine=True)
         try:
             container.replan()
@@ -557,6 +771,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt["signing-key"],
             jwt["public-key"],
             jwt["kid"],
+            lxd_identity["certificate"],
+            lxd_identity["private-key"],
+            lxd_conn.server_ca,
+            lxd_conn.url,
         )
         self._ensure_restart_state(event, desired_hash)
 
@@ -572,6 +790,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         jwt_signing_key_pem: str,
         jwt_public_key_pem: str,
         jwt_kid: str,
+        lxd_client_cert_pem: str,
+        lxd_client_key_pem: str,
+        lxd_server_ca_pem: str,
+        lxd_url: str,
     ) -> str:
         """Return a deterministic hex SHA-256 of the workload inputs."""
         payload = (
@@ -581,6 +803,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             + jwt_signing_key_pem
             + jwt_public_key_pem
             + jwt_kid
+            + lxd_client_cert_pem
+            + lxd_client_key_pem
+            + lxd_server_ca_pem
+            + lxd_url
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -626,10 +852,20 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         tls_cert, tls_key = self._tls_material()
         issuer = self._oauth_issuer()
         jwt = self._ensure_jwt_keypair()
-        if db_uri is None or tls_cert is None or tls_key is None or issuer is None or jwt is None:
+        lxd_identity = self._ensure_lxd_client_identity()
+        lxd_conn = self._lxd_connection()
+        if (
+            db_uri is None
+            or tls_cert is None
+            or tls_key is None
+            or issuer is None
+            or jwt is None
+            or lxd_identity is None
+            or lxd_conn is None
+        ):
             return
 
-        layer = self._pebble_layer(db_uri)
+        layer = self._pebble_layer(db_uri, lxd_conn)
         config_toml = self._render_config_toml(db_uri, issuer)
         container.restart(SERVICE_NAME, DRIVER_SERVICE_NAME)
         self._set_applied_hash(
@@ -640,6 +876,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 jwt["signing-key"],
                 jwt["public-key"],
                 jwt["kid"],
+                lxd_identity["certificate"],
+                lxd_identity["private-key"],
+                lxd_conn.server_ca,
+                lxd_conn.url,
             )
         )
 
@@ -684,6 +924,19 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 "authorization-endpoint": info.authorization_endpoint,
                 "token-endpoint": info.token_endpoint,
                 "jwks-endpoint": info.jwks_endpoint,
+            }
+        )
+
+    def _on_get_lxd_client_cert(self, event: ops.ActionEvent) -> None:
+        identity = self._read_lxd_client_identity()
+        if identity is None:
+            event.fail("LXD client identity not initialised yet")
+            return
+        conn = self._lxd_connection()
+        event.set_results(
+            {
+                "certificate": identity["certificate"],
+                "certificate-fingerprint": conn.fingerprint if conn else "",
             }
         )
 

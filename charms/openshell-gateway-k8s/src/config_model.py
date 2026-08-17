@@ -31,8 +31,6 @@ GATEWAY_PORT: str = "8443"  # TLS-only listen port
 DRIVERS: str = "lxd"
 # Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"
-# LXD REST API socket on the host (must be bind-mounted into the pod).
-LXD_HOST_SOCKET: str = "/var/snap/lxd/common/lxd/unix.socket"
 
 # ---------------------------------------------------------------------------
 # Filesystem path constants (container layout)
@@ -41,6 +39,10 @@ LXD_HOST_SOCKET: str = "/var/snap/lxd/common/lxd/unix.socket"
 CONFIG_PATH: str = "/etc/openshell/config.toml"
 JWT_DIR: str = "/etc/openshell/jwt"
 TLS_DIR: str = "/etc/openshell/tls"
+LXD_DIR: str = "/etc/openshell/lxd"
+LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
+LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
+LXD_SERVER_CA_PATH: str = f"{LXD_DIR}/server.crt"
 
 # Stable workload identity embedded in every minted JWT.  Must match the
 # openshell-server binary's expected default; cross-reference when
@@ -77,19 +79,24 @@ class GatewayConfig(pydantic.BaseModel):
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
     gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
     jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
+    lxd_projects: str | None = Field(default=None, alias="lxd-projects")
+    lxd_sandbox_image: str = Field(default="openshell-sandbox", alias="lxd-sandbox-image")
+    lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
     # Field validators
     # ------------------------------------------------------------------
 
-    @field_validator("external_hostname", "oidc_admin_role", "oidc_user_role", mode="before")
+    @field_validator(
+        "external_hostname", "oidc_admin_role", "oidc_user_role", "lxd_projects", mode="before"
+    )
     @classmethod
     def _empty_string_to_none(cls, v: Any) -> Any:
         """Normalise Juju's empty-string representation of 'unset' to None.
 
-        Only applied to the three ``str | None`` fields; the non-optional
-        fields are deliberately excluded so an empty string there yields a
-        meaningful type/Literal validation error.
+        Only applied to optional string fields; the non-optional fields are
+        deliberately excluded so an empty string there yields a meaningful
+        type/Literal validation error.
         """
         if v == "":
             return None
@@ -102,6 +109,8 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_admin_role",
         "oidc_user_role",
         "gateway_id",
+        "lxd_projects",
+        "lxd_sandbox_image",
         mode="after",
     )
     @classmethod
@@ -311,3 +320,91 @@ def load_config(raw: Mapping[str, Any]) -> tuple[GatewayConfig | None, str | Non
         messages = [e["msg"] for e in exc.errors()]
         message = "; ".join(messages)
         return None, message
+
+
+# ---------------------------------------------------------------------------
+# Driver command renderer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def render_driver_command(
+    url: str,
+    default_image: str,
+    operation_timeout_secs: int,
+    log_level: str,
+) -> str:
+    """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
+
+    The local unix-socket path is intentionally absent; the driver is wired to
+    a remote LXD over HTTPS using the provider's address and pinned CA.
+    """
+    return (
+        f"/usr/bin/openshell-driver-lxd"
+        f" --socket {DRIVER_SOCKET}"
+        f" --lxd-url {url}"
+        f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
+        f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
+        f" --lxd-server-ca {LXD_SERVER_CA_PATH}"
+        f" --default-image {default_image}"
+        f" --operation-timeout-secs {operation_timeout_secs}"
+        f" --log-level {log_level}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# LXD address sanitizer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def _parse_lxd_address(raw: str) -> str | None:
+    """Validate and return a cleaned ``host:port`` string, or None.
+
+    Rejects whitespace, C0 control characters, DEL, and shell/path
+    metacharacters. The result is intended for interpolation into the driver
+    command line and must be a single ``host:port`` value.
+    """
+    # Reject embedded C0 control characters / DEL before stripping surrounding spaces.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+        return None
+
+    value = raw.strip()
+    if not value:
+        return None
+
+    # Reject any remaining value containing whitespace or shell/path metacharacters.
+    forbidden = set(" /\\;|&$`()<>\"'*?\t")
+    if any(c in forbidden for c in value):
+        return None
+
+    # Host charset: A-Z, a-z, 0-9, dot, colon, underscore, hyphen, brackets.
+    if not all(c.isascii() and (c.isalnum() or c in ".:_-[]") for c in value):
+        return None
+
+    # IPv6 literal form: [addr]:port
+    if value.startswith("["):
+        close = value.rfind("]")
+        if close == -1 or close != value.index("]"):
+            return None
+        host_part = value[: close + 1]
+        remainder = value[close + 1 :]
+        if not remainder.startswith(":") or remainder == ":":
+            return None
+        port_part = remainder[1:]
+        # Reject empty bracket content (e.g. "[]:8443").
+        if close == 1:
+            return None
+    else:
+        if ":" not in value:
+            return None
+        host_part, port_part = value.rsplit(":", 1)
+        if not host_part:
+            return None
+
+    try:
+        port = int(port_part)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+
+    return f"{host_part}:{port}"

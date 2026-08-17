@@ -10,11 +10,13 @@ from charm import (
     APPLIED_HASH_KEY,
     CONTAINER_NAME,
     DRIVER_SERVICE_NAME,
+    LXD_RELATION,
     PEER_RELATION,
     PEER_SECRET_ID_KEY,
     RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
+    _LxdConnection,
 )
 
 BOTH_ROLES = {"oidc-admin-role": "admin", "oidc-user-role": "user"}
@@ -33,6 +35,16 @@ _FAKE_JWT = {
     "public-key": "-----BEGIN PUBLIC KEY-----\nFAKE\n-----END PUBLIC KEY-----",
     "kid": "testkid",
 }
+
+_FAKE_LXD_IDENTITY = {
+    "certificate": "-----BEGIN CERTIFICATE-----\nLXDCERT\n-----END CERTIFICATE-----",
+    "private-key": "-----BEGIN PRIVATE KEY-----\nLXDKEY\n-----END PRIVATE KEY-----",
+}
+_LXD_CONN = _LxdConnection(
+    url="https://10.0.0.1:8443",
+    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
+    fingerprint="ab:cd:ef",
+)
 
 
 def _fake_provider_info():
@@ -132,6 +144,7 @@ class TestRestartAction:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
+                Relation(LXD_RELATION),
             ],
         )
         with (
@@ -155,6 +168,17 @@ class TestRestartAction:
                 "_ensure_jwt_keypair",
                 return_value=_FAKE_JWT,
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out = ctx.run(ctx.on.action("restart"), state)
@@ -224,6 +248,17 @@ class TestRotateJwtSigningKey:
             patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=None),
             patch.object(OpenshellGatewayK8sCharm, "_tls_material", return_value=(None, None)),
             patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=None),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
             out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
         results = ctx.action_results
@@ -246,6 +281,17 @@ class TestRotateJwtSigningKey:
             patch.object(
                 OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_FAKE_OAUTH_ISSUER
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
             out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
         results = ctx.action_results
@@ -280,6 +326,7 @@ class TestRotateJwtSigningKey:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
+                Relation(LXD_RELATION),
             ],
             secrets=[secret],
         )
@@ -293,6 +340,17 @@ class TestRotateJwtSigningKey:
             patch.object(
                 OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_FAKE_OAUTH_ISSUER
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out1 = ctx.run(ctx.on.pebble_ready(Container(CONTAINER_NAME, can_connect=True)), state)
@@ -310,6 +368,17 @@ class TestRotateJwtSigningKey:
             patch.object(
                 OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_FAKE_OAUTH_ISSUER
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.action("rotate-jwt-signing-key"), out1)
