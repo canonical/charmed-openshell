@@ -1187,6 +1187,27 @@ class TestLxdDatabag:
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
         assert lxd_rel_out.local_app_data["projects"] == "default,project-a"
 
+    def test_lxd_databag_not_published_when_not_leader(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(LXD_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=False,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
+        assert lxd_rel_out.local_app_data == {}
+
 
 class TestLxdConnection:
     def _make_relation(self, app_data=None, unit_data=None):
@@ -1420,6 +1441,38 @@ class TestLxdFilesAndLayer:
         assert "--operation-timeout-secs 60" in cmd
         assert "--log-level info" in cmd
         assert "--lxd-socket" not in cmd
+
+    def test_driver_layer_socket_only_when_no_connection(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(LXD_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=None),
+        ):
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        plan = out.get_container(CONTAINER_NAME).plan
+        cmd = plan.services[DRIVER_SERVICE_NAME].command
+        assert cmd == f"/usr/bin/openshell-driver-lxd --socket {DRIVER_SOCKET}"
+        assert "--lxd-url" not in cmd
 
 
 class TestLxdReadinessGaps:
