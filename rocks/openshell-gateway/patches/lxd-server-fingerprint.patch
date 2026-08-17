@@ -1,0 +1,288 @@
+diff --git a/crates/lxd-client/Cargo.toml b/crates/lxd-client/Cargo.toml
+index 19c1744..c3e1195 100644
+--- a/crates/lxd-client/Cargo.toml
++++ b/crates/lxd-client/Cargo.toml
+@@ -24,6 +24,8 @@ rustls = { workspace = true }
+ tokio-rustls = { workspace = true }
+ rustls-pemfile = { workspace = true }
+ webpki-roots = { workspace = true }
++ring = "0.17"
++subtle = "2"
+ tokio-tungstenite = { workspace = true }
+ futures = { workspace = true }
+ strum = { workspace = true }
+diff --git a/crates/lxd-client/src/client.rs b/crates/lxd-client/src/client.rs
+index 9525736..55f3467 100644
+--- a/crates/lxd-client/src/client.rs
++++ b/crates/lxd-client/src/client.rs
+@@ -98,7 +98,105 @@ pub struct LxdHttpsConfig {
+     pub client_key: PathBuf,
+     /// Path to a PEM-encoded CA certificate to verify the server cert.
+     /// `None` uses the webpki CA bundle.
++    /// Mutually exclusive with `server_fingerprint`.
+     pub server_ca: Option<PathBuf>,
++    /// SHA-256 fingerprint of the LXD server certificate, as hex (case-
++    /// insensitive, colons optional). When set, the TLS handshake pins trust
++    /// to this exact digest and skips CA/hostname verification.
++    /// Mutually exclusive with `server_ca`.
++    pub server_fingerprint: Option<String>,
++}
++
++/// Normalises a user-supplied SHA-256 fingerprint to a 32-byte array.
++///
++/// Accepts lower or upper case hex and optional colon separators. Anything
++/// else is rejected so malformed input fails fast at client construction.
++fn parse_fingerprint(input: &str) -> Result<[u8; 32], LxdError> {
++    let hex = input.to_ascii_lowercase().replace(':', "");
++    if hex.len() != 64 {
++        return Err(LxdError::Tls {
++            reason: format!(
++                "invalid fingerprint length: expected 64 hex chars, got {}",
++                hex.len()
++            ),
++        });
++    }
++    let mut bytes = [0u8; 32];
++    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
++        let chunk_str = std::str::from_utf8(chunk).expect("hex is ASCII");
++        bytes[i] = u8::from_str_radix(chunk_str, 16).map_err(|e| LxdError::Tls {
++            reason: format!("invalid fingerprint hex: {e}"),
++        })?;
++    }
++    Ok(bytes)
++}
++
++/// rustls `ServerCertVerifier` that pins trust to a single certificate SHA-256
++/// fingerprint instead of a CA trust anchor and hostname.
++///
++/// When the presented end-entity certificate digest matches the pinned digest
++/// the handshake succeeds; otherwise it is aborted before any application data
++/// flows. Signature verification is delegated to the ring crypto provider so
++/// TLS 1.2/1.3 signatures are still validated.
++#[derive(Debug)]
++struct FingerprintVerifier {
++    fingerprint: [u8; 32],
++    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
++}
++
++impl rustls::client::danger::ServerCertVerifier for FingerprintVerifier {
++    fn verify_server_cert(
++        &self,
++        end_entity: &rustls::pki_types::CertificateDer<'_>,
++        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
++        _server_name: &rustls::pki_types::ServerName<'_>,
++        _ocsp_response: &[u8],
++        _now: rustls::pki_types::UnixTime,
++    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
++        use subtle::ConstantTimeEq;
++        let digest = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
++        if digest.as_ref().ct_eq(&self.fingerprint).into() {
++            Ok(rustls::client::danger::ServerCertVerified::assertion())
++        } else {
++            Err(rustls::Error::General(
++                "server certificate fingerprint mismatch".into(),
++            ))
++        }
++    }
++
++    fn verify_tls12_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls12_signature(
++            message,
++            cert,
++            dss,
++            &self.provider.signature_verification_algorithms,
++        )
++    }
++
++    fn verify_tls13_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls13_signature(
++            message,
++            cert,
++            dss,
++            &self.provider.signature_verification_algorithms,
++        )
++    }
++
++    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
++        self.provider
++            .signature_verification_algorithms
++            .supported_schemes()
++    }
+ }
+
+ impl LxdHttpsConfig {
+@@ -174,41 +272,60 @@ impl LxdHttpsConfig {
+                 reason: "no private key in PEM file".into(),
+             })?;
+
+-        let root_store = if let Some(ca_path) = &self.server_ca {
+-            let ca_file = File::open(ca_path).map_err(|e| LxdError::Tls {
+-                reason: format!("cannot open server CA: {e}"),
+-            })?;
+-            let ca_certs: Vec<CertificateDer<'static>> = certs(&mut BufReader::new(ca_file))
+-                .collect::<Result<_, _>>()
++        let provider = Arc::new(rustls::crypto::ring::default_provider());
++
++        let tls_config = if let Some(fingerprint) = &self.server_fingerprint {
++            let fingerprint = parse_fingerprint(fingerprint)?;
++            rustls::ClientConfig::builder_with_provider(provider.clone())
++                .with_safe_default_protocol_versions()
+                 .map_err(|e| LxdError::Tls {
+-                    reason: format!("invalid server CA PEM: {e}"),
+-                })?;
+-            let mut store = rustls::RootCertStore::empty();
+-            for cert in ca_certs {
+-                store.add(cert).map_err(|e| LxdError::Tls {
+-                    reason: format!("invalid CA cert: {e}"),
+-                })?;
+-            }
+-            store
++                    reason: format!("TLS protocol error: {e}"),
++                })?
++                .dangerous()
++                .with_custom_certificate_verifier(Arc::new(FingerprintVerifier {
++                    fingerprint,
++                    provider,
++                }))
++                .with_client_auth_cert(client_certs, key)
++                .map_err(|e| LxdError::Tls {
++                    reason: format!("TLS cert error: {e}"),
++                })?
+         } else {
+-            let mut store = rustls::RootCertStore::empty();
+-            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+-            store
++            let root_store = if let Some(ca_path) = &self.server_ca {
++                let ca_file = File::open(ca_path).map_err(|e| LxdError::Tls {
++                    reason: format!("cannot open server CA: {e}"),
++                })?;
++                let ca_certs: Vec<CertificateDer<'static>> =
++                    certs(&mut BufReader::new(ca_file))
++                        .collect::<Result<_, _>>()
++                        .map_err(|e| LxdError::Tls {
++                            reason: format!("invalid server CA PEM: {e}"),
++                        })?;
++                let mut store = rustls::RootCertStore::empty();
++                for cert in ca_certs {
++                    store.add(cert).map_err(|e| LxdError::Tls {
++                        reason: format!("invalid CA cert: {e}"),
++                    })?;
++                }
++                store
++            } else {
++                let mut store = rustls::RootCertStore::empty();
++                store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++                store
++            };
++
++            rustls::ClientConfig::builder_with_provider(provider)
++                .with_safe_default_protocol_versions()
++                .map_err(|e| LxdError::Tls {
++                    reason: format!("TLS protocol error: {e}"),
++                })?
++                .with_root_certificates(root_store)
++                .with_client_auth_cert(client_certs, key)
++                .map_err(|e| LxdError::Tls {
++                    reason: format!("TLS cert error: {e}"),
++                })?
+         };
+
+-        let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+-            rustls::crypto::ring::default_provider(),
+-        ))
+-        .with_safe_default_protocol_versions()
+-        .map_err(|e| LxdError::Tls {
+-            reason: format!("TLS protocol error: {e}"),
+-        })?
+-        .with_root_certificates(root_store)
+-        .with_client_auth_cert(client_certs, key)
+-        .map_err(|e| LxdError::Tls {
+-            reason: format!("TLS cert error: {e}"),
+-        })?;
+-
+         Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+     }
+ }
+diff --git a/crates/openshell-driver-lxd/src/config.rs b/crates/openshell-driver-lxd/src/config.rs
+index b348107..7c1f17d 100644
+--- a/crates/openshell-driver-lxd/src/config.rs
++++ b/crates/openshell-driver-lxd/src/config.rs
+@@ -59,15 +59,31 @@ pub struct Config {
+
+     /// PEM CA certificate to verify the remote LXD server cert.
+     /// Omit to use the built-in webpki CA bundle.
++    /// Mutually exclusive with --lxd-server-fingerprint.
+     #[arg(long, requires = "lxd_url")]
+     pub lxd_server_ca: Option<PathBuf>,
+
++    /// SHA-256 fingerprint of the remote LXD server certificate (hex, case-
++    /// insensitive, colons optional). When set, the TLS handshake pins trust to
++    /// this digest and skips CA/hostname verification.
++    /// Mutually exclusive with --lxd-server-ca.
++    #[arg(long, requires = "lxd_url")]
++    pub lxd_server_fingerprint: Option<String>,
++
+     /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
+     /// sandboxes. The host is resolved from the sandbox's own LXD bridge
+     /// network at create time.
+     #[arg(long, default_value_t = DEFAULT_GATEWAY_GRPC_PORT)]
+     pub gateway_grpc_port: u16,
+
++    /// Full URL (scheme + host + port) used as OPENSHELL_ENDPOINT for
++    /// sandboxes. When set, this overrides the default bridge-derived
++    /// endpoint.
++    ///
++    /// Example: https://openshell-gateway.my-model.svc.cluster.local:8443
++    #[arg(long)]
++    pub gateway_endpoint: Option<String>,
++
+     /// Deadline, in seconds, to wait for an LXD operation to complete before
+     /// failing the RPC with DeadlineExceeded.
+     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
+diff --git a/crates/openshell-driver-lxd/src/driver.rs b/crates/openshell-driver-lxd/src/driver.rs
+index cab9b3e..45aa364 100644
+--- a/crates/openshell-driver-lxd/src/driver.rs
++++ b/crates/openshell-driver-lxd/src/driver.rs
+@@ -262,6 +262,10 @@ impl LxdComputeDriver {
+         &self,
+         template: &DriverSandboxTemplate,
+     ) -> Result<String, DriverError> {
++        if let Some(endpoint) = self.config.gateway_endpoint.as_ref() {
++            return Ok(endpoint.clone());
++        }
++
+         let network_name = mapping::network(template);
+         let network = self.lxd.get_network(network_name).await?;
+         let cidr = network.config.get("ipv4.address").ok_or_else(|| {
+diff --git a/crates/openshell-driver-lxd/src/main.rs b/crates/openshell-driver-lxd/src/main.rs
+index d7d148b..0ace61e 100644
+--- a/crates/openshell-driver-lxd/src/main.rs
++++ b/crates/openshell-driver-lxd/src/main.rs
+@@ -60,11 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+             .lxd_client_key
+             .clone()
+             .ok_or("--lxd-client-key is required when --lxd-url is set")?;
++        if config.lxd_server_ca.is_some() && config.lxd_server_fingerprint.is_some() {
++            return Err(
++                "--lxd-server-ca and --lxd-server-fingerprint are mutually exclusive".into(),
++            );
++        }
+         LxdEndpoint::Https(LxdHttpsConfig {
+             url,
+             client_cert,
+             client_key,
+             server_ca: config.lxd_server_ca.clone(),
++            server_fingerprint: config.lxd_server_fingerprint.clone(),
+         })
+     } else {
+         LxdEndpoint::UnixSocket(config.lxd_socket.clone())
