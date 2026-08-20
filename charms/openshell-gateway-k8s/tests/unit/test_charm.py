@@ -1207,6 +1207,9 @@ class TestLxdDatabag:
         assert lxd_rel_out.local_app_data["version"] == LXD_INTERFACE_VERSION
         assert lxd_rel_out.local_app_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
         assert "projects" not in lxd_rel_out.local_app_data
+        assert lxd_rel_out.local_unit_data["version"] == LXD_INTERFACE_VERSION
+        assert lxd_rel_out.local_unit_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
+        assert "projects" not in lxd_rel_out.local_unit_data
 
     def test_lxd_databag_publishes_projects_when_configured(self):
         ctx = Context(OpenshellGatewayK8sCharm)
@@ -1228,8 +1231,9 @@ class TestLxdDatabag:
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
         assert lxd_rel_out.local_app_data["projects"] == "default,project-a"
+        assert lxd_rel_out.local_unit_data["projects"] == "default,project-a"
 
-    def test_lxd_databag_not_published_when_not_leader(self):
+    def test_lxd_databag_unit_data_published_when_not_leader(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         lxd_rel = Relation(LXD_RELATION)
         state = State(
@@ -1249,6 +1253,8 @@ class TestLxdDatabag:
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
         assert lxd_rel_out.local_app_data == {}
+        assert lxd_rel_out.local_unit_data["version"] == LXD_INTERFACE_VERSION
+        assert lxd_rel_out.local_unit_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
 
 
 class TestLxdConnection:

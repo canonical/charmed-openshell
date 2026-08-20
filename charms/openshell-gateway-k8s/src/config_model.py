@@ -207,6 +207,8 @@ def render_config_toml(
     jwt_public_key_path: str,
     jwt_kid_path: str,
     redirect_uri: str,
+    k8s_namespace: str = "openshell",
+    k8s_service_account_name: str = "default",
 ) -> str:
     """Return the workload ``config.toml`` as a string.
 
@@ -248,6 +250,10 @@ def render_config_toml(
         f"kid_path = {q(jwt_kid_path)}",
         f"gateway_id = {q(cfg.gateway_id)}",
         f"ttl_secs = {cfg.jwt_ttl_secs}",
+        "",
+        "[openshell.drivers.kubernetes]",
+        f"namespace = {q(k8s_namespace)}",
+        f"service_account_name = {q(k8s_service_account_name)}",
         "",
     ]
     return "\n".join(lines)

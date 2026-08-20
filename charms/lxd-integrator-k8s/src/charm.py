@@ -121,7 +121,8 @@ class LxdIntegratorCharm(ops.CharmBase):
             if exc.status == 403:
                 return False
             raise
-        return identity.get("type") == "Client certificate"
+        identity_type = identity.get("type", "")
+        return isinstance(identity_type, str) and identity_type.startswith("Client certificate")
 
     def _connection_databag(self) -> dict[str, str]:
         """Build the provider databag from config; no LXD call."""

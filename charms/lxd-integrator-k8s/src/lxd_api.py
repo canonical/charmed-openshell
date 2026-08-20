@@ -6,6 +6,7 @@ and before any request bytes are written. There is no unverified mode.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -168,8 +169,12 @@ class LxdClient:
         return metadata
 
     def list_trusted_certificates(self) -> list[dict]:
-        """Return the trust list from ``GET /1.0/certificates``."""
-        response = self._request("GET", "/1.0/certificates")
+        """Return the trust list from ``GET /1.0/certificates``.
+
+        LXD returns a list of certificate URLs by default; use recursion so the
+        response contains the certificate objects (dicts) the caller expects.
+        """
+        response = self._request("GET", "/1.0/certificates?recursion=1")
         metadata = response.get("metadata", [])
         if not isinstance(metadata, list):
             return []
@@ -184,11 +189,13 @@ class LxdClient:
     ) -> None:
         """Add ``cert_pem`` to LXD's trust store via ``POST /1.0/certificates``.
 
+        The LXD API expects the certificate as base64-encoded DER, not PEM.
         HTTP 409 (already trusted) is treated as idempotent success.
         """
+        der = ssl.PEM_cert_to_DER_cert(cert_pem)
         data: dict[str, Any] = {
             "type": "client",
-            "certificate": cert_pem,
+            "certificate": base64.b64encode(der).decode("ascii"),
             "name": name,
         }
         if projects is not None:

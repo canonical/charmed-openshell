@@ -111,6 +111,23 @@ sudo concierge prepare -c concierge.yaml
 just integration-test-charm
 ```
 
+The integration suite runs three modules. ``tests/integration/test_charm.py`` exercises
+the full control plane (PostgreSQL, Hydra, Traefik, and TLS). The two LXD provider-path
+modules can be selected independently with pytest markers:
+
+- ``tests/integration/test_lxd_integrator.py`` (``-m integrator``) uses the host LXD
+  instance that Concierge already enables. It creates an integrator client identity,
+  trusts it on the host LXD, and relates ``lxd-integrator-k8s`` to the gateway in the
+  same Kubernetes model.
+- ``tests/integration/test_lxd_offer.py`` (``-m offer``) creates a machine model on the
+  ``lxd`` cloud, deploys the ``lxd`` charm, offers its ``https`` endpoint, and consumes
+  the offer from the Kubernetes model.
+
+Both provider paths assert the trust lifecycle: relating registers the gateway's client
+certificate with the target LXD, and removing the relation withdraws it. Sandbox end-to-end
+tests in both modules are gated by a probe for the upstream ``--gateway-endpoint`` driver
+flag and skip cleanly until that flag is available.
+
 ## Where to look next
 
 - Browse the [charm definition](charms/openshell-gateway-k8s/charmcraft.yaml) to

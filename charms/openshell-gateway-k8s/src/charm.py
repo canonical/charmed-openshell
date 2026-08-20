@@ -454,18 +454,33 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
     def _publish_lxd_databag(self, identity: dict[str, str]) -> None:
         """Publish this requirer's certificate and version on the lxd relation.
 
-        Leader-gated: non-leaders must not write app data.
+        Writes to both the application databag (leader-only) and the unit
+        databag. The unit-level copy is required for compatibility with the
+        canonical ``lxd`` charm, which reads the requirer's certificate from
+        the remote unit bag in non-clustered deployments.
         """
-        if not self.unit.is_leader():
-            return
         rel = self.model.get_relation(LXD_RELATION)
         if rel is None:
             return
-        rel.data[self.app]["version"] = LXD_INTERFACE_VERSION
-        rel.data[self.app]["certificate"] = identity["certificate"]
+
+        bag: dict[str, str] = {
+            "version": LXD_INTERFACE_VERSION,
+            "certificate": identity["certificate"],
+        }
         if self._model_cfg and self._model_cfg.lxd_projects:
-            rel.data[self.app]["projects"] = self._model_cfg.lxd_projects
-        else:
+            bag["projects"] = self._model_cfg.lxd_projects
+
+        # Unit data can be written by every unit; it is needed by providers
+        # that inspect the remote unit bag (e.g. the canonical lxd charm).
+        rel.data[self.unit].update(bag)
+        if "projects" not in bag:
+            rel.data[self.unit].pop("projects", None)
+
+        if not self.unit.is_leader():
+            return
+
+        rel.data[self.app].update(bag)
+        if "projects" not in bag:
             rel.data[self.app].pop("projects", None)
 
     def _readiness_gaps(self) -> list[_Gap]:
@@ -607,6 +622,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
     ) -> str:
         """Render gateway.toml from the current desired state."""
         assert self._model_cfg is not None
+        k8s_namespace = self._read_pod_namespace()
         return render_config_toml(
             self._model_cfg,
             db_uri=db_uri,
@@ -617,7 +633,28 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt_public_key_path=f"{JWT_DIR}/public.pem",
             jwt_kid_path=f"{JWT_DIR}/kid",
             redirect_uri=self._redirect_uri(),
+            k8s_namespace=k8s_namespace,
         )
+
+    def _read_pod_namespace(self) -> str:
+        """Return the Kubernetes namespace the gateway pod runs in.
+
+        Falls back to ``openshell`` when the downward-API namespace file is not
+        readable, so the server can still start in non-Kubernetes test
+        environments.
+        """
+        container = self.unit.get_container(CONTAINER_NAME)
+        if not container.can_connect():
+            return "openshell"
+        try:
+            namespace = (
+                container.pull("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+                .read()
+                .strip()
+            )
+        except Exception:
+            return "openshell"
+        return namespace if namespace else "openshell"
 
     def _write_container_files(
         self,

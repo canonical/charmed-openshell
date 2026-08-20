@@ -2,6 +2,10 @@
 testpaths = ["tests/unit"]
 addopts = "--tb=short"
 pythonpath = ["src", "lib"]
+markers = [
+    "integrator: tests for the lxd-integrator-k8s provider path",
+    "offer: tests for the cross-model lxd charm offer provider path",
+]
 
 [tool.coverage.run]
 source = ["src"]

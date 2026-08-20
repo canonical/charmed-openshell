@@ -152,7 +152,7 @@ def test_register_requirer_certificate(base_state, transport, requirer_cert):
     )
     state = base_state(relations={relation}, leader=True)
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 200, [])
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     tr.add_response("POST", "/1.0/certificates", 200, {})
     _run_reconcile(ctx, state, tr)
 
@@ -173,7 +173,7 @@ def test_register_idempotent_on_rerun(base_state, transport, requirer_cert):
     state = base_state(relations={relation}, leader=True)
 
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 200, [])
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     tr.add_response("POST", "/1.0/certificates", 200, {})
     state_out = _run_reconcile(ctx, state, tr)
     posts_1 = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]
@@ -182,7 +182,7 @@ def test_register_idempotent_on_rerun(base_state, transport, requirer_cert):
     tr2 = transport()
     tr2.add_response(
         "GET",
-        "/1.0/certificates",
+        "/1.0/certificates?recursion=1",
         200,
         [
             {
@@ -207,7 +207,7 @@ def test_revoke_on_relation_broken(base_state, transport, requirer_cert):
     state = base_state(relations={relation}, leader=True)
 
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 200, [])
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     tr.add_response("POST", "/1.0/certificates", 200, {})
     state_out = _run_reconcile(ctx, state, tr)
 
@@ -215,7 +215,7 @@ def test_revoke_on_relation_broken(base_state, transport, requirer_cert):
     fp = pem_fingerprint(requirer_cert)
     tr2.add_response(
         "GET",
-        "/1.0/certificates",
+        "/1.0/certificates?recursion=1",
         200,
         [
             {"name": "juju-relation-openshell-gateway", "fingerprint": fp},
@@ -270,7 +270,7 @@ def test_requirer_projects_override_default(cert_pair, transport):
         **{"default-projects": "default"},
     )
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 200, [])
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     tr.add_response("POST", "/1.0/certificates", 200, {})
     _run_reconcile(ctx, state, tr)
 
@@ -293,7 +293,7 @@ def test_default_projects_parsed_and_restricted(base_state, transport, requirer_
         **{"default-projects": "project-a, project-b"},
     )
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 200, [])
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     tr.add_response("POST", "/1.0/certificates", 200, {})
     _run_reconcile(ctx, state, tr)
 
@@ -312,7 +312,7 @@ def test_malformed_requirer_cert_skipped(base_state, transport):
     )
     state = base_state(relations={relation}, leader=True)
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 200, [])
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 200, [])
     _run_reconcile(ctx, state, tr)
 
     posts = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]
@@ -363,7 +363,7 @@ def test_lxd_api_error_skips_convergence(base_state, transport):
     )
     state = base_state(relations={relation}, leader=True)
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 500, {})
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 500, {})
     _run_reconcile(ctx, state, tr)
 
     posts = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]
@@ -420,7 +420,7 @@ def test_list_trusted_clients_action(base_state, transport):
     tr = transport()
     tr.add_response(
         "GET",
-        "/1.0/certificates",
+        "/1.0/certificates?recursion=1",
         200,
         [
             {"name": "juju-relation-openshell-gateway", "fingerprint": "aa" * 32},
@@ -578,7 +578,7 @@ def test_list_trusted_clients_action_api_error(base_state, transport):
     ctx = Context(LxdIntegratorCharm)
     state = base_state(leader=True)
     tr = transport()
-    tr.add_response("GET", "/1.0/certificates", 500, {})
+    tr.add_response("GET", "/1.0/certificates?recursion=1", 500, {})
 
     with (
         pytest.raises(Exception) as exc_info,
@@ -624,5 +624,5 @@ def test_reconcile_skips_on_verification_error(cert_pair, transport):
 
     rel_out = state_out.get_relation(relation.id)
     assert rel_out.local_unit_data["addresses"] == "localhost:8443"
-    assert len([r for r in tr.requests if r[:2] == ("GET", "/1.0/certificates")]) == 0
+    assert len([r for r in tr.requests if r[:2] == ("GET", "/1.0/certificates?recursion=1")]) == 0
     assert len([r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]) == 0

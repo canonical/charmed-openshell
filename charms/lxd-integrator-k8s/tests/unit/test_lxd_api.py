@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -254,6 +255,8 @@ def test_response_parsing(cert_pair):
     client.add_trusted_certificate(cert_pem, "test")
     assert conn.requests
     assert conn.requests[0][0] == "POST"
+    payload = json.loads(conn.requests[0][2] or b"{}")
+    assert base64.b64decode(payload["certificate"]) == cert_der
 
     client, conn = make_client(json.dumps({"metadata": {}}).encode())
     client.remove_trusted_certificate("fp1")
@@ -341,6 +344,7 @@ def test_add_trusted_certificate_sets_restricted(cert_pair):
     payload = json.loads(body or b"{}")
     assert payload["restricted"] is True
     assert payload["projects"] == ["default"]
+    assert base64.b64decode(payload["certificate"]) == cert_der
 
 
 def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
@@ -359,3 +363,4 @@ def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
     payload = json.loads(conn.requests[0][2] or b"{}")
     assert "restricted" not in payload
     assert payload["projects"] == []
+    assert base64.b64decode(payload["certificate"]) == cert_der

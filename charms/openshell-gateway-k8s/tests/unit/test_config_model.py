@@ -434,6 +434,19 @@ class TestRenderConfigToml:
         toml = render_config_toml(cfg, **_TOML_KWARGS)
         assert "ttl_secs = 7200" in toml
 
+    def test_kubernetes_driver_section(self):
+        import tomllib
+
+        toml = self._render()
+        parsed = tomllib.loads(toml)
+        section = parsed["openshell"]["drivers"]["kubernetes"]
+        assert section["namespace"] == "openshell"
+        assert section["service_account_name"] == "default"
+
+    def test_kubernetes_namespace_can_be_overridden(self):
+        toml = self._render(k8s_namespace="custom-ns")
+        assert 'namespace = "custom-ns"' in toml
+
     def test_is_string(self):
         toml = self._render()
         assert isinstance(toml, str)
