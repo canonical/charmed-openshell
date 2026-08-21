@@ -182,8 +182,14 @@ jobs:
       - name: Resolve artifact paths
         id: artifacts
         run: |
-          charm="$(ls artifacts/charm/*.charm | head -n1)"
-          rock="$(ls artifacts/rock/*.rock | head -n1)"
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64) rock_arch="amd64" ;;
+            aarch64) rock_arch="arm64" ;;
+            *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
+          esac
+          charm="$(realpath artifacts/charm/*.charm | head -n1)"
+          rock="$(realpath artifacts/rock/*_${rock_arch}.rock | head -n1)"
           echo "charm=$charm" >> "$GITHUB_OUTPUT"
           echo "rock=$rock" >> "$GITHUB_OUTPUT"
 
