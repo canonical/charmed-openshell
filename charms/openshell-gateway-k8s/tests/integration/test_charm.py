@@ -106,9 +106,11 @@ class TestOpenShellGatewayFunctional:
             app = status.apps.get(APP_NAME)
             if app is None:
                 return False
-            return (
-                app.app_status.current == "blocked"
-                and "database relation missing" in app.app_status.message
+            unit = app.units.get(f"{APP_NAME}/0")
+            if unit is None:
+                return False
+            return unit.workload_status.current == "blocked" and "database relation missing" in (
+                unit.workload_status.message or ""
             )
 
         juju.wait(_blocked, timeout=300)
@@ -126,9 +128,11 @@ class TestOpenShellGatewayFunctional:
             app = status.apps.get(APP_NAME)
             if app is None:
                 return False
-            return (
-                app.app_status.current == "blocked"
-                and "oauth relation missing" in app.app_status.message
+            unit = app.units.get(f"{APP_NAME}/0")
+            if unit is None:
+                return False
+            return unit.workload_status.current == "blocked" and "oauth relation missing" in (
+                unit.workload_status.message or ""
             )
 
         juju.wait(_blocked, timeout=300)
