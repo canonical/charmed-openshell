@@ -17,5 +17,6 @@ output "requires" {
     certificates = "certificates"
     oauth        = "oauth"
     ingress      = "ingress"
+    lxd          = "lxd"
   }
 }
