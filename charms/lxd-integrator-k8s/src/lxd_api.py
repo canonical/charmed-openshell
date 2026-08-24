@@ -36,7 +36,8 @@ class LxdConnectionError(Exception):
     """Raised when every configured endpoint fails."""
 
 
-ConnectionFactory = Callable[[str, int], http.client.HTTPSConnection]
+DEFAULT_TIMEOUT: float = 30.0
+ConnectionFactory = Callable[[str, int, float], http.client.HTTPSConnection]
 
 
 def pem_fingerprint(cert_pem: str) -> str:
@@ -64,17 +65,21 @@ class LxdClient:
         client_cert: str,
         client_key: str,
         connection_factory: ConnectionFactory | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self._endpoints = endpoints
         self._verification_mode = verification_mode
         self._server_pin = server_pin
         self._client_cert = client_cert
         self._client_key = client_key
+        self._timeout = timeout
         self._connection_factory: ConnectionFactory = (
             connection_factory or self._default_connection_factory
         )
 
-    def _default_connection_factory(self, host: str, port: int) -> http.client.HTTPSConnection:
+    def _default_connection_factory(
+        self, host: str, port: int, timeout: float = DEFAULT_TIMEOUT
+    ) -> http.client.HTTPSConnection:
         """Build a real HTTPS connection with mTLS and no host/chain verification."""
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
@@ -89,7 +94,7 @@ class LxdClient:
                     file.write(data)
             context.load_cert_chain(cert_path, key_path)
 
-        return http.client.HTTPSConnection(host, port, context=context)
+        return http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
 
     def _verify(self, conn: http.client.HTTPSConnection) -> None:
         """Verify the server identity after the handshake and before any request.
@@ -108,7 +113,7 @@ class LxdClient:
 
         if self._verification_mode == VerificationMode.FINGERPRINT:
             actual = hashlib.sha256(der).hexdigest()
-            expected = self._server_pin.lower()
+            expected = self._server_pin.lower().replace(":", "")
             if actual != expected:
                 raise VerificationError(f"fingerprint mismatch: expected {expected}, got {actual}")
         else:
@@ -128,7 +133,7 @@ class LxdClient:
         for host, port in self._endpoints:
             conn: http.client.HTTPSConnection | None = None
             try:
-                conn = self._connection_factory(host, port)
+                conn = self._connection_factory(host, port, self._timeout)
                 conn.connect()
                 self._verify(conn)
                 headers = {"Content-Type": "application/json"}

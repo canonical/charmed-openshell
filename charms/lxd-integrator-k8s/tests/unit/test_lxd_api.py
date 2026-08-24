@@ -142,7 +142,7 @@ def test_verification_match_and_mismatch(cert_pair):
         server_pin=fingerprint,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn_ok,
+        connection_factory=lambda _h, _p, _t: conn_ok,
     )
     assert client.get_server_info() == {"version": "1.0"}
     assert conn_ok.requests
@@ -155,7 +155,7 @@ def test_verification_match_and_mismatch(cert_pair):
         server_pin="00" * 32,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn_bad,
+        connection_factory=lambda _h, _p, _t: conn_bad,
     )
     with pytest.raises(VerificationError):
         client_bad.get_server_info()
@@ -173,7 +173,7 @@ def test_verification_match_and_mismatch(cert_pair):
         server_pin=cert_pem,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn_cert_ok,
+        connection_factory=lambda _h, _p, _t: conn_cert_ok,
     )
     assert client_cert.get_server_info() == {"version": "1.0"}
     assert conn_cert_ok.requests
@@ -186,7 +186,7 @@ def test_verification_match_and_mismatch(cert_pair):
         server_pin=cert_pem,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn_cert_bad,
+        connection_factory=lambda _h, _p, _t: conn_cert_bad,
     )
     with pytest.raises(VerificationError):
         client_cert_bad.get_server_info()
@@ -203,7 +203,7 @@ def test_pem_pin_to_der(cert_pair):
         server_pin=cert_pem,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn,
+        connection_factory=lambda _h, _p, _t: conn,
     )
     client.get_server_info()
     assert conn.requests
@@ -221,7 +221,7 @@ def test_endpoint_failover(cert_pair):
         server_pin=cert_pem,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: connections.pop(0),
+        connection_factory=lambda _h, _p, _t: connections.pop(0),
     )
     info = client.get_server_info()
     assert info == {"ok": True}
@@ -241,7 +241,7 @@ def test_response_parsing(cert_pair):
             server_pin=fingerprint,
             client_cert=cert_pem,
             client_key=key_pem,
-            connection_factory=lambda _h, _p: conn,
+            connection_factory=lambda _h, _p, _t: conn,
         )
         return client, conn
 
@@ -274,7 +274,7 @@ def test_add_trusted_certificate_non_409_error(cert_pair):
         server_pin=fingerprint,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn,
+        connection_factory=lambda _h, _p, _t: conn,
     )
     with pytest.raises(LxdApiError) as exc_info:
         client.add_trusted_certificate(cert_pem, "test")
@@ -291,7 +291,7 @@ def test_all_endpoints_exhausted(cert_pair):
         server_pin=fingerprint,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn,
+        connection_factory=lambda _h, _p, _t: conn,
     )
     with pytest.raises(LxdConnectionError):
         client.get_server_info()
@@ -316,7 +316,7 @@ def test_get_current_identity(cert_pair):
         server_pin=fingerprint,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn,
+        connection_factory=lambda _h, _p, _t: conn,
     )
     assert client.get_current_identity() == {
         "type": "Client certificate",
@@ -334,7 +334,7 @@ def test_add_trusted_certificate_sets_restricted(cert_pair):
         server_pin=fingerprint,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn,
+        connection_factory=lambda _h, _p, _t: conn,
     )
     client.add_trusted_certificate(cert_pem, "test", projects=["default"])
     assert conn.requests
@@ -357,10 +357,53 @@ def test_add_trusted_certificate_empty_projects_not_restricted(cert_pair):
         server_pin=fingerprint,
         client_cert=cert_pem,
         client_key=key_pem,
-        connection_factory=lambda _h, _p: conn,
+        connection_factory=lambda _h, _p, _t: conn,
     )
     client.add_trusted_certificate(cert_pem, "test", projects=[])
     payload = json.loads(conn.requests[0][2] or b"{}")
     assert "restricted" not in payload
     assert payload["projects"] == []
     assert base64.b64decode(payload["certificate"]) == cert_der
+
+
+def test_fingerprint_colons_accepted(cert_pair):
+    """Colon-separated fingerprints are normalised before comparison."""
+    cert_pem, key_pem, cert_der = cert_pair
+    fingerprint = hashlib.sha256(cert_der).hexdigest()
+    colon_fp = ":".join(fingerprint[i : i + 2] for i in range(0, len(fingerprint), 2))
+    conn = FakeConnection(
+        cert_der,
+        json.dumps({"metadata": {"version": "1.0"}}).encode(),
+    )
+    client = LxdClient(
+        endpoints=(("localhost", 8443),),
+        verification_mode=VerificationMode.FINGERPRINT,
+        server_pin=colon_fp,
+        client_cert=cert_pem,
+        client_key=key_pem,
+        connection_factory=lambda _h, _p, _t: conn,
+    )
+    assert client.get_server_info() == {"version": "1.0"}
+
+
+def test_connection_timeout_passed_to_factory(cert_pair):
+    """The configured timeout is forwarded to the connection factory."""
+    cert_pem, key_pem, cert_der = cert_pair
+    seen: list[tuple[str, int, float]] = []
+
+    def factory(host: str, port: int, timeout: float) -> FakeConnection:
+        seen.append((host, port, timeout))
+        return FakeConnection(cert_der)
+
+    client = LxdClient(
+        endpoints=(("localhost", 8443),),
+        verification_mode=VerificationMode.FINGERPRINT,
+        server_pin="aa" * 32,
+        client_cert=cert_pem,
+        client_key=key_pem,
+        connection_factory=factory,
+        timeout=5.0,
+    )
+    with pytest.raises(VerificationError):
+        client.get_server_info()
+    assert seen == [("localhost", 8443, 5.0)]

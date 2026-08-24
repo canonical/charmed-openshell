@@ -124,7 +124,7 @@ class FakeTransport:
         self._error = error
         self.raise_on_connect = True
 
-    def __call__(self, _host: str, _port: int) -> FakeConnection:
+    def __call__(self, _host: str, _port: int, _timeout: float = 30.0) -> FakeConnection:
         conn = FakeConnection(
             self.peer_der,
             responses=dict(self.responses),
