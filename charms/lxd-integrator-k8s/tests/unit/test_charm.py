@@ -6,10 +6,17 @@ import hashlib
 import json
 
 import pytest
-from ops.testing import Context, Relation, Secret, State
+from ops.testing import Context, Model, Relation, Secret, State
 
 from charm import LxdIntegratorCharm
 from lxd_api import pem_fingerprint
+
+APP_NAME = "lxd-integrator-k8s"
+MODEL_UUID = "test-model-uuid"
+
+
+def _expected_trust_name(remote_app_name: str) -> str:
+    return f"juju-relation-{APP_NAME}-{MODEL_UUID}-{remote_app_name}"
 
 
 def _credentials_secret(client_cert: str, client_key: str) -> Secret:
@@ -39,6 +46,7 @@ def _state(
         secrets={secret},
         relations=relations or set(),
         leader=leader,
+        model=Model(uuid=MODEL_UUID),
     )
 
 
@@ -69,7 +77,7 @@ def base_state(cert_pair):
 def test_charm_starts(cert_pair):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = _state(cert_pem, key_pem, fingerprint)
     with ctx._run(ctx.on.start(), state) as ops:
         ops.run()
@@ -82,7 +90,7 @@ def test_charm_starts(cert_pair):
 
 
 def test_missing_secret_is_config_error():
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = State(config={"lxd-endpoints": "localhost"})
     with ctx._run(ctx.on.start(), state) as ops:
         ops.run()
@@ -94,7 +102,7 @@ def test_missing_secret_is_config_error():
 
 
 def test_publish_single_endpoint_to_unit_bag(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
     state = base_state(relations={relation}, leader=True)
     tr = transport()
@@ -110,7 +118,7 @@ def test_publish_single_endpoint_to_unit_bag(base_state, transport):
 def test_publish_clustered_to_app_bag(cert_pair, transport):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
     state = _state(
         cert_pem,
@@ -131,7 +139,7 @@ def test_publish_clustered_to_app_bag(cert_pair, transport):
 def test_publish_fingerprint_only_omits_certificate(cert_pair, transport):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
     state = _state(cert_pem, key_pem, fingerprint, relations={relation}, leader=True)
     tr = transport()
@@ -143,7 +151,7 @@ def test_publish_fingerprint_only_omits_certificate(cert_pair, transport):
 
 
 def test_register_requirer_certificate(base_state, transport, requirer_cert):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     requirer_cert = requirer_cert.strip()
     relation = Relation(
         endpoint="https",
@@ -159,11 +167,11 @@ def test_register_requirer_certificate(base_state, transport, requirer_cert):
     post = [r for r in tr.requests if r[:2] == ("POST", "/1.0/certificates")]
     assert len(post) == 1
     body = json.loads(post[0][2] or b"{}")
-    assert body["name"] == "juju-relation-openshell-gateway"
+    assert body["name"] == _expected_trust_name("openshell-gateway")
 
 
 def test_register_idempotent_on_rerun(base_state, transport, requirer_cert):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     requirer_cert = requirer_cert.strip()
     relation = Relation(
         endpoint="https",
@@ -186,7 +194,7 @@ def test_register_idempotent_on_rerun(base_state, transport, requirer_cert):
         200,
         [
             {
-                "name": "juju-relation-openshell-gateway",
+                "name": _expected_trust_name("openshell-gateway"),
                 "fingerprint": pem_fingerprint(requirer_cert),
             },
         ],
@@ -197,7 +205,7 @@ def test_register_idempotent_on_rerun(base_state, transport, requirer_cert):
 
 
 def test_revoke_on_relation_broken(base_state, transport, requirer_cert):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     requirer_cert = requirer_cert.strip()
     relation = Relation(
         endpoint="https",
@@ -218,7 +226,7 @@ def test_revoke_on_relation_broken(base_state, transport, requirer_cert):
         "/1.0/certificates?recursion=1",
         200,
         [
-            {"name": "juju-relation-openshell-gateway", "fingerprint": fp},
+            {"name": _expected_trust_name("openshell-gateway"), "fingerprint": fp},
         ],
     )
     tr2.add_response("DELETE", f"/1.0/certificates/{fp}", 200, {})
@@ -232,7 +240,7 @@ def test_revoke_on_relation_broken(base_state, transport, requirer_cert):
 
 
 def test_non_charm_owned_entry_not_revoked(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
     state = base_state(relations={relation}, leader=True)
 
@@ -254,7 +262,7 @@ def test_non_charm_owned_entry_not_revoked(base_state, transport):
 def test_requirer_projects_override_default(cert_pair, transport):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     requirer_cert = cert_pair[0]
     relation = Relation(
         endpoint="https",
@@ -281,7 +289,7 @@ def test_requirer_projects_override_default(cert_pair, transport):
 
 
 def test_default_projects_parsed_and_restricted(base_state, transport, requirer_cert):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(
         endpoint="https",
         remote_app_name="openshell-gateway",
@@ -304,7 +312,7 @@ def test_default_projects_parsed_and_restricted(base_state, transport, requirer_
 
 
 def test_malformed_requirer_cert_skipped(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(
         endpoint="https",
         remote_app_name="openshell-gateway",
@@ -324,7 +332,7 @@ def test_incomplete_credentials_build_client_none():
         id="secret:0123456789abcdef0123",
         tracked_content={"client-cert": "CLIENT_CERT", "server-cert": "SERVER_CERT"},
     )
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = State(
         config={
             "lxd-endpoints": "localhost",
@@ -342,7 +350,7 @@ def test_incomplete_credentials_build_client_none():
 
 
 def test_databag_published_when_lxd_unreachable(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
     state = base_state(relations={relation}, leader=True)
     tr = transport()
@@ -354,7 +362,7 @@ def test_databag_published_when_lxd_unreachable(base_state, transport):
 
 
 def test_lxd_api_error_skips_convergence(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     requirer_cert = "REQUIRER_CERT"
     relation = Relation(
         endpoint="https",
@@ -371,7 +379,7 @@ def test_lxd_api_error_skips_convergence(base_state, transport):
 
 
 def test_get_connection_info_action_trusted(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response("GET", "/1.0/auth/identities/current", 200, {"type": "Client certificate"})
@@ -386,7 +394,7 @@ def test_get_connection_info_action_trusted(base_state, transport):
 
 
 def test_get_connection_info_action_untrusted(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response("GET", "/1.0/auth/identities/current", 403, {})
@@ -399,7 +407,7 @@ def test_get_connection_info_action_untrusted(base_state, transport):
 
 
 def test_get_connection_info_action_unreachable(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.raise_on_connect = True
@@ -415,7 +423,7 @@ def test_get_connection_info_action_unreachable(base_state, transport):
 
 
 def test_list_trusted_clients_action(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response(
@@ -423,7 +431,7 @@ def test_list_trusted_clients_action(base_state, transport):
         "/1.0/certificates?recursion=1",
         200,
         [
-            {"name": "juju-relation-openshell-gateway", "fingerprint": "aa" * 32},
+            {"name": _expected_trust_name("openshell-gateway"), "fingerprint": "aa" * 32},
             {"name": "manual-entry", "fingerprint": "bb" * 32},
         ],
     )
@@ -434,11 +442,11 @@ def test_list_trusted_clients_action(base_state, transport):
 
     clients = ctx.action_results["clients"]
     assert len(clients) == 1
-    assert clients[0]["name"] == "juju-relation-openshell-gateway"
+    assert clients[0]["name"] == _expected_trust_name("openshell-gateway")
 
 
 def test_list_trusted_clients_action_unreachable(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.raise_on_connect = True
@@ -454,14 +462,14 @@ def test_list_trusted_clients_action_unreachable(base_state, transport):
 
 
 def test_status_blocked_without_credentials():
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = State(config={"lxd-endpoints": "localhost"})
     state_out = ctx.run(ctx.on.start(), state)
     assert state_out.unit_status.name == "blocked"
 
 
 def test_status_waiting_when_lxd_unreachable(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.raise_on_connect = True
@@ -474,7 +482,7 @@ def test_status_waiting_when_lxd_unreachable(base_state, transport):
 
 
 def test_status_active_when_trusted(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response("GET", "/1.0/auth/identities/current", 200, {"type": "Client certificate"})
@@ -490,7 +498,7 @@ def test_status_blocked_on_verification_error(base_state, transport):
     state = base_state(leader=True)
     tr = transport()
     # Use a mismatched server fingerprint to trigger VerificationError.
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state2 = State(
         config={
             "lxd-endpoints": "localhost",
@@ -509,7 +517,7 @@ def test_status_blocked_on_verification_error(base_state, transport):
 
 
 def test_status_blocked_on_api_error(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response("GET", "/1.0/auth/identities/current", 500, {})
@@ -524,7 +532,7 @@ def test_status_blocked_on_api_error(base_state, transport):
 def test_get_connection_info_action_ipv6_endpoint_bracketed(cert_pair, transport):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = _state(
         cert_pem,
         key_pem,
@@ -544,7 +552,7 @@ def test_get_connection_info_action_ipv6_endpoint_bracketed(cert_pair, transport
 
 
 def test_get_connection_info_action_api_error(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response("GET", "/1.0/auth/identities/current", 500, {})
@@ -560,7 +568,7 @@ def test_get_connection_info_action_api_error(base_state, transport):
 
 
 def test_get_connection_info_action_verification_error(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True, **{"lxd-server-fingerprint": "00" * 32})
     tr = transport()
 
@@ -575,7 +583,7 @@ def test_get_connection_info_action_verification_error(base_state, transport):
 
 
 def test_list_trusted_clients_action_api_error(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True)
     tr = transport()
     tr.add_response("GET", "/1.0/certificates?recursion=1", 500, {})
@@ -591,7 +599,7 @@ def test_list_trusted_clients_action_api_error(base_state, transport):
 
 
 def test_list_trusted_clients_action_verification_error(base_state, transport):
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     state = base_state(leader=True, **{"lxd-server-fingerprint": "00" * 32})
     tr = transport()
 
@@ -608,7 +616,7 @@ def test_list_trusted_clients_action_verification_error(base_state, transport):
 def test_reconcile_skips_on_verification_error(cert_pair, transport):
     cert_pem, key_pem, cert_der = cert_pair
     fingerprint = hashlib.sha256(cert_der).hexdigest()
-    ctx = Context(LxdIntegratorCharm)
+    ctx = Context(LxdIntegratorCharm, app_name="lxd-integrator-k8s")
     relation = Relation(endpoint="https", remote_app_name="openshell-gateway")
     state = _state(
         cert_pem,

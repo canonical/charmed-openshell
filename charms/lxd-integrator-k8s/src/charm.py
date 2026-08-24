@@ -159,18 +159,31 @@ class LxdIntegratorCharm(ops.CharmBase):
             target.update(bag)
 
     def _trust_name(self, relation: ops.Relation) -> str:
-        """Return the LXD trust entry name for a related application."""
+        """Return the LXD trust entry name for a related application.
+
+        The name is scoped to this integrator application so that multiple
+        integrators targeting the same LXD do not classify each other's trust
+        entries as owned.
+        """
         assert self._model is not None
         assert relation.app is not None
-        return f"{self._model.trust_name_prefix}-{relation.app.name}"
+        return (
+            f"{self._model.trust_name_prefix}-"
+            f"{self.app.name}-{self.model.uuid}-"
+            f"{relation.app.name}"
+        )
+
+    def _ownership_prefix(self) -> str:
+        """Return the name prefix that identifies this integrator's trust entries."""
+        assert self._model is not None
+        return f"{self._model.trust_name_prefix}-{self.app.name}-{self.model.uuid}-"
 
     def _is_charm_owned(self, entry: dict) -> bool:
-        """Return whether a trust entry is owned by this charm."""
+        """Return whether a trust entry is owned by this integrator application."""
         if not self._model:
             return False
         name = entry.get("name", "")
-        prefix = f"{self._model.trust_name_prefix}-"
-        return isinstance(name, str) and name.startswith(prefix)
+        return isinstance(name, str) and name.startswith(self._ownership_prefix())
 
     def _read_relation_raw(self, relation: ops.Relation, key: str) -> str | None:
         """Read a raw string from the relation app bag, falling back to unit bags."""
@@ -200,14 +213,19 @@ class LxdIntegratorCharm(ops.CharmBase):
         self,
         client: LxdClient,
         live_relations: set[str],
+        broken_relation_id: int | None = None,
     ) -> None:
-        """Register related certs and revoke orphaned charm-owned entries."""
+        """Register related certs and revoke orphaned or rotated charm-owned entries."""
+        assert self._model is not None
         trust_entries = client.list_trusted_certificates()
 
         known_fingerprints = {entry.get("fingerprint", "").lower() for entry in trust_entries}
+        expected_by_name: dict[str, str] = {}
 
         for relation in self.model.relations[HTTPS_RELATION]:
             if relation.app is None:
+                continue
+            if broken_relation_id is not None and relation.id == broken_relation_id:
                 continue
             cert = self._requirer_cert(relation)
             if not cert:
@@ -220,24 +238,27 @@ class LxdIntegratorCharm(ops.CharmBase):
                     relation.id,
                 )
                 continue
+            name = self._trust_name(relation)
+            expected_by_name[name] = fp
             if fp in known_fingerprints:
                 continue
             client.add_trusted_certificate(
                 cert,
-                name=self._trust_name(relation),
+                name=name,
                 projects=self._requirer_projects(relation),
-                trust_token=None,
+                trust_token=self._model.trust_token,
             )
 
         for entry in trust_entries:
             if not self._is_charm_owned(entry):
                 continue
             name = entry.get("name", "")
-            assert self._model is not None
-            prefix = f"{self._model.trust_name_prefix}-"
-            app_name = name[len(prefix) :] if name.startswith(prefix) else ""
-            if app_name not in live_relations:
-                client.remove_trusted_certificate(entry["fingerprint"])
+            entry_fp = entry.get("fingerprint", "").lower()
+            if not isinstance(name, str):
+                continue
+            expected_fp = expected_by_name.get(name)
+            if expected_fp is None or expected_fp != entry_fp:
+                client.remove_trusted_certificate(entry_fp)
 
     def _reconcile(self, event: ops.EventBase) -> None:
         """Idempotently publish connection info and converge the LXD trust store."""
@@ -248,16 +269,18 @@ class LxdIntegratorCharm(ops.CharmBase):
             logger.info("Skipping trust convergence: LXD credentials incomplete")
             return
 
+        broken_relation_id: int | None = None
         live_relations: set[str] = set()
         for relation in self.model.relations[HTTPS_RELATION]:
             if relation.app is None:
                 continue
             if isinstance(event, ops.RelationBrokenEvent) and event.relation.id == relation.id:
+                broken_relation_id = relation.id
                 continue
             live_relations.add(relation.app.name)
 
         try:
-            self._converge_trust(client, live_relations)
+            self._converge_trust(client, live_relations, broken_relation_id)
         except (LxdConnectionError, VerificationError, LxdApiError) as exc:
             logger.warning("Skipping trust convergence: %s", exc)
 
