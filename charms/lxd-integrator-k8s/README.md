@@ -28,10 +28,10 @@ The charm is workload-less, so there is no workload container or rock to manage.
 
 | Option                 | Type    | Default         | Meaning |
 | ---------------------- | ------- | --------------- | ------- |
-| `lxd-endpoints`        | string  |                 | Comma-separated list of LXD HTTPS API endpoints, most-preferred first. IPv6 literals must be bracketed, for example `[::1]:8443`. Port 8443 is used when omitted. |
+| `lxd-endpoints`        | string  |                 | Comma-separated list of LXD HTTPS API endpoints, most-preferred first. IPv6 literals must be bracketed, for example `[::1]:8443`. Port 8443 is used when omitted. Do not include a URL scheme; HTTPS is implied. |
 | `lxd-credentials`      | secret  |                 | Juju secret that contains the integrator's LXD credentials. See [Credentials and trust-store setup](#credentials-and-trust-store-setup). |
 | `lxd-server-fingerprint` | string |               | SHA-256 fingerprint (hex) of the LXD server's TLS certificate. |
-| `default-projects`     | string  |                 | Comma-separated list of default LXD projects to advertise to requirers. |
+| `default-projects`     | string  |                 | Comma-separated list of default LXD projects used as the fallback project restriction when adding a requirer's certificate to LXD. Leave unset to allow requirers all-project access. |
 | `trust-name-prefix`    | string  | `juju-relation` | Prefix used when registering trusted client certificates in LXD. |
 
 ## Credentials and trust-store setup
@@ -61,14 +61,16 @@ Grant the secret to the integrator charm and configure the endpoints:
 ```bash
 juju grant-secret <secret-uri> lxd-integrator-k8s
 juju config lxd-integrator-k8s \
-  lxd-endpoints="https://lxd-1.example.com:8443,https://lxd-2.example.com:8443" \
+  lxd-endpoints="lxd-1.example.com:8443,lxd-2.example.com:8443" \
   lxd-credentials=<secret-uri>
 ```
 
 The charm registers a trust-store entry for each requirer under a name built
-from `trust-name-prefix` and the relation identifier, for example
-`juju-relation-3`. The `list-trusted-clients` action can be used to inspect the
-trust-store entries owned by this charm.
+from `trust-name-prefix`, this integrator's application name and model UUID,
+and the remote application name, for example
+`juju-relation-lxd-integrator-k8s-<model-uuid>-openshell-gateway`.
+The `list-trusted-clients` action can be used to inspect the trust-store
+entries owned by this charm.
 
 ## The `lxd-https` relation
 
