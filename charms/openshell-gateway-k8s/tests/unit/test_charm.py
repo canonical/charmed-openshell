@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import stat
 from pathlib import Path
@@ -10,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import ops.pebble
 import yaml
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
-from ops import ActiveStatus, BlockedStatus, WaitingStatus
+from ops import ActiveStatus, BlockedStatus, ModelError, SecretNotFoundError, WaitingStatus
 from ops.testing import Container, Context, Model, PeerRelation, Relation, Secret, State
 
 import config_model
@@ -225,6 +226,93 @@ class TestMissingRelations:
     def test_waiting_when_jwt_not_ready(self):
         status = self._status_with(_DB_URI, (_FAKE_TLS_CERT, _FAKE_TLS_KEY), _ISSUER, None)
         assert isinstance(status, (BlockedStatus, WaitingStatus))
+
+
+# ---------------------------------------------------------------------------
+# Relation-data resilience during secret churn
+# ---------------------------------------------------------------------------
+
+
+class TestRelationDataResilience:
+    def _ready_patches(self, stack: contextlib.ExitStack, **overrides):
+        """Patch all readiness helpers via the supplied ExitStack."""
+        defaults = {
+            "_database_uri": _DB_URI,
+            "_tls_material": (_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+            "_oauth_issuer": _ISSUER,
+            "_ensure_jwt_keypair": _FAKE_JWT,
+            "_read_jwt_keypair": _FAKE_JWT,
+            "_ensure_lxd_client_identity": _FAKE_LXD_IDENTITY,
+            "_read_lxd_client_identity": _FAKE_LXD_IDENTITY,
+            "_lxd_connection": _LXD_CONN,
+        }
+        defaults.update(overrides)
+        for name, value in defaults.items():
+            stack.enter_context(patch.object(OpenshellGatewayK8sCharm, name, return_value=value))
+
+    def test_database_uri_swallows_secret_not_found(self):
+        """Trans revoked database secrets are treated as not-ready, not fatal."""
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = _all_ready_state()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "charms.data_platform_libs.v0.data_interfaces.DatabaseRequires.fetch_relation_data",
+                    side_effect=SecretNotFoundError("secret gone"),
+                )
+            )
+            self._ready_patches(stack, _database_uri=None)
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "database credentials" in out.unit_status.message.lower()
+
+    def test_database_uri_swallows_model_error(self):
+        """Transient model errors reading database secrets are treated as not-ready."""
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = _all_ready_state()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "charms.data_platform_libs.v0.data_interfaces.DatabaseRequires.fetch_relation_data",
+                    side_effect=ModelError("model hiccup"),
+                )
+            )
+            self._ready_patches(stack, _database_uri=None)
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "database credentials" in out.unit_status.message.lower()
+
+    def test_oauth_issuer_swallows_secret_not_found(self):
+        """Trans revoked oauth secrets are treated as not-ready, not fatal."""
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = _all_ready_state()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "charms.hydra.v0.oauth.OAuthRequirer.get_provider_info",
+                    side_effect=SecretNotFoundError("secret gone"),
+                )
+            )
+            self._ready_patches(stack, _oauth_issuer=None)
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "oauth provider info" in out.unit_status.message.lower()
+
+    def test_oauth_issuer_swallows_model_error(self):
+        """Transient model errors reading oauth secrets are treated as not-ready."""
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = _all_ready_state()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "charms.hydra.v0.oauth.OAuthRequirer.get_provider_info",
+                    side_effect=ModelError("model hiccup"),
+                )
+            )
+            self._ready_patches(stack, _oauth_issuer=None)
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "oauth provider info" in out.unit_status.message.lower()
 
 
 # ---------------------------------------------------------------------------

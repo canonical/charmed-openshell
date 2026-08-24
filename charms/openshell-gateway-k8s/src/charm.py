@@ -239,7 +239,13 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
     def _database_uri(self) -> str | None:
         """Build the PostgreSQL URI from relation data, or None if not ready."""
-        all_data = self.database.fetch_relation_data()
+        try:
+            all_data = self.database.fetch_relation_data()
+        except (ops.SecretNotFoundError, ops.ModelError):
+            # Secrets may be revoked transiently during relation churn (e.g.
+            # remove-relation followed by integrate). Treat that as not-ready
+            # and wait for the provider to publish fresh credentials.
+            return None
         if not all_data:
             return None
         # fetch_relation_data() returns Dict[relation_id, Dict[str, str]]
@@ -266,7 +272,12 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
     def _oauth_issuer(self) -> str | None:
         """Return the OIDC issuer URL from the oauth relation, or None."""
-        info = self.oauth.get_provider_info()
+        try:
+            info = self.oauth.get_provider_info()
+        except (ops.SecretNotFoundError, ops.ModelError):
+            # Provider secrets can be revoked transiently during relation
+            # churn; treat that as not-ready until fresh data is published.
+            return None
         return info.issuer_url if info else None
 
     def _read_jwt_keypair(self) -> dict | None:
