@@ -12,14 +12,15 @@ import ipaddress
 import json
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import ops
+from charmlibs.rollingops import OperationResult, RollingOpsManager
 from charms.certificate_transfer_interface.v1.certificate_transfer import (
     CertificateTransferProvides,
 )
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.hydra.v0.oauth import ClientConfig, OAuthRequirer
-from charms.rolling_ops.v0.rollingops import RollingOpsManager
 from charms.tls_certificates_interface.v4.tls_certificates import (
     CertificateRequestAttributes,
     TLSCertificatesRequiresV4,
@@ -82,8 +83,8 @@ CHECK_THRESHOLD = 2
 @dataclass
 class _LxdConnection:
     url: str
-    server_ca: str
     fingerprint: str
+    server_ca: str | None = None
 
 
 def _generate_jwt_keypair() -> dict[str, str]:
@@ -152,11 +153,13 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self.ca_transfer = CertificateTransferProvides(self, "send-ca-cert")
         self.ingress = GatewayIngress(self)
 
-        # Rolling restart coordination. The manager wires its own relation and
-        # lock events; the action and upgrade-charm events are handled locally
-        # so we can emit the library's acquire_lock event.
-        self.restart_manager = RollingOpsManager(
-            self, relation=RESTART_RELATION, callback=self._restart_workload
+        # Rolling restart coordination using the maintained charmlibs
+        # implementation. The manager wires its own relation and lock events;
+        # the action and upgrade-charm events request an async lock.
+        self.rollingops = RollingOpsManager(
+            self,
+            peer_relation_name=RESTART_RELATION,
+            callback_targets={"restart": self._restart_workload},
         )
         self.framework.observe(self.on.restart_action, self._on_restart_action)
         self.framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
@@ -429,7 +432,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         server_ca = data.get("certificate", "")
         fingerprint = data.get("certificate_fingerprint", "")
 
-        if not addresses_raw or not server_ca:
+        if not addresses_raw or not (server_ca or fingerprint):
             return None
 
         # addresses may be a comma-separated list or a JSON list. A single
@@ -447,7 +450,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         return _LxdConnection(
             url=f"https://{parsed}",
-            server_ca=server_ca,
+            server_ca=server_ca or None,
             fingerprint=fingerprint,
         )
 
@@ -574,6 +577,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
                 log_level=self._model_cfg.log_level,
                 gateway_endpoint=self._gateway_endpoint(),
+                server_ca=(LXD_SERVER_CA_PATH if lxd_connection.server_ca is not None else None),
+                server_fingerprint=(
+                    lxd_connection.fingerprint if lxd_connection.server_ca is None else None
+                ),
             )
         else:
             # No connection yet: keep the service defined but unable to start,
@@ -669,7 +676,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         issuer_url: str,
         lxd_client_cert_pem: str,
         lxd_client_key_pem: str,
-        lxd_server_ca_pem: str,
+        lxd_server_ca_pem: str | None,
     ) -> str:
         """Push all rendered files to the container and return the rendered config TOML."""
         container.push(
@@ -704,7 +711,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             LXD_CLIENT_CERT_PATH, lxd_client_cert_pem, make_dirs=True, permissions=0o644
         )
         container.push(LXD_CLIENT_KEY_PATH, lxd_client_key_pem, make_dirs=True, permissions=0o600)
-        container.push(LXD_SERVER_CA_PATH, lxd_server_ca_pem, make_dirs=True, permissions=0o644)
+        if lxd_server_ca_pem is not None:
+            container.push(
+                LXD_SERVER_CA_PATH, lxd_server_ca_pem, make_dirs=True, permissions=0o644
+            )
 
         config_toml = self._render_config_toml(db_uri, issuer_url)
         container.push(CONFIG_PATH, config_toml, make_dirs=True, permissions=0o600)
@@ -791,24 +801,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         )
         layer = self._pebble_layer(db_uri, lxd_conn)
         container.add_layer(CONTAINER_NAME, layer, combine=True)
-        try:
-            container.replan()
-        except ops.pebble.ChangeError:
-            # The workload can legitimately crash-loop for a while after a
-            # config/relation change (e.g. it needs to re-resolve an OIDC
-            # issuer that isn't reachable yet). Pebble's replan raises
-            # ChangeError when the service exits quickly during the start
-            # attempt it makes as part of replanning, but the new layer/
-            # config has already been applied and pebble will keep retrying
-            # the service in the background on its own backoff schedule.
-            # Letting this exception propagate would fail the hook (leaving
-            # the unit in error state, needing a manual `juju resolved`) even
-            # though nothing is actually wrong with the charm's reconciliation
-            # — so log and continue instead of crashing.
-            logger.warning(
-                "workload service failed to start immediately after replan; "
-                "it will keep retrying via its own backoff",
-            )
 
         desired_hash = self._workload_config_hash(
             layer,
@@ -819,10 +811,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt["kid"],
             lxd_identity["certificate"],
             lxd_identity["private-key"],
-            lxd_conn.server_ca,
+            lxd_conn.server_ca or "",
             lxd_conn.url,
         )
-        self._ensure_restart_state(event, desired_hash)
+        self._ensure_restart_state(event, desired_hash, container)
 
         # Re-publish CA to any joined send-ca-cert relations.
         for rel in self.model.relations.get("send-ca-cert", []):
@@ -870,27 +862,51 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return
         rel.data[self.unit][APPLIED_HASH_KEY] = value
 
-    def _ensure_restart_state(self, event: ops.EventBase, desired_hash: str) -> None:
+    def _ensure_restart_state(
+        self,
+        event: ops.EventBase,
+        desired_hash: str,
+        container: ops.Container,
+    ) -> None:
         """Coordinate rolling restarts after convergence.
 
-        First start records the hash immediately (cold unit, no coordination
-        needed). Subsequent reconciles acquire the rolling-ops lock only when
-        the rendered workload configuration has changed.
+        First start replans and records the hash immediately (cold unit, no
+        coordination needed). Subsequent reconciles request the rolling-ops
+        lock only when the rendered workload configuration has changed, so the
+        actual restart is serialized across units.
         """
         if self._applied_hash() is None:
-            # First successful convergence: the service is already running via
-            # replan(), so just record the hash without taking the lock.
+            # First successful convergence: start the service now and record
+            # the hash without taking the lock.
+            try:
+                container.replan()
+            except ops.pebble.ChangeError:
+                # The workload can legitimately crash-loop for a while after a
+                # config/relation change (e.g. it needs to re-resolve an OIDC
+                # issuer that isn't reachable yet). Pebble's replan raises
+                # ChangeError when the service exits quickly during the start
+                # attempt it makes as part of replanning, but the new layer/
+                # config has already been applied and pebble will keep retrying
+                # the service in the background on its own backoff schedule.
+                # Letting this exception propagate would fail the hook (leaving
+                # the unit in error state, needing a manual `juju resolved`) even
+                # though nothing is actually wrong with the charm's reconciliation
+                # — so log and continue instead of crashing.
+                logger.warning(
+                    "workload service failed to start immediately after replan; "
+                    "it will keep retrying via its own backoff",
+                )
             self._set_applied_hash(desired_hash)
             return
 
         if desired_hash != self._applied_hash():
-            self.on[RESTART_RELATION].acquire_lock.emit()
+            self.rollingops.request_async_lock(callback_id="restart")
 
-    def _restart_workload(self, event: ops.EventBase) -> None:
+    def _restart_workload(self, **kwargs: Any) -> OperationResult:
         """Rolling-ops lock callback: restart the workload and refresh the hash."""
         container = self.unit.get_container(CONTAINER_NAME)
         if not container.can_connect():
-            return
+            return OperationResult.RETRY_RELEASE
 
         # Re-derive the desired hash from live state so this callback is safe
         # even when invoked in a later hook after the original reconcile.
@@ -909,10 +925,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             or lxd_identity is None
             or lxd_conn is None
         ):
-            return
+            return OperationResult.RETRY_RELEASE
 
         layer = self._pebble_layer(db_uri, lxd_conn)
         config_toml = self._render_config_toml(db_uri, issuer)
+        container.add_layer(CONTAINER_NAME, layer, combine=True)
         container.restart(SERVICE_NAME, DRIVER_SERVICE_NAME)
         self._set_applied_hash(
             self._workload_config_hash(
@@ -924,18 +941,19 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 jwt["kid"],
                 lxd_identity["certificate"],
                 lxd_identity["private-key"],
-                lxd_conn.server_ca,
+                lxd_conn.server_ca or "",
                 lxd_conn.url,
             )
         )
+        return OperationResult.RELEASE
 
     def _on_restart_action(self, event: ops.ActionEvent) -> None:
         """Operator-initiated rolling restart."""
-        self.on[RESTART_RELATION].acquire_lock.emit()
+        self.rollingops.request_async_lock(callback_id="restart")
 
     def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent) -> None:
         """Force a rolling restart on charm upgrade (image may have changed)."""
-        self.on[RESTART_RELATION].acquire_lock.emit()
+        self.rollingops.request_async_lock(callback_id="restart")
 
     def _on_collect_unit_status(self, event: ops.CollectStatusEvent) -> None:
         if self._config_error:

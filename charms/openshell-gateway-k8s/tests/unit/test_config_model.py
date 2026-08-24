@@ -467,13 +467,14 @@ class TestRenderConfigToml:
 
 
 class TestRenderDriverCommand:
-    def test_golden_command(self):
+    def test_golden_command_with_ca(self):
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
+            server_ca=LXD_SERVER_CA_PATH,
         )
         assert cmd == (
             "/usr/bin/openshell-driver-lxd"
@@ -488,6 +489,30 @@ class TestRenderDriverCommand:
             " --gateway-endpoint https://openshell-gateway.my-model.svc.cluster.local:8443"
         )
 
+    def test_command_with_fingerprint(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://openshell-gateway.my-model.svc.cluster.local:8443",
+            server_fingerprint="ab:cd:ef:12:34:56",
+        )
+        assert "--lxd-server-fingerprint ab:cd:ef:12:34:56" in cmd
+        assert "--lxd-server-ca" not in cmd
+
+    def test_ca_and_fingerprint_mutually_exclusive(self):
+        with pytest.raises(ValueError):
+            render_driver_command(
+                "https://10.0.0.1:8443",
+                "openshell-sandbox",
+                60,
+                "info",
+                "https://openshell-gateway.my-model.svc.cluster.local:8443",
+                server_ca=LXD_SERVER_CA_PATH,
+                server_fingerprint="ab:cd",
+            )
+
     def test_rendered_command_has_no_socket_reference(self):
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
@@ -495,6 +520,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
+            server_ca=LXD_SERVER_CA_PATH,
         )
         assert "--lxd-socket" not in cmd
         assert "LXD_HOST_SOCKET" not in cmd
@@ -509,6 +535,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             endpoint,
+            server_ca=LXD_SERVER_CA_PATH,
         )
         assert f"--gateway-endpoint {endpoint}" in cmd
 

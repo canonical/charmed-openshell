@@ -553,7 +553,7 @@ class TestIdempotency:
         with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
-            out2 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), out1)
+            out2 = ctx.run(ctx.on.pebble_ready(out1.get_container(CONTAINER_NAME)), out1)
         assert out2 is not None
 
 
@@ -1491,6 +1491,53 @@ class TestLxdFilesAndLayer:
         assert "--log-level info" in cmd
         assert "--gateway-endpoint https://my-gateway.prod.svc.cluster.local:8443" in cmd
         assert "--lxd-socket" not in cmd
+
+    def test_driver_layer_uses_fingerprint_when_ca_omitted(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(
+            LXD_RELATION,
+            remote_app_data={
+                "certificate_fingerprint": "abc:def",
+                "addresses": "10.0.0.1:8443",
+            },
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+            model=Model(name="prod"),
+        )
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_lxd_connection",
+                return_value=_LxdConnection(
+                    url="https://10.0.0.1:8443",
+                    server_ca=None,
+                    fingerprint="abc:def",
+                ),
+            ),
+        ):
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        plan = out.get_container(CONTAINER_NAME).plan
+        cmd = plan.services[DRIVER_SERVICE_NAME].command
+        assert "--lxd-server-fingerprint abc:def" in cmd
+        assert "--lxd-server-ca" not in cmd
 
     def test_driver_layer_socket_only_when_no_connection(self):
         ctx = Context(OpenshellGatewayK8sCharm)
