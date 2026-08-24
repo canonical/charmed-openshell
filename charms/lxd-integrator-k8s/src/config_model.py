@@ -193,9 +193,33 @@ def _parse_endpoint(raw: str) -> tuple[str, int]:
                 {"raw": raw},
             )
         host = match.group("host")
+        if not host:
+            raise PydanticCustomError(
+                "invalid_endpoint",
+                "invalid endpoint: {raw}",
+                {"raw": raw},
+            )
         port_str = match.group("port")
     else:
+        if "://" in raw:
+            raise PydanticCustomError(
+                "invalid_endpoint",
+                "endpoint must not include a URL scheme: {raw}",
+                {"raw": raw},
+            )
+        if "/" in raw:
+            raise PydanticCustomError(
+                "invalid_endpoint",
+                "invalid endpoint: {raw}",
+                {"raw": raw},
+            )
         if ":" in raw:
+            if raw.count(":") > 1:
+                raise PydanticCustomError(
+                    "invalid_endpoint",
+                    "IPv6 literals must be bracketed: {raw}",
+                    {"raw": raw},
+                )
             host, port_str = raw.rsplit(":", 1)
         else:
             host = raw
@@ -219,6 +243,12 @@ def _parse_endpoint(raw: str) -> tuple[str, int]:
                 "invalid port in endpoint: {raw}",
                 {"raw": raw},
             ) from None
+        if not 1 <= port <= 65535:
+            raise PydanticCustomError(
+                "invalid_endpoint_port",
+                "port must be between 1 and 65535: {raw}",
+                {"raw": raw},
+            )
 
     return host, port
 

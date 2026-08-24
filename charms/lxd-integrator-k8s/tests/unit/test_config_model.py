@@ -30,11 +30,49 @@ def test_endpoint_normalisation():
     assert parse_endpoints("localhost") == (("localhost", DEFAULT_LXD_PORT),)
     assert parse_endpoints("host:8444") == (("host", 8444),)
     assert parse_endpoints("[::1]:8443") == (("::1", 8443),)
-    assert parse_endpoints("a:1, b:2 ,[::3]") == (
-        ("a", 1),
-        ("b", 2),
+    assert parse_endpoints("a:8441, b:8442 ,[::3]") == (
+        ("a", 8441),
+        ("b", 8442),
         ("::3", DEFAULT_LXD_PORT),
     )
+
+
+def test_endpoint_port_range_rejected():
+    for invalid in ("host:0", "host:65536", "host:-1"):
+        _, err = load_config(
+            {
+                "lxd-endpoints": invalid,
+                "client-cert": "C",
+                "client-key": "K",
+                "server-cert": "S",
+            }
+        )
+        assert err is not None
+        assert "port" in err.lower()
+
+
+def test_endpoint_scheme_and_unbracketed_ipv6_rejected():
+    _, err = load_config(
+        {
+            "lxd-endpoints": "https://lxd.example.com:8443",
+            "client-cert": "C",
+            "client-key": "K",
+            "server-cert": "S",
+        }
+    )
+    assert err is not None
+    assert "scheme" in err.lower()
+
+    _, err = load_config(
+        {
+            "lxd-endpoints": "2001:db8::1:8443",
+            "client-cert": "C",
+            "client-key": "K",
+            "server-cert": "S",
+        }
+    )
+    assert err is not None
+    assert "bracketed" in err.lower()
 
 
 def test_credential_completeness():
