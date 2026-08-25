@@ -158,6 +158,16 @@ Smoke tests for the rock are in `rocks/openshell-gateway/tests/smoke.sh` and run
 just test-rock
 ```
 
+## Vendored Library Patches
+
+Libraries in `lib/` are vendored via `charmcraft fetch-libs`. When a vendored library crashes on a transient Juju condition that the charm itself already handles, it is acceptable to patch the vendored copy locally and cover the patch with a unit test.
+
+Known patch:
+
+- `lib/charms/data_platform_libs/v0/data_interfaces.py`: `_register_secrets_to_relation` catches `SecretNotFoundError` / `ModelError` when a provider publishes a secret URI before the grant has propagated (e.g. during `remove-relation` / `integrate` churn). Without this patch the library's `database-relation-changed` handler crashes before the charm's own `_database_uri()` resilience can run.
+
+Document any such patch in the commit message and add a regression test that fails if the patch is removed.
+
 ## Documentation
 
 - Feature specifications go in `docs/spec/`.

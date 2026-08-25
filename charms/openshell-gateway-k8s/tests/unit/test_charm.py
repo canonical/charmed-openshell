@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import ops.pebble
 import yaml
+from charms.data_platform_libs.v0.data_interfaces import CachedSecret
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, ModelError, SecretNotFoundError, WaitingStatus
 from ops.testing import Container, Context, Model, PeerRelation, Relation, Secret, State
@@ -279,6 +280,72 @@ class TestRelationDataResilience:
             )
             self._ready_patches(stack, _database_uri=None)
             out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "database credentials" in out.unit_status.message.lower()
+
+    def test_database_secret_registration_failure_is_transient(self):
+        """An inaccessible provider secret during relation churn does not crash the hook.
+
+        When a provider publishes a secret URI before the grant is propagated
+        (e.g. immediately after ``juju integrate``), the data_interfaces
+        library's secret registration can fail. The charm must survive that
+        event and report ``waiting for database credentials`` until a later
+        secret-changed/relation-changed event makes the secret readable.
+        """
+        ctx = Context(OpenshellGatewayK8sCharm)
+        db_rel = Relation(
+            "database",
+            remote_app_data={"secret-user": "secret://model/uuid/user"},
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                db_rel,
+                Relation("certificates"),
+                Relation("oauth"),
+                Relation(LXD_RELATION),
+            ],
+        )
+
+        def _raising_meta(_self):
+            raise SecretNotFoundError("grant not yet propagated")
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    CachedSecret,
+                    "meta",
+                    property(_raising_meta),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    OpenshellGatewayK8sCharm,
+                    "_tls_material",
+                    return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+                )
+            )
+            stack.enter_context(
+                patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER)
+            )
+            stack.enter_context(
+                patch.object(
+                    OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    OpenshellGatewayK8sCharm,
+                    "_ensure_lxd_client_identity",
+                    return_value=_FAKE_LXD_IDENTITY,
+                )
+            )
+            stack.enter_context(
+                patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN)
+            )
+            out = ctx.run(ctx.on.relation_changed(relation=db_rel), state)
         assert isinstance(out.unit_status, WaitingStatus)
         assert "database credentials" in out.unit_status.message.lower()
 

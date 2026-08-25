@@ -1433,7 +1433,23 @@ class Data(ABC):
             if secret_field in params_name_list and (
                 secret_uri := self.get_secret_uri(relation, group)
             ):
-                self._register_secret_to_relation(relation.name, relation.id, secret_uri, group)
+                try:
+                    self._register_secret_to_relation(
+                        relation.name, relation.id, secret_uri, group
+                    )
+                except (SecretNotFoundError, ModelError):
+                    # Secrets may not be immediately accessible when a
+                    # provider publishes a secret URI during relation churn
+                    # (e.g. remove-relation followed by integrate). Treat the
+                    # registration failure as transient; a later secret-changed
+                    # or relation-changed event will retry once the grant is
+                    # propagated.
+                    logger.warning(
+                        "Secret %s for relation %s/%s is not accessible yet; skipping registration",
+                        secret_uri,
+                        relation.name,
+                        relation.id,
+                    )
 
     # Optional overrides
 
