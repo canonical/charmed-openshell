@@ -33,6 +33,7 @@ from .conftest import (
     INFRA_APPS,
     INTEGRATOR_APP,
     OIDC_AUDIENCE,
+    _fail_on_app_error,
     _openshell_gateway_add,
     _openshell_gateway_remove,
     _openshell_status,
@@ -115,7 +116,11 @@ class TestOpenShellGatewayFunctional:
 
         juju.wait(_blocked, timeout=300)
         juju.integrate(f"{APP_NAME}:database", f"{DB_GATEWAY_APP}:database")
-        juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=900)
+        juju.wait(
+            lambda s: jubilant.all_active(s, APP_NAME),
+            error=_fail_on_app_error(juju, APP_NAME),
+            timeout=900,
+        )
         _wait_for_workload_running(juju)
 
     def test_relation_resilience_oauth(
@@ -137,7 +142,11 @@ class TestOpenShellGatewayFunctional:
 
         juju.wait(_blocked, timeout=300)
         juju.integrate(f"{APP_NAME}:oauth", f"{HYDRA_APP}:oauth")
-        juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=900)
+        juju.wait(
+            lambda s: jubilant.all_active(s, APP_NAME),
+            error=_fail_on_app_error(juju, APP_NAME),
+            timeout=900,
+        )
         _wait_for_workload_running(juju)
 
         # Confirm the snap is still connected after the relation churn.

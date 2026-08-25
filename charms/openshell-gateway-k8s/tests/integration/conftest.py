@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -257,6 +258,7 @@ def _deploy_infrastructure(juju: jubilant.Juju) -> None:
         "identity-platform-login-ui-operator",
         app=LOGIN_UI_APP,
         channel="latest/stable",
+        trust=True,
     )
     # Hydra needs cluster-scoped trust to manage its Kubernetes resources.
     juju.cli("trust", HYDRA_APP, "--scope=cluster")
@@ -272,8 +274,29 @@ def _deploy_infrastructure(juju: jubilant.Juju) -> None:
     logger.info("Waiting for infrastructure relations to converge")
     juju.wait(
         lambda s: jubilant.all_active(s, *INFRA_APPS) and jubilant.all_agents_idle(s, *INFRA_APPS),
+        error=_fail_on_app_error(juju, *INFRA_APPS),
         timeout=1800,
     )
+
+
+def _fail_on_app_error(juju: jubilant.Juju, *app_names: str) -> Callable[[jubilant.Status], bool]:
+    """Fail immediately with Juju logs when one of *app_names* enters error."""
+
+    def _error(status: jubilant.Status) -> bool:
+        for app_name in app_names:
+            app = status.apps.get(app_name)
+            if app is None or app.app_status.current != "error":
+                continue
+            try:
+                log_output = juju.debug_log(limit=500)
+            except (jubilant.CLIError, jubilant.TaskError):
+                logger.exception("Failed to capture Juju debug logs")
+            else:
+                logger.error("Juju debug-log after %s entered error:\n%s", app_name, log_output)
+            pytest.fail(f"{app_name} entered error: {app.app_status.message}")
+        return False
+
+    return _error
 
 
 def _get_traefik_lb_address(juju: jubilant.Juju, timeout: int = 300) -> str:
