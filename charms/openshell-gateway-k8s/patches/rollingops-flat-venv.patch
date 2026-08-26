@@ -1,0 +1,19 @@
+--- a/charmlibs/rollingops/_common/_base_worker.py
++++ b/charmlibs/rollingops/_common/_base_worker.py
+@@ -82,13 +82,15 @@ class BaseRollingOpsAsyncWorker(ABC):
+         This path is used to locate the rolling-ops worker scripts and ensure
+         the spawned subprocess can import charm library code.
+         """
+-        return pathops.LocalPath(
++        conventional_path = pathops.LocalPath(
+             self._charm_dir
+             / 'venv'
+             / 'lib'
+             / f'python{version_info.major}.{version_info.minor}'
+             / 'site-packages'
+         )
++        flattened_path = pathops.LocalPath(self._charm_dir / 'venv')
++        return conventional_path if conventional_path.exists() else flattened_path
+ 
+     def _build_env(self) -> dict[str, str]:
+         """Build the environment used to spawn the worker subprocess.

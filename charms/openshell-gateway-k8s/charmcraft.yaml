@@ -28,7 +28,12 @@ parts:
       - requirements.txt
     build-packages:
       - libssl-dev
+      - patch
       - pkg-config
+    override-build: |
+      craftctl default
+      patch -d "${CRAFT_PART_INSTALL}/venv" -p1 \
+        < "${CRAFT_PROJECT_DIR}/patches/rollingops-flat-venv.patch"
 
 charm-libs:
   - lib: data_platform_libs.data_interfaces

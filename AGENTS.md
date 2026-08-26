@@ -168,6 +168,14 @@ Known patch:
 
 Document any such patch in the commit message and add a regression test that fails if the patch is removed.
 
+## Charm packaging compatibility
+
+Charmcraft installs Python dependencies directly under `venv/`, while
+`charmlibs-rollingops` 1.1.x looks for its asynchronous worker under the
+conventional `venv/lib/pythonX.Y/site-packages/` path. The charm part applies
+`patches/rollingops-flat-venv.patch` during packing so the worker supports both
+layouts. Keep it until rollingops supports Charmcraft's flattened virtualenv.
+
 ## Documentation
 
 - Feature specifications go in `docs/spec/`.
