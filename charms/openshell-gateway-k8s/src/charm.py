@@ -566,6 +566,12 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if DRIVER_SERVICE_NAME in services and services[DRIVER_SERVICE_NAME].is_running():
             container.stop(DRIVER_SERVICE_NAME)
 
+        # The disabled layer no longer matches the last running configuration.
+        # Clear its hash so relation recovery replans even when provider data is unchanged.
+        restart_rel = self.model.get_relation(RESTART_RELATION)
+        if restart_rel is not None:
+            restart_rel.data[self.unit].pop(APPLIED_HASH_KEY, None)
+
     def _gateway_endpoint(self) -> str:
         """Return the dial-back URL sandbox supervisors use to reach this gateway.
 

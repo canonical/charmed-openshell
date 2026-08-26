@@ -567,6 +567,76 @@ class TestTeardown:
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert isinstance(out.unit_status, (BlockedStatus, WaitingStatus))
 
+    def test_relation_recovery_replans_when_workload_inputs_are_unchanged(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        restart_rel = PeerRelation(RESTART_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[restart_rel, *_all_relations()],
+        )
+        ready = _all_ready_patches()
+        with (
+            ready[0],
+            ready[1],
+            ready[2],
+            ready[3],
+            ready[4],
+            ready[5],
+            ready[6],
+            ready[7],
+        ):
+            running = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        restart_rel = next(r for r in running.relations if r.endpoint == RESTART_RELATION)
+        original_hash = restart_rel.local_unit_data[APPLIED_HASH_KEY]
+
+        with (
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_DB_URI),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_tls_material",
+                return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=None),
+            patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+        ):
+            stopped = ctx.run(ctx.on.config_changed(), running)
+
+        restart_rel = next(r for r in stopped.relations if r.endpoint == RESTART_RELATION)
+        assert APPLIED_HASH_KEY not in restart_rel.local_unit_data
+
+        ready = _all_ready_patches()
+        with (
+            ready[0],
+            ready[1],
+            ready[2],
+            ready[3],
+            ready[4],
+            ready[5],
+            ready[6],
+            ready[7],
+            patch("ops.model.Container.replan") as replan_mock,
+        ):
+            recovered = ctx.run(ctx.on.config_changed(), stopped)
+
+        replan_mock.assert_called_once_with()
+        restart_rel = next(r for r in recovered.relations if r.endpoint == RESTART_RELATION)
+        assert restart_rel.local_unit_data[APPLIED_HASH_KEY] == original_hash
+
 
 # ---------------------------------------------------------------------------
 # JWT keypair
