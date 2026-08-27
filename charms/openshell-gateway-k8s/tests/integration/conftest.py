@@ -274,19 +274,43 @@ def _deploy_infrastructure(juju: jubilant.Juju) -> None:
     logger.info("Waiting for infrastructure relations to converge")
     juju.wait(
         lambda s: jubilant.all_active(s, *INFRA_APPS) and jubilant.all_agents_idle(s, *INFRA_APPS),
-        error=_fail_on_app_error(juju, *INFRA_APPS),
+        error=_fail_on_app_error(juju, *INFRA_APPS, hook_retry_limit=1),
         timeout=1800,
     )
 
 
-def _fail_on_app_error(juju: jubilant.Juju, *app_names: str) -> Callable[[jubilant.Status], bool]:
-    """Fail immediately with Juju logs when one of *app_names* enters error."""
+def _fail_on_app_error(
+    juju: jubilant.Juju,
+    *app_names: str,
+    hook_retry_limit: int = 0,
+) -> Callable[[jubilant.Status], bool]:
+    """Retry hook failures up to a limit, then fail with Juju logs."""
+    hook_retries: dict[str, int] = {}
+    retry_grace_deadlines: dict[str, float] = {}
 
     def _error(status: jubilant.Status) -> bool:
         for app_name in app_names:
             app = status.apps.get(app_name)
             if app is None or app.app_status.current != "error":
                 continue
+            failed_hook = (app.app_status.message or "").startswith("hook failed:")
+            for unit_name, unit in app.units.items():
+                if unit.workload_status.current != "error" or not failed_hook:
+                    continue
+                retries = hook_retries.get(unit_name, 0)
+                if retries < hook_retry_limit:
+                    logger.warning(
+                        "%s entered error; retrying failed hook (%d/%d)",
+                        unit_name,
+                        retries + 1,
+                        hook_retry_limit,
+                    )
+                    juju.cli("resolved", unit_name, "--retry")
+                    hook_retries[unit_name] = retries + 1
+                    retry_grace_deadlines[unit_name] = time.monotonic() + 30
+                    return False
+                if time.monotonic() < retry_grace_deadlines.get(unit_name, 0):
+                    return False
             try:
                 log_output = juju.debug_log(limit=500)
             except (jubilant.CLIError, jubilant.TaskError):
