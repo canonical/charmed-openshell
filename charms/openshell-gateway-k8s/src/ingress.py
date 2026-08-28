@@ -61,6 +61,10 @@ class GatewayIngress(ops.Object):
         self.framework.observe(charm.on[relation_name].relation_broken, self._on_relation_broken)
         self.framework.observe(charm.on.collect_unit_status, self._on_collect_unit_status)
 
+    def is_ready(self) -> bool:
+        """Return True when the ingress (traefik_route) relation is present."""
+        return self._charm.model.get_relation(self._relation_name) is not None
+
     # ------------------------------------------------------------------
     # Config assembly
     # ------------------------------------------------------------------

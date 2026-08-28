@@ -529,6 +529,46 @@ class TestGatewayEndpoint:
         attrs = args[0][0]
         assert "osgw.stg.svc.cluster.local" in attrs.sans_dns
 
+    def _driver_command(self, ctx: Context, config: dict, extra_relations: list) -> str:
+        state = State(
+            config=config,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                Relation(LXD_RELATION),
+                *extra_relations,
+            ],
+            model=Model(name="prod"),
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        return out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+
+    def test_uses_external_hostname_when_ingress_ready(self):
+        """External LXD sandboxes get a dial-back address reachable from outside."""
+        ctx = Context(OpenshellGatewayK8sCharm, app_name="my-gateway")
+        cmd = self._driver_command(
+            ctx,
+            config={**BOTH_ROLES, "external-hostname": "gw.example.com"},
+            extra_relations=[Relation("ingress")],
+        )
+        assert "--gateway-endpoint https://gw.example.com:8443" in cmd
+
+    def test_falls_back_to_cluster_local_without_ingress(self):
+        """Without an ingress relation the cluster-local SVC address is used."""
+        ctx = Context(OpenshellGatewayK8sCharm, app_name="my-gateway")
+        cmd = self._driver_command(
+            ctx,
+            config={**BOTH_ROLES, "external-hostname": "gw.example.com"},
+            extra_relations=[],
+        )
+        assert "--gateway-endpoint https://my-gateway.prod.svc.cluster.local:8443" in cmd
+
 
 # ---------------------------------------------------------------------------
 # Teardown — relation-broken stops service

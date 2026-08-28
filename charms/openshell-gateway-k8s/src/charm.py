@@ -575,9 +575,18 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
     def _gateway_endpoint(self) -> str:
         """Return the dial-back URL sandbox supervisors use to reach this gateway.
 
-        Built from the charm's in-cluster Kubernetes service name so it matches
-        the SAN on the gateway's TLS certificate.
+        When the operator has configured an external hostname and the ingress
+        (traefik_route) relation is present, sandbox supervisors outside the
+        cluster dial back via that hostname.  Otherwise fall back to the
+        in-cluster Kubernetes service DNS name, which matches the SAN on the
+        gateway's TLS certificate.
         """
+        if (
+            self._model_cfg is not None
+            and self._model_cfg.external_hostname
+            and self.ingress.is_ready()
+        ):
+            return f"https://{self._model_cfg.external_hostname}:8443"
         return f"https://{self.app.name}.{self.model.name}.svc.cluster.local:8443"
 
     def _pebble_layer(
