@@ -597,16 +597,21 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         env["OPENSHELL_DB_URL"] = db_uri
 
         if lxd_connection is not None:
+            # Prefer the fingerprint pin whenever the provider publishes one.
+            # LXD's self-signed server certificate lists only the hostname and
+            # the loopback addresses as SANs, so CA verification rejects the
+            # routable address this pod dials. Pinning by digest skips the
+            # hostname check and is the only mode that works for such an
+            # endpoint; CA verification remains the fallback.
+            pin_fingerprint = bool(lxd_connection.fingerprint)
             driver_command = render_driver_command(
                 url=lxd_connection.url,
                 default_image=self._model_cfg.lxd_sandbox_image,
                 operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
                 log_level=self._model_cfg.log_level,
                 gateway_endpoint=self._gateway_endpoint(),
-                server_ca=(LXD_SERVER_CA_PATH if lxd_connection.server_ca is not None else None),
-                server_fingerprint=(
-                    lxd_connection.fingerprint if lxd_connection.server_ca is None else None
-                ),
+                server_ca=(None if pin_fingerprint else LXD_SERVER_CA_PATH),
+                server_fingerprint=(lxd_connection.fingerprint if pin_fingerprint else None),
             )
         else:
             # No connection yet: keep the service defined but unable to start,

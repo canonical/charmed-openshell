@@ -1750,7 +1750,8 @@ class TestLxdFilesAndLayer:
         assert f"--lxd-url {_LXD_URL}" in cmd
         assert f"--lxd-client-cert {LXD_CLIENT_CERT_PATH}" in cmd
         assert f"--lxd-client-key {LXD_CLIENT_KEY_PATH}" in cmd
-        assert f"--lxd-server-ca {LXD_SERVER_CA_PATH}" in cmd
+        assert f"--lxd-server-fingerprint {_LXD_CONN.fingerprint}" in cmd
+        assert "--lxd-server-ca" not in cmd
         assert "--default-image openshell-sandbox" in cmd
         assert "--operation-timeout-secs 60" in cmd
         assert "--log-level info" in cmd
@@ -1803,6 +1804,92 @@ class TestLxdFilesAndLayer:
         cmd = plan.services[DRIVER_SERVICE_NAME].command
         assert "--lxd-server-fingerprint abc:def" in cmd
         assert "--lxd-server-ca" not in cmd
+
+    def test_driver_layer_prefers_fingerprint_over_ca(self):
+        """BG-021: a published fingerprint wins even when a certificate is present.
+
+        LXD's self-signed server certificate carries only the hostname and the
+        loopback addresses as SANs, so CA verification rejects the routable
+        address the pod dials. Preferring the digest pin is what makes the
+        connection work, and lxd-integrator-k8s always publishes both fields.
+        """
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                Relation(LXD_RELATION),
+            ],
+            model=Model(name="prod"),
+        )
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_lxd_connection",
+                return_value=_LxdConnection(
+                    url="https://10.0.0.1:8443",
+                    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
+                    fingerprint="abc:def",
+                ),
+            ),
+        ):
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+        assert "--lxd-server-fingerprint abc:def" in cmd
+        assert "--lxd-server-ca" not in cmd
+
+    def test_driver_layer_falls_back_to_ca_without_fingerprint(self):
+        """A provider that publishes only a certificate still gets CA verification."""
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                Relation(LXD_RELATION),
+            ],
+            model=Model(name="prod"),
+        )
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_lxd_connection",
+                return_value=_LxdConnection(
+                    url="https://10.0.0.1:8443",
+                    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
+                    fingerprint="",
+                ),
+            ),
+        ):
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+        assert f"--lxd-server-ca {LXD_SERVER_CA_PATH}" in cmd
+        assert "--lxd-server-fingerprint" not in cmd
 
     def test_driver_layer_socket_only_when_no_connection(self):
         ctx = Context(OpenshellGatewayK8sCharm)
