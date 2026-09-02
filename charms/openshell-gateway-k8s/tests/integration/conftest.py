@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -305,7 +306,7 @@ def _fail_on_app_error(
                         retries + 1,
                         hook_retry_limit,
                     )
-                    juju.cli("resolved", unit_name, "--retry")
+                    juju.cli("resolved", unit_name)
                     hook_retries[unit_name] = retries + 1
                     retry_grace_deadlines[unit_name] = time.monotonic() + 30
                     return False
@@ -642,24 +643,36 @@ def prepare_openshell_client(juju: jubilant.Juju, gateway_url: str) -> dict[str,
     }
 
 
-def sandbox_e2e_supported(juju: jubilant.Juju) -> bool:
-    """Return True if the deployed driver exposes ``--gateway-endpoint``."""
+def driver_help_output(juju: jubilant.Juju) -> str:
+    """Return ``openshell-driver-lxd --help`` output from the workload container.
+
+    ``juju exec`` cannot target a workload container, so the probe goes through
+    ``juju ssh --container``. A probe that produces no output at all means the
+    driver could not be inspected, which fails the test rather than silently
+    closing the capability gate.
+    """
     try:
-        output = juju.cli(
-            "exec",
-            "--unit",
+        return juju.ssh(
             f"{APP_NAME}/0",
-            "--container",
-            CONTAINER_NAME,
-            "--",
             "openshell-driver-lxd",
             "--help",
+            container=CONTAINER_NAME,
         )
-    except jubilant.CLIError:
-        # A non-zero exit means the driver binary or flag is not present; treat
-        # this as the gate being closed rather than a test failure.
-        return False
-    return "--gateway-endpoint" in output
+    except jubilant.CLIError as exc:
+        # Some CLIs print usage on stderr and exit non-zero; only treat the
+        # probe itself as broken when it yielded no output whatsoever.
+        output = f"{exc.stdout or ''}{exc.stderr or ''}"
+        if not output.strip():
+            pytest.fail(
+                f"could not probe openshell-driver-lxd in container "
+                f"{CONTAINER_NAME!r} of {APP_NAME}/0: {exc}"
+            )
+        return output
+
+
+def sandbox_e2e_supported(juju: jubilant.Juju) -> bool:
+    """Return True if the deployed driver exposes ``--gateway-endpoint``."""
+    return "--gateway-endpoint" in driver_help_output(juju)
 
 
 @pytest.fixture(scope="module")
@@ -779,11 +792,16 @@ def _openshell_gateway_remove(name: str) -> None:
     _run("openshell", "gateway", "remove", name)
 
 
-def _openshell_sandbox_create(name: str, *, image: str | None = None) -> None:
+def _openshell_sandbox_create(
+    name: str, *, source: str | None = None, gateway_name: str | None = None
+) -> None:
     """Create an OpenShell sandbox through the configured gateway."""
-    args = ["openshell", "sandbox", "create", "--name", name]
-    if image:
-        args.extend(["--image", image])
+    args = ["openshell"]
+    if gateway_name:
+        args.extend(["-g", gateway_name])
+    args.extend(["sandbox", "create", "--name", name])
+    if source:
+        args.extend(["--from", source])
     result = _run(*args)
     output = result.stdout + result.stderr
     print("openshell sandbox create output:\n", output)
@@ -791,24 +809,54 @@ def _openshell_sandbox_create(name: str, *, image: str | None = None) -> None:
         pytest.fail(f"openshell sandbox create failed ({result.returncode}):\n{output}")
 
 
-def _openshell_sandbox_delete(name: str) -> None:
+def _openshell_sandbox_delete(name: str, *, gateway_name: str | None = None) -> None:
     """Delete an OpenShell sandbox."""
-    result = _run("openshell", "sandbox", "delete", "--name", name)
+    args = ["openshell"]
+    if gateway_name:
+        args.extend(["-g", gateway_name])
+    args.extend(["sandbox", "delete", name])
+    result = _run(*args)
     output = result.stdout + result.stderr
     print("openshell sandbox delete output:\n", output)
     if result.returncode != 0:
         pytest.fail(f"openshell sandbox delete failed ({result.returncode}):\n{output}")
 
 
+def _unique_marker(sandbox_name: str) -> str:
+    """Return a sandbox-specific token that cannot be confused with stale output."""
+    return f"{sandbox_name}-{uuid.uuid4().hex[:8]}"
+
+
+def _openshell_sandbox_exec(name: str, marker: str, *, gateway_name: str | None = None) -> str:
+    """Run a non-interactive command in a sandbox and return its stdout."""
+    args = ["openshell"]
+    if gateway_name:
+        args.extend(["-g", gateway_name])
+    args.extend(["sandbox", "exec", "-n", name, "--", "echo", marker])
+    result = _run(*args)
+    output = result.stdout + result.stderr
+    print("openshell sandbox exec output:\n", output)
+    if result.returncode != 0:
+        pytest.fail(f"openshell sandbox exec failed ({result.returncode}):\n{output}")
+    if marker not in result.stdout:
+        pytest.fail(f"openshell sandbox exec output missing marker ({marker!r}):\n{output}")
+    return result.stdout
+
+
 def _openshell_sandbox_wait_running(
     name: str,
     *,
     timeout: int = 300,
+    gateway_name: str | None = None,
 ) -> None:
     """Poll ``openshell sandbox list`` until the named sandbox reports running."""
     deadline = time.monotonic() + timeout
     while True:
-        result = _run("openshell", "sandbox", "list", "--format", "json")
+        args = ["openshell"]
+        if gateway_name:
+            args.extend(["-g", gateway_name])
+        args.extend(["sandbox", "list", "-o", "json"])
+        result = _run(*args)
         output = result.stdout + result.stderr
         if result.returncode == 0 and _sandbox_is_running(name, result.stdout):
             return
@@ -827,12 +875,13 @@ def _run_gated_sandbox_e2e(
     gateway_name: str,
     sandbox_name: str,
 ) -> None:
-    """Add a gateway, launch a sandbox, and assert it reaches running state.
+    """Add a gateway, launch a sandbox, verify shell access, and clean up.
 
     This helper is shared by the gated sandbox end-to-end tests in both
     provider-path modules. It removes any pre-existing gateway/sandbox, adds the
     gateway, verifies the CLI reports "Status: Connected", creates the sandbox,
-    waits for it to report running, and cleans up in a ``finally`` block.
+    waits for it to report running, execs a marker command to verify shell
+    access, and cleans up in a ``finally`` block.
     """
     _openshell_gateway_remove(gateway_name)
     _openshell_sandbox_delete(sandbox_name)
@@ -849,10 +898,13 @@ def _run_gated_sandbox_e2e(
     assert "Status: Connected" in status_output, status_output
 
     try:
-        _openshell_sandbox_create(sandbox_name)
-        _openshell_sandbox_wait_running(sandbox_name)
+        _openshell_sandbox_create(sandbox_name, gateway_name=gateway_name)
+        _openshell_sandbox_wait_running(sandbox_name, gateway_name=gateway_name)
+        marker = _unique_marker(sandbox_name)
+        stdout = _openshell_sandbox_exec(sandbox_name, marker, gateway_name=gateway_name)
+        assert marker in stdout, stdout
     finally:
-        _openshell_sandbox_delete(sandbox_name)
+        _openshell_sandbox_delete(sandbox_name, gateway_name=gateway_name)
         _openshell_gateway_remove(gateway_name)
 
 
