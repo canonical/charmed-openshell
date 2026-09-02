@@ -2122,6 +2122,77 @@ class TestLxdHash:
         )
 
 
+class TestReplanResilience:
+    """Regression tests for BG-022: replan failures must not lock out retries."""
+
+    def test_failed_first_replan_does_not_record_hash_and_retries(self):
+        """A transient ChangeError on first replan must not persist the hash.
+
+        If ``_ensure_restart_state`` records the applied-config-hash even though
+        ``container.replan()`` raised, every later reconcile sees the hash as
+        matching and never retries the replan. In a fresh model this can leave
+        the workload services out of the Pebble plan permanently while the
+        charm reports no readiness gaps.
+        """
+        ctx = Context(OpenshellGatewayK8sCharm)
+        restart_rel = PeerRelation(RESTART_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                *(_all_relations()),
+                PeerRelation(PEER_RELATION),
+                restart_rel,
+            ],
+        )
+
+        calls: list[object] = []
+
+        def flaky_replan(*args: object, **kwargs: object) -> None:
+            calls.append(None)
+            if len(calls) == 1:
+                raise ops.pebble.ChangeError("replan failed", change=None)
+
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            patch("ops.model.Container.replan", side_effect=flaky_replan),
+        ):
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+
+        restart_data1 = out1.get_relation(restart_rel.id).local_unit_data
+        assert APPLIED_HASH_KEY not in restart_data1
+        assert len(calls) == 1
+
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            patch("ops.model.Container.replan", side_effect=flaky_replan),
+        ):
+            out2 = ctx.run(ctx.on.config_changed(), out1)
+
+        restart_data2 = out2.get_relation(restart_rel.id).local_unit_data
+        assert APPLIED_HASH_KEY in restart_data2
+        assert len(calls) == 2
+        plan = out2.get_container(CONTAINER_NAME).plan
+        assert SERVICE_NAME in plan.services
+        assert DRIVER_SERVICE_NAME in plan.services
+
+
 class TestLxdAction:
     def test_get_lxd_client_cert_action(self):
         ctx = Context(OpenshellGatewayK8sCharm)

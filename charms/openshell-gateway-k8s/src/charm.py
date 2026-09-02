@@ -908,7 +908,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         """
         if self._applied_hash() is None:
             # First successful convergence: start the service now and record
-            # the hash without taking the lock.
+            # the hash without taking the lock. Only record the hash once
+            # replan has actually succeeded: if replan raises ChangeError the
+            # layer may not have been applied, and recording the hash would
+            # prevent future reconciles from ever retrying the replan.
             try:
                 container.replan()
             except ops.pebble.ChangeError:
@@ -916,17 +919,17 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 # config/relation change (e.g. it needs to re-resolve an OIDC
                 # issuer that isn't reachable yet). Pebble's replan raises
                 # ChangeError when the service exits quickly during the start
-                # attempt it makes as part of replanning, but the new layer/
-                # config has already been applied and pebble will keep retrying
-                # the service in the background on its own backoff schedule.
-                # Letting this exception propagate would fail the hook (leaving
-                # the unit in error state, needing a manual `juju resolved`) even
-                # though nothing is actually wrong with the charm's reconciliation
-                # — so log and continue instead of crashing.
+                # attempt it makes as part of replanning. Letting this
+                # exception propagate would fail the hook (leaving the unit in
+                # error state, needing a manual `juju resolved`) even though
+                # nothing is actually wrong with the charm's reconciliation —
+                # so log and continue instead of crashing. Because the hash is
+                # not recorded, the next reconcile will retry the replan.
                 logger.warning(
                     "workload service failed to start immediately after replan; "
                     "it will keep retrying via its own backoff",
                 )
+                return
             self._set_applied_hash(desired_hash)
             return
 
