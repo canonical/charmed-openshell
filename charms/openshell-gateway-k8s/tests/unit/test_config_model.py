@@ -10,10 +10,15 @@ from config_model import (
     DRIVER_SOCKET,
     GATEWAY_ID,
     GATEWAY_PORT,
+    LXD_CLIENT_CERT_PATH,
+    LXD_CLIENT_KEY_PATH,
+    LXD_SERVER_CA_PATH,
     GatewayConfig,
+    _parse_lxd_address,
     append_sslmode,
     load_config,
     render_config_toml,
+    render_driver_command,
     render_env,
 )
 
@@ -42,7 +47,7 @@ BOTH_ROLES_MINIMAL = {
 
 
 class TestConfigSurface:
-    def test_parse_all_six_keys(self):
+    def test_parse_all_eight_keys(self):
         cfg = GatewayConfig.model_validate(VALID_CONFIG)
         assert cfg.external_hostname == "gateway.example.com"
         assert cfg.oidc_audience == "openshell-cli"
@@ -50,6 +55,25 @@ class TestConfigSurface:
         assert cfg.oidc_admin_role == "admin"
         assert cfg.oidc_user_role == "user"
         assert cfg.log_level == "info"
+        assert cfg.gateway_id == "openshell-gateway"
+        assert cfg.jwt_ttl_secs == 3600
+
+    def test_lxd_config_defaults(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.lxd_projects is None
+        assert cfg.lxd_sandbox_image == "openshell-sandbox"
+        assert cfg.lxd_operation_timeout_secs == 60
+
+    def test_lxd_projects_empty_string_normalised(self):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "lxd-projects": ""})
+        assert cfg.lxd_projects is None
+
+    @pytest.mark.parametrize("field", ["lxd-projects", "lxd-sandbox-image"])
+    def test_lxd_string_fields_reject_control_chars(self, field):
+        base = {**BOTH_ROLES_MINIMAL}
+        base[field] = "bad\nvalue"
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate(base)
 
     def test_no_disable_tls_field(self):
         # These options must never be declared as fields anywhere.
@@ -128,6 +152,7 @@ class TestRBACValidation:
             "external-hostname",
             "oidc-audience",
             "oidc-roles-claim",
+            "gateway-id",
         ],
     )
     def test_control_char_newline_rejected(self, field):
@@ -155,6 +180,19 @@ class TestRBACValidation:
         """Empty string in a non-optional field is NOT normalised — it fails validation."""
         with pytest.raises(ValidationError):
             GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "log-level": ""})
+
+    @pytest.mark.parametrize("value", [0, -1, -3600])
+    def test_jwt_ttl_secs_must_be_positive(self, value):
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "jwt-ttl-secs": value})
+
+    def test_jwt_ttl_secs_rejects_non_integer(self):
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "jwt-ttl-secs": "one-hour"})
+
+    def test_gateway_id_empty_rejected(self):
+        with pytest.raises(ValidationError):
+            GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "gateway-id": ""})
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +369,7 @@ _TOML_KWARGS = {
     "tls_key_path": "/etc/openshell/tls/tls.key",
     "jwt_signing_key_path": "/etc/openshell/jwt/signing.key",
     "jwt_public_key_path": "/etc/openshell/jwt/public.pem",
-    "jwt_kid": "abc123",
+    "jwt_kid_path": "/etc/openshell/jwt/kid",
     "redirect_uri": "https://gw.example.com/oauth/unused",
 }
 
@@ -343,17 +381,23 @@ class TestRenderConfigToml:
     def _render(self, **overrides):
         return render_config_toml(self._cfg(), **{**_TOML_KWARGS, **overrides})
 
-    def test_gateway_id_is_openshell_gateway(self):
+    def test_gateway_id_defaults_to_constant(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.gateway_id == GATEWAY_ID == "openshell-gateway"
+
+    def test_gateway_id_is_rendered(self):
         toml = self._render()
-        # GATEWAY_ID is a constant but not part of the rendered config.toml
-        # The binary configuration uses gateway configuration sections instead
-        assert GATEWAY_ID == "openshell-gateway"
-        assert "[openshell.gateway]" in toml
+        assert f'gateway_id = "{GATEWAY_ID}"' in toml
+
+    def test_gateway_id_can_be_overridden(self):
+        cfg = GatewayConfig.model_validate({**VALID_CONFIG, "gateway-id": "custom-gateway"})
+        toml = render_config_toml(cfg, **_TOML_KWARGS)
+        assert 'gateway_id = "custom-gateway"' in toml
 
     def test_database_url_in_output(self):
         toml = self._render()
         # Database URL is passed via OPENSHELL_DB_URL env var, not in config.toml
-        # The config.toml only contains gateway, TLS, and OIDC configuration
+        # The config.toml only contains gateway, TLS, OIDC, and gateway_jwt configuration
         assert "[openshell.gateway]" in toml
 
     def test_oidc_section(self):
@@ -368,10 +412,40 @@ class TestRenderConfigToml:
         assert "tls.key" in toml
 
     def test_gateway_jwt_section(self):
+        import tomllib
+
         toml = self._render()
-        # gateway_jwt section is not part of the server-side config for the current binary version
-        # Configuration is passed via environment variables (FD-003)
-        assert "[gateway_jwt]" not in toml
+        parsed = tomllib.loads(toml)
+        section = parsed["openshell"]["gateway"]["gateway_jwt"]
+        assert section["signing_key_path"] == _TOML_KWARGS["jwt_signing_key_path"]
+        assert section["public_key_path"] == _TOML_KWARGS["jwt_public_key_path"]
+        assert section["kid_path"] == _TOML_KWARGS["jwt_kid_path"]
+        assert section["gateway_id"] == GATEWAY_ID
+        assert section["ttl_secs"] == 3600
+        assert isinstance(section["ttl_secs"], int)
+        assert section["ttl_secs"] > 0
+
+    def test_jwt_ttl_secs_defaults_to_one_hour(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.jwt_ttl_secs == 3600
+
+    def test_jwt_ttl_secs_can_be_overridden(self):
+        cfg = GatewayConfig.model_validate({**VALID_CONFIG, "jwt-ttl-secs": 7200})
+        toml = render_config_toml(cfg, **_TOML_KWARGS)
+        assert "ttl_secs = 7200" in toml
+
+    def test_kubernetes_driver_section(self):
+        import tomllib
+
+        toml = self._render()
+        parsed = tomllib.loads(toml)
+        section = parsed["openshell"]["drivers"]["kubernetes"]
+        assert section["namespace"] == "openshell"
+        assert section["service_account_name"] == "default"
+
+    def test_kubernetes_namespace_can_be_overridden(self):
+        toml = self._render(k8s_namespace="custom-ns")
+        assert 'namespace = "custom-ns"' in toml
 
     def test_is_string(self):
         toml = self._render()
@@ -385,3 +459,125 @@ class TestRenderConfigToml:
 
         src = inspect.getsource(config_model)
         assert "import ops" not in src
+
+
+# ---------------------------------------------------------------------------
+# LXD driver command rendering
+# ---------------------------------------------------------------------------
+
+
+class TestRenderDriverCommand:
+    def test_golden_command_with_ca(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://openshell-gateway.my-model.svc.cluster.local:8443",
+            server_ca=LXD_SERVER_CA_PATH,
+        )
+        assert cmd == (
+            "/usr/bin/openshell-driver-lxd"
+            f" --socket {DRIVER_SOCKET}"
+            " --lxd-url https://10.0.0.1:8443"
+            f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
+            f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
+            f" --lxd-server-ca {LXD_SERVER_CA_PATH}"
+            " --default-image openshell-sandbox"
+            " --operation-timeout-secs 60"
+            " --log-level info"
+            " --gateway-endpoint https://openshell-gateway.my-model.svc.cluster.local:8443"
+        )
+
+    def test_command_with_fingerprint(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://openshell-gateway.my-model.svc.cluster.local:8443",
+            server_fingerprint="ab:cd:ef:12:34:56",
+        )
+        assert "--lxd-server-fingerprint ab:cd:ef:12:34:56" in cmd
+        assert "--lxd-server-ca" not in cmd
+
+    def test_ca_and_fingerprint_mutually_exclusive(self):
+        with pytest.raises(ValueError):
+            render_driver_command(
+                "https://10.0.0.1:8443",
+                "openshell-sandbox",
+                60,
+                "info",
+                "https://openshell-gateway.my-model.svc.cluster.local:8443",
+                server_ca=LXD_SERVER_CA_PATH,
+                server_fingerprint="ab:cd",
+            )
+
+    def test_rendered_command_has_no_socket_reference(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://openshell-gateway.my-model.svc.cluster.local:8443",
+            server_ca=LXD_SERVER_CA_PATH,
+        )
+        assert "--lxd-socket" not in cmd
+        assert "LXD_HOST_SOCKET" not in cmd
+        assert "/var/snap/lxd" not in cmd
+
+    def test_gateway_endpoint_verbatim(self):
+        """The endpoint is emitted exactly as supplied, preserving scheme/host/port."""
+        endpoint = "https://custom.svc.cluster.local:8443"
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            endpoint,
+            server_ca=LXD_SERVER_CA_PATH,
+        )
+        assert f"--gateway-endpoint {endpoint}" in cmd
+
+
+class TestParseLxdAddress:
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("10.0.0.1:8443", "10.0.0.1:8443"),
+            ("  10.0.0.1:8443  ", "10.0.0.1:8443"),
+            ("[::1]:8443", "[::1]:8443"),
+            ("lxd.local:8443", "lxd.local:8443"),
+            ("lxd-1.cluster.local:12345", "lxd-1.cluster.local:12345"),
+            ("10.0.0.1:1", "10.0.0.1:1"),
+            ("10.0.0.1:65535", "10.0.0.1:65535"),
+        ],
+    )
+    def test_valid_addresses(self, raw, expected):
+        assert _parse_lxd_address(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "",
+            "   ",
+            "10.0.0.1",
+            "10.0.0.1:",
+            ":8443",
+            "10.0.0.1:0",
+            "10.0.0.1:65536",
+            "10.0.0.1:abc",
+            "10.0.0.1 8443",
+            "10.0.0.1\t8443",
+            "10.0.0.1:8443;rm -rf",
+            "$(x):8443",
+            "10.0.0.1:8443\n",
+            "10.0.0.1:8443\x00",
+            "10.0.0.1/path:8443",
+            "[::1",  # missing bracket
+            "[::1]:",  # missing port
+            "[]:8443",  # empty host
+        ],
+    )
+    def test_rejects_injection(self, raw):
+        assert _parse_lxd_address(raw) is None

@@ -37,7 +37,7 @@ parts:
   driver-lxd:
     plugin: rust
     source: https://github.com/canonical/openshell-driver-lxd.git
-    source-commit: e24758bdc957c80d1029a680a508e5327b34f272
+    source-commit: e591558cd2cf9f62a8d942f328d3c9a2627f1f73
     source-subdir: crates/openshell-driver-lxd
     build-packages:
       - pkg-config
@@ -45,6 +45,12 @@ parts:
       - protobuf-compiler
       - libprotobuf-dev
       - cmake
+    override-build: |
+      # Carried patch combining --gateway-endpoint (FD-015) and
+      # --lxd-server-fingerprint (FD-016). Remove once both flags land
+      # upstream in canonical/openshell-driver-lxd.
+      patch -p1 < "${CRAFT_PROJECT_DIR}/patches/lxd-server-fingerprint.patch"
+      craftctl default
 
   runtime-deps:
     plugin: nil

@@ -1,0 +1,94 @@
+name: CI (integrator)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - charms/lxd-integrator-k8s/**
+      - .github/workflows/ci-integrator.yaml
+  pull_request:
+    paths:
+      - charms/lxd-integrator-k8s/**
+      - .github/workflows/ci-integrator.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run lint
+        run: |
+          tox -e lint
+        working-directory: charms/lxd-integrator-k8s
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run unit tests
+        run: |
+          tox -e unit
+        working-directory: charms/lxd-integrator-k8s
+
+  static:
+    name: Static type checks
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt install -y tox
+      - name: Run static checks
+        run: |
+          tox -e static
+        working-directory: charms/lxd-integrator-k8s
+
+  build-charm:
+    name: Build charm
+    runs-on: ubuntu-24.04
+    needs: [lint, unit, static]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Pack charm
+        uses: canonical/craft-actions/charmcraft/pack@39a1fa1fd30fb8bef5abb80a24f3a06ad6261d17
+        with:
+          path: charms/lxd-integrator-k8s
+
+      - name: Upload charm artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: charm
+          path: charms/lxd-integrator-k8s/*.charm
+          if-no-files-found: error

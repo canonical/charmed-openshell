@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import yaml
 from ops import ActiveStatus, BlockedStatus
-from ops.testing import Container, Context, Relation, State, TCPPort
+from ops.testing import Container, Context, PeerRelation, Relation, State, TCPPort
 
-from charm import CONTAINER_NAME, OpenshellGatewayK8sCharm
+from charm import CONTAINER_NAME, RESTART_RELATION, OpenshellGatewayK8sCharm
 from ingress import GatewayIngress, _is_ip_address, _valid_hostname
 
 # Minimal valid config so the charm's config validator doesn't block _reconcile.
@@ -348,7 +348,12 @@ class TestLeaderElected:
         ctx = _ctx()
         out = ctx.run(
             ctx.on.leader_elected(),
-            State(config=_ROLES, leader=True, relations=[_INGRESS_REL], containers=[_GATEWAY]),
+            State(
+                config=_ROLES,
+                leader=True,
+                relations=[_INGRESS_REL, PeerRelation(RESTART_RELATION)],
+                containers=[_GATEWAY],
+            ),
         )
         rel = _ingress_rel_from_out(out)
         assert rel.local_app_data.get("raw") == "True"

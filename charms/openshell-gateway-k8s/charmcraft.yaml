@@ -28,7 +28,12 @@ parts:
       - requirements.txt
     build-packages:
       - libssl-dev
+      - patch
       - pkg-config
+    override-build: |
+      craftctl default
+      patch -d "${CRAFT_PART_INSTALL}/venv" -p1 \
+        < "${CRAFT_PROJECT_DIR}/patches/rollingops-flat-venv.patch"
 
 charm-libs:
   - lib: data_platform_libs.data_interfaces
@@ -49,6 +54,8 @@ containers:
 peers:
   gateway-peers:
     interface: gateway_peers
+  restart:
+    interface: rolling_op
 
 requires:
   database:
@@ -63,6 +70,9 @@ requires:
   ingress:
     interface: traefik_route
     limit: 1
+  lxd:
+    interface: lxd-https
+    limit: 1
 
 provides:
   send-ca-cert:
@@ -71,8 +81,16 @@ provides:
 actions:
   get-oidc-client-config:
     description: Return the OIDC client configuration for CLI consumers.
+  get-lxd-client-cert:
+    description: Return this application's LXD client certificate and the provider's fingerprint.
   get-gateway-status:
     description: Report the current readiness and configuration state of the gateway.
+  restart:
+    description: Request a rolling restart of the gateway workload across units.
+  rotate-jwt-signing-key:
+    description: >
+      Generate a new Ed25519 JWT signing keypair and publish it as a new
+      revision of the gateway's shared signing-key secret. Leader unit only.
 
 resources:
   gateway-image:
@@ -110,3 +128,31 @@ config:
       type: string
       default: info
       description: "Log verbosity level. One of: debug, info, warn, error."
+    gateway-id:
+      type: string
+      default: openshell-gateway
+      description: >
+        Stable identity for this gateway deployment, embedded in every minted
+        JWT. Must match the value expected by sandbox supervisors that verify
+        gateway-issued tokens.
+    jwt-ttl-secs:
+      type: int
+      default: 3600
+      description: >
+        Lifetime, in seconds, of tokens minted by the gateway for sandbox
+        supervisor authentication. Must be a positive integer.
+    lxd-projects:
+      type: string
+      description: >
+        Comma-separated list of LXD projects to restrict the gateway to.
+        Leave unset to allow all projects.
+    lxd-sandbox-image:
+      type: string
+      default: openshell-sandbox
+      description: Default image alias passed to the LXD driver as --default-image.
+    lxd-operation-timeout-secs:
+      type: int
+      default: 60
+      description: >
+        Timeout, in seconds, for LXD driver operations. Must be a positive
+        integer.

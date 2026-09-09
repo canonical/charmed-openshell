@@ -1,11 +1,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
 addopts = "--tb=short"
-pythonpath = ["src", "lib"]
-markers = [
-    "integrator: tests for the lxd-integrator-k8s provider path",
-    "offer: tests for the cross-model lxd charm offer provider path",
-]
+pythonpath = ["src"]
 
 [tool.coverage.run]
 source = ["src"]
@@ -15,7 +11,7 @@ branch = true
 show_missing = true
 
 [tool.pyright]
-extraPaths = ["lib"]
+extraPaths = ["src"]
 
 [tool.ruff]
 line-length = 99

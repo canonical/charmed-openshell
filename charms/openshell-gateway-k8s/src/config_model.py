@@ -31,8 +31,6 @@ GATEWAY_PORT: str = "8443"  # TLS-only listen port
 DRIVERS: str = "lxd"
 # Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"
-# LXD REST API socket on the host (must be bind-mounted into the pod).
-LXD_HOST_SOCKET: str = "/var/snap/lxd/common/lxd/unix.socket"
 
 # ---------------------------------------------------------------------------
 # Filesystem path constants (container layout)
@@ -41,11 +39,22 @@ LXD_HOST_SOCKET: str = "/var/snap/lxd/common/lxd/unix.socket"
 CONFIG_PATH: str = "/etc/openshell/config.toml"
 JWT_DIR: str = "/etc/openshell/jwt"
 TLS_DIR: str = "/etc/openshell/tls"
+LXD_DIR: str = "/etc/openshell/lxd"
+LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
+LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
+LXD_SERVER_CA_PATH: str = f"{LXD_DIR}/server.crt"
 
 # Stable workload identity embedded in every minted JWT.  Must match the
 # openshell-server binary's expected default; cross-reference when
 # crates/openshell-server lands its config parser (FD-004).
 GATEWAY_ID: str = "openshell-gateway"
+
+# Default minted-token lifetime for shared Kubernetes deployments.
+JWT_TTL_SECS: int = 3600
+
+# Path to the key-id file delivered alongside the JWT signing/public key
+# material.  The charm writes the kid here and the renderer emits the path.
+JWT_KID_PATH: str = f"{JWT_DIR}/kid"
 
 
 # ---------------------------------------------------------------------------
@@ -68,19 +77,26 @@ class GatewayConfig(pydantic.BaseModel):
     oidc_admin_role: str | None = Field(default=None, alias="oidc-admin-role")
     oidc_user_role: str | None = Field(default=None, alias="oidc-user-role")
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
+    gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
+    jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
+    lxd_projects: str | None = Field(default=None, alias="lxd-projects")
+    lxd_sandbox_image: str = Field(default="openshell-sandbox", alias="lxd-sandbox-image")
+    lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
     # Field validators
     # ------------------------------------------------------------------
 
-    @field_validator("external_hostname", "oidc_admin_role", "oidc_user_role", mode="before")
+    @field_validator(
+        "external_hostname", "oidc_admin_role", "oidc_user_role", "lxd_projects", mode="before"
+    )
     @classmethod
     def _empty_string_to_none(cls, v: Any) -> Any:
         """Normalise Juju's empty-string representation of 'unset' to None.
 
-        Only applied to the three ``str | None`` fields; the non-optional
-        fields are deliberately excluded so an empty string there yields a
-        meaningful type/Literal validation error.
+        Only applied to optional string fields; the non-optional fields are
+        deliberately excluded so an empty string there yields a meaningful
+        type/Literal validation error.
         """
         if v == "":
             return None
@@ -92,6 +108,9 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_roles_claim",
         "oidc_admin_role",
         "oidc_user_role",
+        "gateway_id",
+        "lxd_projects",
+        "lxd_sandbox_image",
         mode="after",
     )
     @classmethod
@@ -186,19 +205,22 @@ def render_config_toml(
     tls_key_path: str,
     jwt_signing_key_path: str,
     jwt_public_key_path: str,
-    jwt_kid: str,
+    jwt_kid_path: str,
     redirect_uri: str,
+    k8s_namespace: str = "openshell",
+    k8s_service_account_name: str = "default",
 ) -> str:
     """Return the workload ``config.toml`` as a string.
 
     Pure function — no filesystem access, no ``ops`` imports.  All paths are
     passed in so the function is trivially unit-testable.
 
-    The binary uses ``[openshell.gateway]``, ``[openshell.gateway.tls]``, and
-    ``[openshell.gateway.oidc]`` sections.  The database URL is supplied via
-    the ``OPENSHELL_DB_URL`` env var (handled by the Pebble layer), not here.
-    The ``gateway_jwt`` section and ``redirect_uri`` are not part of the
-    server-side config for the current binary version.
+    The binary uses ``[openshell.gateway]``, ``[openshell.gateway.tls]``,
+    ``[openshell.gateway.oidc]``, and ``[openshell.gateway.gateway_jwt]``
+    sections.  The database URL is supplied via the ``OPENSHELL_DB_URL`` env
+    var (handled by the Pebble layer), not here.  ``redirect_uri`` is kept as
+    an argument for backwards compatibility but is not rendered in this
+    version.
     """
     assert cfg.oidc_admin_role is not None
     assert cfg.oidc_user_role is not None
@@ -222,6 +244,17 @@ def render_config_toml(
         f"admin_role = {q(cfg.oidc_admin_role)}",
         f"user_role = {q(cfg.oidc_user_role)}",
         "",
+        "[openshell.gateway.gateway_jwt]",
+        f"signing_key_path = {q(jwt_signing_key_path)}",
+        f"public_key_path = {q(jwt_public_key_path)}",
+        f"kid_path = {q(jwt_kid_path)}",
+        f"gateway_id = {q(cfg.gateway_id)}",
+        f"ttl_secs = {cfg.jwt_ttl_secs}",
+        "",
+        "[openshell.drivers.kubernetes]",
+        f"namespace = {q(k8s_namespace)}",
+        f"service_account_name = {q(k8s_service_account_name)}",
+        "",
     ]
     return "\n".join(lines)
 
@@ -239,7 +272,7 @@ def render_env(cfg: GatewayConfig) -> dict[str, str]:
     - ``OPENSHELL_DB_URL`` (relation-sourced, FD-003)
     - TLS certificate paths (FD-003)
     - OIDC issuer URL (FD-003)
-    - All ``config.toml`` / ``gateway_jwt.*`` assembly (FD-003/FD-006)
+    - ``gateway_jwt.*`` assembly (rendered into ``config.toml`` by FD-005)
     - ``OPENSHELL_ALLOW_UNAUTHENTICATED`` (option deliberately absent)
     - ``OPENSHELL_DISABLE_TLS`` (option deliberately absent)
     """
@@ -293,3 +326,111 @@ def load_config(raw: Mapping[str, Any]) -> tuple[GatewayConfig | None, str | Non
         messages = [e["msg"] for e in exc.errors()]
         message = "; ".join(messages)
         return None, message
+
+
+# ---------------------------------------------------------------------------
+# Driver command renderer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def render_driver_command(
+    url: str,
+    default_image: str,
+    operation_timeout_secs: int,
+    log_level: str,
+    gateway_endpoint: str,
+    server_ca: str | None = None,
+    server_fingerprint: str | None = None,
+) -> str:
+    """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
+
+    The local unix-socket path is intentionally absent; the driver is wired to
+    a remote LXD over HTTPS using the provider's address and pinned CA or
+    certificate fingerprint.
+
+    Exactly one of ``server_ca`` or ``server_fingerprint`` must be supplied.
+
+    ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
+    flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
+    (scheme + host + port) reachable by sandbox supervisors.
+    """
+    if (server_ca is None) == (server_fingerprint is None):
+        raise ValueError("exactly one of server_ca or server_fingerprint must be set")
+
+    trust_arg = (
+        f" --lxd-server-ca {server_ca}"
+        if server_ca is not None
+        else f" --lxd-server-fingerprint {server_fingerprint}"
+    )
+
+    return (
+        f"/usr/bin/openshell-driver-lxd"
+        f" --socket {DRIVER_SOCKET}"
+        f" --lxd-url {url}"
+        f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
+        f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
+        f"{trust_arg}"
+        f" --default-image {default_image}"
+        f" --operation-timeout-secs {operation_timeout_secs}"
+        f" --log-level {log_level}"
+        f" --gateway-endpoint {gateway_endpoint}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# LXD address sanitizer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def _parse_lxd_address(raw: str) -> str | None:
+    """Validate and return a cleaned ``host:port`` string, or None.
+
+    Rejects whitespace, C0 control characters, DEL, and shell/path
+    metacharacters. The result is intended for interpolation into the driver
+    command line and must be a single ``host:port`` value.
+    """
+    # Reject embedded C0 control characters / DEL before stripping surrounding spaces.
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+        return None
+
+    value = raw.strip()
+    if not value:
+        return None
+
+    # Reject any remaining value containing whitespace or shell/path metacharacters.
+    forbidden = set(" /\\;|&$`()<>\"'*?\t")
+    if any(c in forbidden for c in value):
+        return None
+
+    # Host charset: A-Z, a-z, 0-9, dot, colon, underscore, hyphen, brackets.
+    if not all(c.isascii() and (c.isalnum() or c in ".:_-[]") for c in value):
+        return None
+
+    # IPv6 literal form: [addr]:port
+    if value.startswith("["):
+        close = value.rfind("]")
+        if close == -1 or close != value.index("]"):
+            return None
+        host_part = value[: close + 1]
+        remainder = value[close + 1 :]
+        if not remainder.startswith(":") or remainder == ":":
+            return None
+        port_part = remainder[1:]
+        # Reject empty bracket content (e.g. "[]:8443").
+        if close == 1:
+            return None
+    else:
+        if ":" not in value:
+            return None
+        host_part, port_part = value.rsplit(":", 1)
+        if not host_part:
+            return None
+
+    try:
+        port = int(port_part)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+
+    return f"{host_part}:{port}"
