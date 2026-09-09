@@ -11,11 +11,15 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import io
+import json
 import logging
 import os
 import socket
 import ssl
 import subprocess
+import tarfile
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -137,6 +141,71 @@ def _host_reachable_ip() -> str:
     raise RuntimeError("could not determine host reachable IP: no default IPv4 route found")
 
 
+DEFAULT_SANDBOX_IMAGE_ALIAS = "openshell-sandbox"
+
+
+def ensure_sandbox_image(runner: Any = host_lxc_runner) -> None:
+    """Ensure that the default sandbox image alias exists in LXD.
+
+    The OpenShell LXD driver checks on startup that the configured default
+    sandbox image alias exists in the LXD image store. If absent, alias an
+    existing image or import a minimal dummy image so the driver can start.
+    """
+    aliases_res = runner("image", "alias", "list", "--format=json")
+    if aliases_res.returncode == 0 and aliases_res.stdout:
+        try:
+            aliases = json.loads(aliases_res.stdout)
+            if any(a.get("name") == DEFAULT_SANDBOX_IMAGE_ALIAS for a in aliases):
+                return
+        except json.JSONDecodeError:
+            pass
+
+    # Find an existing image to alias
+    img_res = runner("image", "list", "--format=json")
+    if img_res.returncode == 0 and img_res.stdout:
+        try:
+            images = json.loads(img_res.stdout)
+            if images and "fingerprint" in images[0]:
+                alias_res = runner(
+                    "image",
+                    "alias",
+                    "create",
+                    DEFAULT_SANDBOX_IMAGE_ALIAS,
+                    images[0]["fingerprint"],
+                )
+                if alias_res.returncode == 0:
+                    return
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: import a minimal dummy container image
+    meta = (
+        b"architecture: x86_64\n"
+        b"creation_date: 1600000000\n"
+        b"properties:\n"
+        b"  description: openshell sandbox dummy image\n"
+        b"  os: ubuntu\n"
+        b"  release: noble\n"
+    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        meta_tar = Path(tmpdir) / "meta.tar.gz"
+        rootfs_tar = Path(tmpdir) / "rootfs.tar.gz"
+        with tarfile.open(meta_tar, "w:gz") as tar:
+            info = tarfile.TarInfo("metadata.yaml")
+            info.size = len(meta)
+            tar.addfile(info, io.BytesIO(meta))
+        with tarfile.open(rootfs_tar, "w:gz") as tar:
+            pass
+        runner(
+            "image",
+            "import",
+            str(meta_tar),
+            str(rootfs_tar),
+            "--alias",
+            DEFAULT_SANDBOX_IMAGE_ALIAS,
+        )
+
+
 def setup_host_lxd_endpoint() -> HostLxdEndpoint:
     """Enable HTTPS on the host LXD, trust an integrator identity, and return details."""
     host_ip = _host_reachable_ip()
@@ -146,6 +215,8 @@ def setup_host_lxd_endpoint() -> HostLxdEndpoint:
 
     # Allow the listener a moment to come up.
     time.sleep(2)
+
+    ensure_sandbox_image(host_lxc_runner)
 
     client_cert_pem, client_key_pem, integrator_fingerprint = (
         generate_integrator_client_credentials()

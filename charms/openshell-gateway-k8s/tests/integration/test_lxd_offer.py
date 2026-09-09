@@ -80,6 +80,39 @@ def _prime_lxd_certificate_store(machine_juju: jubilant.Juju) -> None:
     )
 
 
+def _prime_lxd_image_store(machine_juju: jubilant.Juju) -> None:
+    """Ensure the managed LXD has the default sandbox image alias."""
+    script = (
+        "import json, subprocess, tempfile, tarfile, io, os, sys\n"
+        "res = subprocess.run(['lxc', 'image', 'alias', 'list', '--format=json'], "
+        "capture_output=True, text=True)\n"
+        "aliases = json.loads(res.stdout) if res.returncode == 0 and res.stdout else []\n"
+        "if any(a.get('name') == 'openshell-sandbox' for a in aliases):\n"
+        "    sys.exit(0)\n"
+        "img_res = subprocess.run(['lxc', 'image', 'list', '--format=json'], "
+        "capture_output=True, text=True)\n"
+        "imgs = json.loads(img_res.stdout) if img_res.returncode == 0 and img_res.stdout else []\n"
+        "if imgs:\n"
+        "    subprocess.run(['lxc', 'image', 'alias', 'create', 'openshell-sandbox', "
+        "imgs[0]['fingerprint']], check=True)\n"
+        "    sys.exit(0)\n"
+        "meta = b'architecture: x86_64\\ncreation_date: 1600000000\\nproperties:\\n"
+        "  description: openshell sandbox\\n  os: ubuntu\\n  release: noble\\n'\n"
+        "with tempfile.TemporaryDirectory() as td:\n"
+        "    m = os.path.join(td, 'm.tar.gz')\n"
+        "    r = os.path.join(td, 'r.tar.gz')\n"
+        "    with tarfile.open(m, 'w:gz') as t:\n"
+        "        ti = tarfile.TarInfo('metadata.yaml')\n"
+        "        ti.size = len(meta)\n"
+        "        t.addfile(ti, io.BytesIO(meta))\n"
+        "    with tarfile.open(r, 'w:gz') as t:\n"
+        "        pass\n"
+        "    subprocess.run(['lxc', 'image', 'import', m, r, '--alias', 'openshell-sandbox'], "
+        "check=True)\n"
+    )
+    machine_juju.exec("python3", "-c", script, unit=f"{LXD_APP}/0")
+
+
 def _wait_for_managed_lxd_ready(machine_juju: jubilant.Juju, timeout: int = 300) -> None:
     """Poll the managed LXD until the charm's pylxd client can list certificates."""
     deadline = time.monotonic() + timeout
@@ -122,6 +155,7 @@ def machine_lxd_offer() -> tuple[str, jubilant.Juju]:
         # certificate queries; prime the trust store and wait for the pylxd
         # client the charm uses to be able to iterate over certificates.
         _prime_lxd_certificate_store(machine_juju)
+        _prime_lxd_image_store(machine_juju)
         _wait_for_managed_lxd_ready(machine_juju)
         machine_juju.offer(LXD_APP, endpoint="https")
         # Give the offer a moment to publish.

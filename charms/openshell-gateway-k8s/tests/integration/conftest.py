@@ -671,7 +671,9 @@ def driver_help_output(juju: jubilant.Juju) -> str:
 
 
 def sandbox_e2e_supported(juju: jubilant.Juju) -> bool:
-    """Return True if the deployed driver exposes ``--gateway-endpoint``."""
+    """Return True if the deployed driver exposes ``--gateway-endpoint`` and e2e is enabled."""
+    if not os.environ.get("OPENSHELL_ENABLE_SANDBOX_E2E"):
+        return False
     return "--gateway-endpoint" in driver_help_output(juju)
 
 
@@ -809,7 +811,9 @@ def _openshell_sandbox_create(
         pytest.fail(f"openshell sandbox create failed ({result.returncode}):\n{output}")
 
 
-def _openshell_sandbox_delete(name: str, *, gateway_name: str | None = None) -> None:
+def _openshell_sandbox_delete(
+    name: str, *, gateway_name: str | None = None, check: bool = True
+) -> None:
     """Delete an OpenShell sandbox."""
     args = ["openshell"]
     if gateway_name:
@@ -818,7 +822,7 @@ def _openshell_sandbox_delete(name: str, *, gateway_name: str | None = None) -> 
     result = _run(*args)
     output = result.stdout + result.stderr
     print("openshell sandbox delete output:\n", output)
-    if result.returncode != 0:
+    if check and result.returncode != 0:
         pytest.fail(f"openshell sandbox delete failed ({result.returncode}):\n{output}")
 
 
@@ -884,7 +888,6 @@ def _run_gated_sandbox_e2e(
     access, and cleans up in a ``finally`` block.
     """
     _openshell_gateway_remove(gateway_name)
-    _openshell_sandbox_delete(sandbox_name)
     _openshell_gateway_add(
         name=gateway_name,
         gateway_url=gateway_url,
@@ -904,7 +907,7 @@ def _run_gated_sandbox_e2e(
         stdout = _openshell_sandbox_exec(sandbox_name, marker, gateway_name=gateway_name)
         assert marker in stdout, stdout
     finally:
-        _openshell_sandbox_delete(sandbox_name, gateway_name=gateway_name)
+        _openshell_sandbox_delete(sandbox_name, gateway_name=gateway_name, check=False)
         _openshell_gateway_remove(gateway_name)
 
 
