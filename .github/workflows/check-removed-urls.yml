@@ -1,0 +1,57 @@
+name: Check for removed URLs
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This implicitly gets the PR branch. Making it explicit causes problems
+          # with private forks, but it is equivalent to the following:
+          # repository: ${{ github.event.pull_request.head.repo.full_name }}
+          # ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          path: compare
+      - name: Checkout base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          fetch-depth: 0
+          path: base
+      - name: Checkout sphinx-stack
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: canonical/sphinx-stack
+          path: sphinx-stack
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Build docs
+        run: |
+          for dir in compare base; do
+            pushd ${dir}/docs
+            make html
+            popd
+          done
+      - name: Generate current URLs list
+        run: |
+          for dir in compare base; do
+            build_dir="${dir}/docs/_build"
+            urls_file="${dir}/docs/urls.txt"
+
+            if [ ! -d "${build_dir}" ]; then
+              echo "Expected docs build directory not found: ${build_dir}"
+              exit 1
+            fi
+
+            find "${build_dir}" -name '*.html' \
+              | sed "s|^${build_dir}||;s|^/html||;s|/index.html$|/|;s|.html$||" \
+              | sort > "${urls_file}"
+          done
+      - name: Compare URLs
+        run: python3 sphinx-stack/docs/_dev/check_removed_urls.py
