@@ -21,7 +21,7 @@ import textwrap
 
 # Project name
 # TODO: Update with the official name of your project or product (e.g., "Ubuntu Server")
-project = "Project"
+project = "Charmed OpenShell"
 
 # Author name; used in the default copyright statement in the page footer
 author = "Canonical Ltd."
@@ -72,7 +72,7 @@ html_context = {
     # documentation source files and creating GitHub issues are added at the bottom of
     # each page.
     # TODO: Change to your documentation GitHub repository URL or leave empty.
-    "github_url": "",
+    "github_url": "https://github.com/canonical/charmed-openshell",
     # Docs branch in the repo; used in links for viewing the source files
     "repo_default_branch": "main",
     # Docs location in the repo; used in links for viewing the source files
@@ -91,9 +91,9 @@ html_context = {
         # TODO: Specify your project's license.
         # For the name, we recommend using the standard shorthand identifier from
         # https://spdx.org/licenses
-        "name": "",
+        "name": "Apache-2.0",
         # TODO: Link directly to your project's license statement.
-        "url": "",
+        "url": "https://github.com/canonical/charmed-openshell/blob/main/LICENSE",
     },
 }
 
@@ -168,8 +168,8 @@ rediraffe_dir_only = True
 # <first sentence of home page>".
 llms_txt_description = textwrap.dedent(
     """\
-    This is the documentation for the Sphinx Stack, a template repository that helps you
-    set up, build, and publish Sphinx documentation.
+    This is the documentation for Charmed OpenShell, which combines OpenShell's
+    control plane with Canonical's operator ecosystem.
     """
 )
 
@@ -196,7 +196,7 @@ linkcheck_anchors_ignore_for_url = [r"https://github\.com/.*"]
 
 # How long the link checker will wait for a response for each request
 # TODO: Decrease to improve run time or increase if links frequently time out.
-# linkcheck_timeout = 30
+linkcheck_timeout = 30
 
 # Give linkcheck multiple tries on failure
 linkcheck_retries = 3
