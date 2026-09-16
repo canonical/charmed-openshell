@@ -1,15 +1,23 @@
-name: CI (charm)
+name: Release (gateway)
 
 on:
-  pull_request:
+  push:
+    branches:
+      - main
     paths:
       - charms/openshell-gateway-k8s/**
       - concierge.yaml
-      - .github/workflows/ci-charm.yaml
+      - .github/workflows/release-gateway.yaml
   workflow_dispatch:
+    inputs:
+      track:
+        description: Track to publish to
+        required: true
+        default: latest
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -93,9 +101,6 @@ jobs:
     needs: [build-charm]
     runs-on: ubuntu-26.04
     timeout-minutes: 180
-    permissions:
-      contents: read
-      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -153,12 +158,39 @@ jobs:
           charm="$(realpath artifacts/charm/*.charm | head -n1)"
           echo "charm=$charm" >> "$GITHUB_OUTPUT"
 
-      - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
       - name: Run integration tests
         run: just integration-test-charm
         env:
           CHARM_FILE: ${{ steps.artifacts.outputs.charm }}
+
+  release:
+    name: Release charm
+    runs-on: ubuntu-24.04
+    needs: [integration]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download charm artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.9
+        with:
+          name: charm
+          path: artifacts/charm
+
+      - name: Resolve artifact paths
+        id: artifacts
+        run: |
+          charm="$(realpath artifacts/charm/*.charm | head -n1)"
+          echo "charm=$charm" >> "$GITHUB_OUTPUT"
+
+      - name: Upload charm to Charmhub
+        uses: canonical/charming-actions/upload-charm@1753e0803f70445132e92acd45c905aba6473225 # 2.7.0
+        with:
+          credentials: "${{ secrets.CHARMHUB_TOKEN }}"
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          charm-path: charms/openshell-gateway-k8s
+          built-charm-path: "${{ steps.artifacts.outputs.charm }}"
+          channel: "${{ inputs.track || 'latest' }}/edge"
+          tag-prefix: "${{ inputs.track || 'latest' }}"

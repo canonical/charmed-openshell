@@ -1,0 +1,68 @@
+name: Promote (gateway)
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: Track to promote from and to
+        required: true
+        default: latest
+        type: string
+      from-risk:
+        description: Risk to promote from
+        required: true
+        default: edge
+        type: choice
+        options:
+          - edge
+          - beta
+          - candidate
+      to-risk:
+        description: Risk to promote to
+        required: true
+        default: beta
+        type: choice
+        options:
+          - beta
+          - candidate
+          - stable
+
+jobs:
+  promote:
+    name: Promote charm
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Validate risk step-up
+        run: |
+          risks="edge beta candidate stable"
+          index_of() {
+            local i=0
+            for r in $risks; do
+              if [ "$r" = "$1" ]; then
+                echo "$i"
+                return
+              fi
+              i=$((i + 1))
+            done
+            echo "-1"
+          }
+
+          FROM_IDX=$(index_of "${{ inputs.from-risk }}")
+          TO_IDX=$(index_of "${{ inputs.to-risk }}")
+
+          if [ "$TO_IDX" -le "$FROM_IDX" ] || [ "$FROM_IDX" -eq -1 ] || [ "$TO_IDX" -eq -1 ]; then
+            echo "Error: Promotion must strictly advance risk level: '${{ inputs.from-risk }}' -> '${{ inputs.to-risk }}' is not allowed."
+            exit 1
+          fi
+          echo "Promotion valid: ${{ inputs.from-risk }} (level $FROM_IDX) -> ${{ inputs.to-risk }} (level $TO_IDX)"
+
+      - name: Promote charm in Charmhub
+        uses: canonical/charming-actions/promote-charm@1753e0803f70445132e92acd45c905aba6473225 # 2.7.0
+        with:
+          credentials: "${{ secrets.CHARMHUB_TOKEN }}"
+          charm-path: charms/openshell-gateway-k8s
+          origin-channel: "${{ inputs.track }}/${{ inputs.from-risk }}"
+          destination-channel: "${{ inputs.track }}/${{ inputs.to-risk }}"
