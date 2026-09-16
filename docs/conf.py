@@ -29,12 +29,15 @@ author = "Canonical Ltd."
 # The year in the copyright statement
 copyright = f"{datetime.date.today().year}"
 
+# Use RTD canonical URL to ensure duplicate pages have a specific canonical URL
+html_baseurl = "https://ubuntu.com/docs/charmed-openshell/"
+
 # Sidebar documentation title
 # To disable the title, set it to an empty string.
 html_title = project + " documentation"
 
 # Documentation website URL
-ogp_site_url = os.environ.get("READTHEDOCS_CANONICAL_URL", "/")
+ogp_site_url = html_baseurl
 
 # Preview name of the documentation website
 # TODO: To use a different name for the project in previews, update the next line.
@@ -111,17 +114,15 @@ html_context = {
 # Project slug
 # TODO: If your documentation is hosted on https://documentation.ubuntu.com/,
 #       uncomment and set to the RTD slug.
-# slug = ''
+slug = "ubuntu.com/docs/charmed-openshell"
 
 #######################
 # Sitemap configuration: https://sphinx-sitemap.readthedocs.io/
 #######################
 
-# Use RTD canonical URL to ensure duplicate pages have a specific canonical URL
-html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "/")
-
 # sphinx-sitemap uses html_baseurl to generate the full URL for each page:
 sitemap_url_scheme = "{link}"
+sitemap_filename = "doc-sitemap.xml"
 
 # Include `lastmod` dates in the sitemap:
 sitemap_show_lastmod = True
@@ -139,7 +140,7 @@ sitemap_excludes = [
 # Template and asset locations #
 ################################
 
-# html_static_path = ["_static"]
+html_static_path = ["_static"]
 # templates_path = ["_templates"]
 
 #############
@@ -252,9 +253,10 @@ exclude_patterns = [
 # ]
 
 # Adds custom JavaScript files, located remotely or in 'html_static_path'.
-# html_js_files = [
-#     "https://assets.ubuntu.com/v1/287a5e8f-bundle.js",
-# ]
+html_js_files = [
+    "https://assets.ubuntu.com/v1/287a5e8f-bundle.js",
+    "js/overwrite_links.js",
+]
 
 # Appends extra markup to the end of every document written in reST
 # rst_epilog = """
