@@ -136,6 +136,8 @@ def integrator_charm_file() -> str:
         if shutil.which("charmcraft") is None:
             pytest.skip("INTEGRATOR_CHARM_FILE not set and 'charmcraft' not found")
         integrator_dir = REPO_ROOT / "charms" / "lxd-integrator-k8s"
+        if not integrator_dir.exists():
+            pytest.skip("INTEGRATOR_CHARM_FILE not set and charms/lxd-integrator-k8s not found")
         result = subprocess.run(
             ["charmcraft", "pack"],
             cwd=str(integrator_dir),
@@ -692,7 +694,7 @@ def deploy_integrator(
     """Deploy ``lxd-integrator-k8s`` against the host LXD and return the secret URI."""
     deploy_args = {"app": app}
     if charm_file is None:
-        deploy_args["channel"] = "latest/stable"
+        deploy_args["channel"] = "latest/edge"
     juju.deploy(charm_file or app, **deploy_args)
     secret_uri = create_lxd_credentials_secret(juju, host_lxd_endpoint, app)
     try:
