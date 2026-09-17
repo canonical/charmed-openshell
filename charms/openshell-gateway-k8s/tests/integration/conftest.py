@@ -14,7 +14,6 @@ import re
 import shutil
 import subprocess
 import time
-import urllib.request
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -25,6 +24,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
+from .image_resolver import resolve_gateway_image
 from .lxd_host import (
     HostLxdEndpoint,
     read_lxd_config,
@@ -153,90 +153,16 @@ def integrator_charm_file() -> str:
     return str(accessible)
 
 
-def _find_rock_file() -> Path | None:
-    """Locate a pre-built gateway rock in the repository."""
-    candidates = [
-        *REPO_ROOT.glob("*.rock"),
-        *(REPO_ROOT / "rocks" / "openshell-gateway").glob("*.rock"),
-    ]
-    if not candidates:
-        return None
-    return sorted(candidates)[-1]
-
-
-def _build_rock() -> Path:
-    """Build the gateway rock with rockcraft and return the produced file."""
-    if shutil.which("rockcraft") is None:
-        pytest.skip("No gateway rock found and 'rockcraft' is not available")
-
-    rock_dir = REPO_ROOT / "rocks" / "openshell-gateway"
-    result = subprocess.run(
-        ["rockcraft", "pack"],
-        cwd=str(rock_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"rockcraft pack failed:\n{result.stderr}")
-
-    rocks = sorted(rock_dir.glob("*.rock"))
-    if not rocks:
-        pytest.skip("rockcraft pack succeeded but no .rock file found")
-    return rocks[-1]
-
-
-def _push_rock_to_registry(rock_file: Path, registry: str) -> str:
-    """Push a local rock to the local registry using skopeo."""
-    if shutil.which("skopeo") is None:
-        pytest.skip("skopeo is required to import the gateway rock into the registry")
-
-    dest = f"docker://{registry}/openshell-gateway:latest"
-    logger.info("Pushing %s to %s", rock_file, dest)
-    result = subprocess.run(
-        [
-            "skopeo",
-            "copy",
-            f"oci-archive:{rock_file}",
-            dest,
-            "--dest-tls-verify=false",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"skopeo copy failed:\n{result.stderr}")
-    return f"{registry}/openshell-gateway:latest"
-
-
 @pytest.fixture(scope="module")
 def gateway_image() -> str:
     """Return the OCI image ref for the gateway workload.
 
     Precedence:
-      1. ``GATEWAY_IMAGE`` env var (use an already-published image).
-      2. ``ROCK_FILE`` env var or any ``*.rock`` in the repo, pushed to the
-         local registry snap with ``skopeo``.
-      3. Build the rock with ``rockcraft`` and push it.
-
-    The local registry is read from ``LOCAL_REGISTRY`` and defaults to
-    ``localhost:5000``.
+      1. ``GATEWAY_IMAGE`` env var.
+      2. Upstream source in ``charmcraft.yaml``.
+      3. Fallback default: ``ghcr.io/canonical/openshell-gateway:latest``.
     """
-    image = os.environ.get("GATEWAY_IMAGE")
-    if image:
-        return image
-
-    registry = os.environ.get("LOCAL_REGISTRY", "localhost:5000")
-    # Sanity-check that the registry snap is reachable before spending time
-    # building or copying the rock.
-    try:
-        urllib.request.urlopen(f"http://{registry}/v2/", timeout=5).read()
-    except Exception as exc:
-        pytest.skip(f"Local registry {registry} is not reachable: {exc}")
-
-    rock_file = os.environ.get("ROCK_FILE")
-    source = Path(rock_file) if rock_file else _find_rock_file() or _build_rock()
-
-    return _push_rock_to_registry(source, registry)
+    return resolve_gateway_image()
 
 
 @pytest.fixture(scope="module")

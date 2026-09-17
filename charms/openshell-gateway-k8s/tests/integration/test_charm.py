@@ -11,10 +11,7 @@ Environment variables:
   CHARM_FILE    Path to a pre-built .charm artifact. If unset, the test shells
                 out to a pre-installed ``charmcraft`` binary.
   GATEWAY_IMAGE OCI image ref for the gateway-image resource. If unset, the
-                test imports a local gateway rock into the registry snap.
-  ROCK_FILE     Path to a pre-built gateway rock. If unset, the test searches
-                the repository or builds the rock with ``rockcraft``.
-  LOCAL_REGISTRY  Registry endpoint for the rock import (default: localhost:5000).
+                test defaults to the upstream source defined in charmcraft.yaml.
   JUJU_MODEL    Deploy into an existing model instead of creating a temporary
                 one. The model is *not* destroyed when the test finishes.
 """

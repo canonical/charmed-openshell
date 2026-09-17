@@ -95,8 +95,7 @@ actions:
 resources:
   gateway-image:
     type: oci-image
-    description: OCI image for the OpenShell gateway workload (FD-001 rock).
-    # Placeholder tag; replace with the real ref once FD-001 publishes the rock.
+    description: OCI image for the OpenShell gateway workload
     upstream-source: ghcr.io/canonical/openshell-gateway:latest
 
 config:

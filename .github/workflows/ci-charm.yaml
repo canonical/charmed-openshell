@@ -7,14 +7,12 @@ on:
     paths:
       - charms/openshell-gateway-k8s/**
       - charms/lxd-integrator-k8s/**
-      - rocks/openshell-gateway/**
       - concierge.yaml
       - .github/workflows/ci-charm.yaml
   pull_request:
     paths:
       - charms/openshell-gateway-k8s/**
       - charms/lxd-integrator-k8s/**
-      - rocks/openshell-gateway/**
       - concierge.yaml
       - .github/workflows/ci-charm.yaml
   workflow_dispatch:
@@ -99,31 +97,14 @@ jobs:
           path: charms/openshell-gateway-k8s/*.charm
           if-no-files-found: error
 
-  build-rock:
-    name: Build rock
-    runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Pack rock
-        uses: canonical/craft-actions/rockcraft/pack@39a1fa1fd30fb8bef5abb80a24f3a06ad6261d17
-        with:
-          path: rocks/openshell-gateway
-
-      - name: Upload rock artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: rock
-          path: rocks/openshell-gateway/*.rock
-          if-no-files-found: error
-
   integration:
     name: Integration tests
-    needs: [build-charm, build-rock]
+    needs: [build-charm]
     runs-on: ubuntu-26.04
     timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -175,28 +156,18 @@ jobs:
           name: charm
           path: artifacts/charm
 
-      - name: Download rock artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.9
-        with:
-          name: rock
-          path: artifacts/rock
-
       - name: Resolve artifact paths
         id: artifacts
         run: |
-          arch="$(uname -m)"
-          case "$arch" in
-            x86_64) rock_arch="amd64" ;;
-            aarch64) rock_arch="arm64" ;;
-            *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
-          esac
           charm="$(realpath artifacts/charm/*.charm | head -n1)"
-          rock="$(realpath artifacts/rock/*_${rock_arch}.rock | head -n1)"
           echo "charm=$charm" >> "$GITHUB_OUTPUT"
-          echo "rock=$rock" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Run integration tests
         run: just integration-test-charm
         env:
           CHARM_FILE: ${{ steps.artifacts.outputs.charm }}
-          ROCK_FILE: ${{ steps.artifacts.outputs.rock }}

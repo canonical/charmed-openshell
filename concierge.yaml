@@ -27,7 +27,6 @@ host:
     - skopeo
   snaps:
     charmcraft:
-    rockcraft:
     registry:
       channel: latest/stable
     openshell:

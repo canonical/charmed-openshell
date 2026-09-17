@@ -13,11 +13,9 @@ platform.
 ## What is included
 
 - **Kubernetes charm** in [`charms/openshell-gateway-k8s/`](charms/openshell-gateway-k8s/)
-  that deploys and manages the gateway workload.
-- **OCI rock** in [`rocks/openshell-gateway/`](rocks/openshell-gateway/) containing
-  the OpenShell gateway and the
-  [`openshell-driver-lxd`](https://github.com/canonical/openshell-driver-lxd)
-  compute driver in the same image.
+  that deploys and manages the gateway workload using the companion
+  [`openshell-gateway`](https://github.com/canonical/openshell-driver-lxd)
+  rock (built and maintained externally).
 - **Integration with platform services**, including
   [Canonical PostgreSQL](https://canonical.com/data/postgresql/docs/14) for persistence,
   the [Canonical Identity stack](https://canonical-identity.readthedocs-hosted.com/)
@@ -27,7 +25,7 @@ platform.
 - **Documentation and architecture decisions** in [`docs/`](docs/) describing the
   solution and the important design choices behind it.
 - **Automated checks and build workflows** in [`.github/workflows/`](.github/workflows/)
-  for the charm and rock.
+  for the charms.
 
 ## The solution at a glance
 
@@ -85,20 +83,17 @@ To build the project locally, install the tools used by the repository:
 - [Canonical Kubernetes](https://ubuntu.com/kubernetes)
 - [MicroCloud](https://canonical.com/microcloud)
 - [Charmcraft](https://canonical-charmcraft.readthedocs-hosted.com/)
-- [Rockcraft](https://canonical-rockcraft.readthedocs-hosted.com/)
 - Python 3.12, `tox`, and [`just`](https://github.com/casey/just)
 
-Build the workload image and charm from the repository root:
+Build the charm from the repository root:
 
 ```bash
-just build-rock
 just build-charm
 ```
 
 Run the available tests:
 
 ```bash
-just test-rock
 just test-charm
 ```
 
@@ -132,8 +127,6 @@ flag and skip cleanly until that flag is available.
 
 - Browse the [charm definition](charms/openshell-gateway-k8s/charmcraft.yaml) to
   see its configuration and service integrations.
-- Browse the [rock definition](rocks/openshell-gateway/rockcraft.yaml) to see how
-  the gateway image is assembled.
 - Review the [architecture decisions](docs/adrs/) for the reasoning behind the
   design.
 

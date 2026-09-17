@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This repository is the Canonical-native Juju packaging for the NVIDIA OpenShell gateway on Kubernetes. It produces the `openshell-gateway-k8s` charm, the companion `openshell-gateway` rock, and supporting documentation/Terraform modules for deploying OpenShell in a production-grade, operator-native way.
+This repository is the Canonical-native Juju packaging for the NVIDIA OpenShell gateway on Kubernetes. It produces the `openshell-gateway-k8s` charm and supporting documentation/Terraform modules for deploying OpenShell in a production-grade, operator-native way. The gateway workload runs using the companion `openshell-gateway` rock, which is built and maintained externally.
 
 The gateway provides the OpenShell control plane — API server, persistence, authentication/authorization, and sandbox orchestration — and is designed to integrate with PostgreSQL, Charmed Hydra (OIDC), Traefik ingress, and the Canonical Observability Stack.
 
@@ -21,12 +21,11 @@ Keep the guidance concise, accurate, and actionable.
 
 | Path | Purpose |
 |------|---------|
-| `charms/openshell-gateway-k8s/` | Sidecar Kubernetes charm (ops framework) that operates the rock |
-| `rocks/openshell-gateway/` | Pebble-based OCI image bundling `openshell-gateway` and `openshell-driver-lxd` |
+| `charms/openshell-gateway-k8s/` | Sidecar Kubernetes charm (ops framework) that operates the workload |
 | `docs/adrs/` | Architecture Decision Records (MADR-style) |
 | `Justfile` | High-level build/test recipes |
 | `concierge.yaml` | Local integration-test environment setup (Juju + K8s) |
-| `.github/workflows/` | CI definitions for charm lint/unit/static/integration and rock builds |
+| `.github/workflows/` | CI definitions for charm lint/unit/static/integration |
 
 ## Key Files Reference
 
@@ -38,7 +37,6 @@ Keep the guidance concise, accurate, and actionable.
 | `charms/openshell-gateway-k8s/charmcraft.yaml` | Charm metadata, relations, resources, and build config |
 | `charms/openshell-gateway-k8s/pyproject.toml` | Python tooling configuration (pytest, ruff, pyright, coverage) |
 | `charms/openshell-gateway-k8s/tox.ini` | Local test environments |
-| `rocks/openshell-gateway/rockcraft.yaml` | Rock build definition |
 
 ## Development Setup
 
@@ -47,9 +45,6 @@ The project assumes an Ubuntu environment with Python 3.12, `tox`, `just`, and (
 Typical workflows:
 
 ```bash
-# Build the rock
-just build-rock
-
 # Build the charm
 just build-charm
 
@@ -150,14 +145,6 @@ Integration tests live in `charms/openshell-gateway-k8s/tests/integration/` and 
 just integration-test-charm
 ```
 
-### Rock Smoke Tests
-
-Smoke tests for the rock are in `rocks/openshell-gateway/tests/smoke.sh` and run automatically in CI:
-
-```bash
-just test-rock
-```
-
 ## Vendored Library Patches
 
 Libraries in `lib/` are vendored via `charmcraft fetch-libs`. When a vendored library crashes on a transient Juju condition that the charm itself already handles, it is acceptable to patch the vendored copy locally and cover the patch with a unit test.
@@ -208,5 +195,4 @@ Follow conventional commit style in PR titles:
 2. Update the spec or ADRs if the change affects architecture or user-facing behaviour.
 3. Run `tox -e lint`, `tox -e unit`, and `tox -e static` in `charms/openshell-gateway-k8s`.
 4. Run `tox -e fmt` if formatting is needed.
-5. For rock changes, ensure `just test-rock` still passes.
-6. Verify the CI workflows in `.github/workflows/` still apply to the files you changed.
+5. Verify the CI workflows in `.github/workflows/` still apply to the files you changed.
