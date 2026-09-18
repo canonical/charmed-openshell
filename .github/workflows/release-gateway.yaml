@@ -194,3 +194,4 @@ jobs:
           built-charm-path: "${{ steps.artifacts.outputs.charm }}"
           channel: "${{ inputs.track || 'latest' }}/edge"
           tag-prefix: "${{ inputs.track || 'latest' }}"
+          upload-image: false
