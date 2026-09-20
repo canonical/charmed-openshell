@@ -10,6 +10,7 @@ until the upstream ``--gateway-endpoint`` driver flag lands.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import jubilant
@@ -18,14 +19,19 @@ import pytest
 from .conftest import (
     APP_NAME,
     INTEGRATOR_APP,
+    IT_PROJECT,
+    _has_integrator_relation,
     _run_gated_sandbox_e2e,
     _wait_for_gateway_blocked,
     _wait_for_gateway_stack,
     assert_trust_registered,
     assert_trust_withdrawn,
     deploy_integrator,
+    ensure_integrator_relation,
+    lxc_instance_projects,
     lxc_trust_fingerprints,
     prepare_openshell_client,
+    wait_for_lxd_project,
 )
 from .lxd_host import HostLxdEndpoint
 
@@ -46,15 +52,6 @@ def _lxd_integrator_provider(
     juju.wait(lambda s: jubilant.all_active(s, INTEGRATOR_APP), timeout=900)
     juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
     _wait_for_gateway_stack(juju)
-
-
-def _has_integrator_relation(juju: jubilant.Juju) -> bool:
-    """Return True when the gateway is currently related to the integrator."""
-    status = juju.status()
-    app = status.apps.get(APP_NAME)
-    if app is None:
-        return False
-    return any(relation.related_app == INTEGRATOR_APP for relation in app.relations.get("lxd", []))
 
 
 class TestLxdIntegratorProvider:
@@ -101,9 +98,7 @@ class TestLxdIntegratorProvider:
         openshell_available: None,
     ) -> None:
         """Gated: the openshell CLI connects to the gateway over the integrator path."""
-        if not _has_integrator_relation(juju):
-            juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
-            juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=900)
+        ensure_integrator_relation(juju)
 
         creds = prepare_openshell_client(juju, gateway_url)
         _run_gated_sandbox_e2e(
@@ -115,3 +110,90 @@ class TestLxdIntegratorProvider:
             gateway_name="integration-test-gateway-integrator",
             sandbox_name="integration-test-sandbox-integrator",
         )
+
+
+class TestLxdProjectPlacement:
+    """The LXD project comes from the integrator, not from gateway config.
+
+    Both halves of the matrix are covered: the integrator naming no project, so
+    the driver falls back to LXD's ``default``, and the integrator naming an
+    isolated project, which is what a production deployment does.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ensure_provider_related(self, juju: jubilant.Juju) -> None:
+        """Guarantee a related integrator and a running stack before each test.
+
+        The trust-lifecycle class before this one ends with the ``lxd``
+        relation removed and the gateway blocked, and in CI nothing between
+        the two classes re-establishes the relation. Each test here declares
+        the state it needs instead of inheriting whatever ran before it; on an
+        already-converged stack the fixture is a fast no-op.
+        """
+        ensure_integrator_relation(juju)
+        _wait_for_gateway_stack(juju)
+
+    def test_default_project_when_the_integrator_names_none(
+        self,
+        juju: jubilant.Juju,
+    ) -> None:
+        """With no project configured the gateway reports none and stays active."""
+        juju.config(INTEGRATOR_APP, reset="project")
+        status = wait_for_lxd_project(juju, "")
+        assert status["workload-running"] == "True", status
+        assert status["readiness-gaps"] == "none", status
+
+    def test_project_from_the_integrator_reaches_the_gateway(
+        self,
+        juju: jubilant.Juju,
+        host_lxd_endpoint: HostLxdEndpoint,
+        it_project: str,
+    ) -> None:
+        """Configuring the integrator's project moves the gateway's driver into it."""
+        juju.config(INTEGRATOR_APP, {"project": IT_PROJECT})
+        status = wait_for_lxd_project(juju, IT_PROJECT)
+        assert status["workload-running"] == "True", status
+        assert status["readiness-gaps"] == "none", status
+
+        # LXD restricts the gateway's trust entry to the same project, so the
+        # isolation does not depend on the gateway behaving itself.
+        result = juju.run(f"{INTEGRATOR_APP}/0", "list-trusted-clients")
+        assert result.status == "completed", result.status
+        assert IT_PROJECT in json.dumps(result.results), result.results
+
+    def test_sandbox_lands_in_the_project_the_integrator_named(
+        self,
+        juju: jubilant.Juju,
+        gateway_url: str,
+        host_lxd_endpoint: HostLxdEndpoint,
+        requires_sandbox_e2e: None,
+        openshell_available: None,
+        it_project: str,
+    ) -> None:
+        """Gated: a sandbox created through the gateway appears in IT_PROJECT."""
+        juju.config(INTEGRATOR_APP, {"project": IT_PROJECT})
+        wait_for_lxd_project(juju, IT_PROJECT)
+
+        creds = prepare_openshell_client(juju, gateway_url)
+        sandbox_name = "integration-test-sandbox-project"
+        observed: dict[str, str] = {}
+
+        def _capture() -> None:
+            observed.update(lxc_instance_projects(host_lxd_endpoint.host_runner, sandbox_name))
+
+        _run_gated_sandbox_e2e(
+            gateway_url=creds["gateway_url"],
+            issuer_url=creds["issuer_url"],
+            client_id=creds["client_id"],
+            client_secret=creds["client_secret"],
+            audience=creds["audience"],
+            gateway_name="integration-test-gateway-project",
+            sandbox_name=sandbox_name,
+            while_running=_capture,
+        )
+
+        assert observed, (
+            f"no LXD instance named {sandbox_name}* was found in any project while "
+            "the sandbox was running"
+        )
+        assert set(observed.values()) == {IT_PROJECT}, observed

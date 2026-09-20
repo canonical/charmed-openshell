@@ -40,6 +40,10 @@ _FAKE_LXD_IDENTITY = {
     "certificate": "-----BEGIN CERTIFICATE-----\nLXDCERT\n-----END CERTIFICATE-----",
     "private-key": "-----BEGIN PRIVATE KEY-----\nLXDKEY\n-----END PRIVATE KEY-----",
 }
+_FAKE_SANDBOX_IDENTITY = {
+    "certificate": "-----BEGIN CERTIFICATE-----\nSBXCERT\n-----END CERTIFICATE-----",
+    "private-key": "-----BEGIN PRIVATE KEY-----\nSBXKEY\n-----END PRIVATE KEY-----",
+}
 _LXD_CONN = _LxdConnection(
     url="https://10.0.0.1:8443",
     server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
@@ -178,6 +182,16 @@ class TestRestartAction:
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
             patch("ops.model.Container.restart") as restart_mock,
         ):
@@ -258,6 +272,16 @@ class TestRotateJwtSigningKey:
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
             out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
@@ -290,6 +314,16 @@ class TestRotateJwtSigningKey:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
@@ -350,6 +384,16 @@ class TestRotateJwtSigningKey:
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
             patch("ops.model.Container.restart") as restart_mock,
         ):
@@ -377,6 +421,16 @@ class TestRotateJwtSigningKey:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
             patch("ops.model.Container.restart") as restart_mock,

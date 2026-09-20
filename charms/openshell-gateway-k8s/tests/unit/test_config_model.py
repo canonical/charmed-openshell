@@ -13,8 +13,12 @@ from config_model import (
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
     LXD_SERVER_CA_PATH,
+    SANDBOX_TLS_CA_PATH,
+    SANDBOX_TLS_CERT_PATH,
+    SANDBOX_TLS_KEY_PATH,
     GatewayConfig,
     _parse_lxd_address,
+    _parse_lxd_project,
     append_sslmode,
     load_config,
     render_config_toml,
@@ -60,15 +64,16 @@ class TestConfigSurface:
 
     def test_lxd_config_defaults(self):
         cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
-        assert cfg.lxd_projects is None
         assert cfg.lxd_sandbox_image == "openshell-sandbox"
         assert cfg.lxd_operation_timeout_secs == 60
 
-    def test_lxd_projects_empty_string_normalised(self):
-        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "lxd-projects": ""})
-        assert cfg.lxd_projects is None
+    def test_no_lxd_projects_field(self):
+        # Which LXD projects the gateway may reach is the integrator's
+        # decision and arrives over the lxd-https relation. This charm must
+        # never grow a config option for it again.
+        assert "lxd_projects" not in GatewayConfig.model_fields
 
-    @pytest.mark.parametrize("field", ["lxd-projects", "lxd-sandbox-image"])
+    @pytest.mark.parametrize("field", ["lxd-sandbox-image"])
     def test_lxd_string_fields_reject_control_chars(self, field):
         base = {**BOTH_ROLES_MINIMAL}
         base[field] = "bad\nvalue"
@@ -487,7 +492,49 @@ class TestRenderDriverCommand:
             " --operation-timeout-secs 60"
             " --log-level info"
             " --gateway-endpoint https://openshell-gateway.my-model.svc.cluster.local:8443"
+            f" --guest-tls-ca {SANDBOX_TLS_CA_PATH}"
+            f" --guest-tls-cert {SANDBOX_TLS_CERT_PATH}"
+            f" --guest-tls-key {SANDBOX_TLS_KEY_PATH}"
         )
+
+    def test_project_is_rendered_when_the_provider_names_one(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://gw:8443",
+            server_ca=LXD_SERVER_CA_PATH,
+            project="openshell",
+        )
+        assert " --project openshell" in cmd
+
+    def test_project_is_absent_when_the_provider_names_none(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://gw:8443",
+            server_ca=LXD_SERVER_CA_PATH,
+        )
+        assert "--project" not in cmd
+
+    def test_sandbox_tls_material_is_always_passed(self):
+        # The driver refuses to start without it unless plaintext is allowed,
+        # and this charm never allows plaintext.
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            60,
+            "info",
+            "https://gw:8443",
+            server_fingerprint="abcdef",
+        )
+        assert f"--guest-tls-ca {SANDBOX_TLS_CA_PATH}" in cmd
+        assert f"--guest-tls-cert {SANDBOX_TLS_CERT_PATH}" in cmd
+        assert f"--guest-tls-key {SANDBOX_TLS_KEY_PATH}" in cmd
+        assert "--allow-plaintext-gateway" not in cmd
 
     def test_command_with_fingerprint(self):
         cmd = render_driver_command(
@@ -581,3 +628,29 @@ class TestParseLxdAddress:
     )
     def test_rejects_injection(self, raw):
         assert _parse_lxd_address(raw) is None
+
+
+class TestParseLxdProject:
+    @pytest.mark.parametrize("name", ["openshell", "a", "a" * 63, "proj-1_2.3", " padded "])
+    def test_accepts_lxd_project_names(self, name):
+        assert _parse_lxd_project(name) == name.strip()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            "   ",
+            "a" * 64,
+            "bad/project",
+            "has space",
+            "semi;colon",
+            "dollar$sign",
+            "back`tick`",
+            "new\nline",
+            "nul\x00byte",
+            "del\x7f",
+            "uni\u00e7ode",
+        ],
+    )
+    def test_rejects_unusable_names(self, name):
+        assert _parse_lxd_project(name) is None

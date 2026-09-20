@@ -44,6 +44,16 @@ LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
 LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
 LXD_SERVER_CA_PATH: str = f"{LXD_DIR}/server.crt"
 
+# Material every sandbox receives so its supervisor can reach the gateway
+# over TLS.  The CA is the gateway's own issuer, so a sandbox verifies the
+# certificate the gateway presents; the client certificate is a dedicated
+# identity that is deliberately *not* the LXD client identity, which is an
+# administrative credential and must never be copied into a sandbox.
+SANDBOX_TLS_DIR: str = "/etc/openshell/sandbox-tls"
+SANDBOX_TLS_CA_PATH: str = f"{SANDBOX_TLS_DIR}/ca.crt"
+SANDBOX_TLS_CERT_PATH: str = f"{SANDBOX_TLS_DIR}/client.crt"
+SANDBOX_TLS_KEY_PATH: str = f"{SANDBOX_TLS_DIR}/client.key"
+
 # Stable workload identity embedded in every minted JWT.  Must match the
 # openshell-server binary's expected default; cross-reference when
 # crates/openshell-server lands its config parser (FD-004).
@@ -79,7 +89,6 @@ class GatewayConfig(pydantic.BaseModel):
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
     gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
     jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
-    lxd_projects: str | None = Field(default=None, alias="lxd-projects")
     lxd_sandbox_image: str = Field(default="openshell-sandbox", alias="lxd-sandbox-image")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
@@ -87,9 +96,7 @@ class GatewayConfig(pydantic.BaseModel):
     # Field validators
     # ------------------------------------------------------------------
 
-    @field_validator(
-        "external_hostname", "oidc_admin_role", "oidc_user_role", "lxd_projects", mode="before"
-    )
+    @field_validator("external_hostname", "oidc_admin_role", "oidc_user_role", mode="before")
     @classmethod
     def _empty_string_to_none(cls, v: Any) -> Any:
         """Normalise Juju's empty-string representation of 'unset' to None.
@@ -109,7 +116,6 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_admin_role",
         "oidc_user_role",
         "gateway_id",
-        "lxd_projects",
         "lxd_sandbox_image",
         mode="after",
     )
@@ -341,6 +347,7 @@ def render_driver_command(
     gateway_endpoint: str,
     server_ca: str | None = None,
     server_fingerprint: str | None = None,
+    project: str | None = None,
 ) -> str:
     """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
 
@@ -353,6 +360,17 @@ def render_driver_command(
     ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
     flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
     (scheme + host + port) reachable by sandbox supervisors.
+
+    ``project`` is the LXD project the driver places every sandbox, image and
+    operation in.  It comes from the provider over the ``lxd-https`` relation,
+    never from charm config: which project a requirer may use is the LXD
+    administrator's decision, and the integrator holds it.  Left unset, the
+    driver falls back to its own default (the LXD ``default`` project).
+
+    The sandbox TLS material is always passed.  The driver refuses to start
+    without it unless plaintext is explicitly allowed, and this charm never
+    allows plaintext: a sandbox supervisor reaches the gateway over TLS or not
+    at all.
     """
     if (server_ca is None) == (server_fingerprint is None):
         raise ValueError("exactly one of server_ca or server_fingerprint must be set")
@@ -362,6 +380,7 @@ def render_driver_command(
         if server_ca is not None
         else f" --lxd-server-fingerprint {server_fingerprint}"
     )
+    project_arg = f" --project {project}" if project is not None else ""
 
     return (
         f"/usr/bin/openshell-driver-lxd"
@@ -370,10 +389,14 @@ def render_driver_command(
         f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
         f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
         f"{trust_arg}"
+        f"{project_arg}"
         f" --default-image {default_image}"
         f" --operation-timeout-secs {operation_timeout_secs}"
         f" --log-level {log_level}"
         f" --gateway-endpoint {gateway_endpoint}"
+        f" --guest-tls-ca {SANDBOX_TLS_CA_PATH}"
+        f" --guest-tls-cert {SANDBOX_TLS_CERT_PATH}"
+        f" --guest-tls-key {SANDBOX_TLS_KEY_PATH}"
     )
 
 
@@ -434,3 +457,32 @@ def _parse_lxd_address(raw: str) -> str | None:
         return None
 
     return f"{host_part}:{port}"
+
+
+# ---------------------------------------------------------------------------
+# LXD project sanitizer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def _parse_lxd_project(raw: str) -> str | None:
+    """Validate and return an LXD project name, or None.
+
+    The value arrives over the ``lxd-https`` relation from the integrator and
+    is interpolated into the driver's command line, so the accepted charset is
+    deliberately narrow: letters, digits, dot, hyphen and underscore, up to the
+    63 characters LXD allows. Anything else — whitespace, control characters,
+    shell or path metacharacters, an over-long name — is rejected rather than
+    sanitised, so a malformed value fails visibly instead of silently landing
+    the driver in the wrong project.
+    """
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+        return None
+
+    value = raw.strip()
+    if not 1 <= len(value) <= 63:
+        return None
+
+    if not all(c.isascii() and (c.isalnum() or c in "._-") for c in value):
+        return None
+
+    return value

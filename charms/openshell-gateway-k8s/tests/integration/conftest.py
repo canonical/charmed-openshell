@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives import serialization
 from .image_resolver import resolve_gateway_image
 from .lxd_host import (
     HostLxdEndpoint,
+    ensure_lxd_project,
     read_lxd_config,
     setup_host_lxd_endpoint,
     teardown_host_lxd_endpoint,
@@ -125,34 +126,79 @@ def charm_file() -> str:
 def integrator_charm_file() -> str:
     """Resolve a ``lxd-integrator-k8s`` .charm artifact the ``juju`` snap can read.
 
-    If ``INTEGRATOR_CHARM_FILE`` is set, use it (after copying to an accessible
-    path). Otherwise invoke ``charmcraft pack`` in ``charms/lxd-integrator-k8s``
-    and copy the resulting artifact.
+    The integrator charm lives in its own repository; it is not part of this
+    tree. Resolution order:
+
+    1. ``INTEGRATOR_CHARM_FILE`` — a prebuilt artifact. Use this to test against
+       an integrator branch that is not merged yet.
+    2. ``INTEGRATOR_CHARM_DIR`` — a local checkout to pack.
+    3. A shallow clone of ``INTEGRATOR_CHARM_REPO`` (default
+       ``canonical/lxd-integrator-k8s``) into the cache directory, then pack.
+
+    Every failure is loud. The integrator is not optional to these tests: a
+    skip here would quietly report a green run that never exercised the
+    provider path at all.
     """
     env_path = os.environ.get("INTEGRATOR_CHARM_FILE")
-    source = Path(env_path) if env_path else None
+    if env_path:
+        source = Path(env_path)
+        if not source.is_file():
+            pytest.fail(f"INTEGRATOR_CHARM_FILE={env_path} does not exist")
+        return str(_ensure_juju_readable(source))
 
-    if source is None:
-        if shutil.which("charmcraft") is None:
-            pytest.skip("INTEGRATOR_CHARM_FILE not set and 'charmcraft' not found")
-        integrator_dir = REPO_ROOT / "charms" / "lxd-integrator-k8s"
-        if not integrator_dir.exists():
-            pytest.skip("INTEGRATOR_CHARM_FILE not set and charms/lxd-integrator-k8s not found")
-        result = subprocess.run(
-            ["charmcraft", "pack"],
-            cwd=str(integrator_dir),
-            capture_output=True,
-            text=True,
+    if shutil.which("charmcraft") is None:
+        pytest.fail(
+            "Cannot obtain the lxd-integrator-k8s charm: 'charmcraft' is not on PATH. "
+            "Install charmcraft, or set INTEGRATOR_CHARM_FILE to a prebuilt .charm."
         )
-        if result.returncode != 0:
-            pytest.skip(f"charmcraft pack failed for lxd-integrator-k8s:\n{result.stderr}")
-        charms = sorted(integrator_dir.glob("*.charm"))
-        if not charms:
-            pytest.skip("charmcraft pack succeeded but no .charm file found")
-        source = charms[-1]
 
-    accessible = _ensure_juju_readable(source)
-    return str(accessible)
+    env_dir = os.environ.get("INTEGRATOR_CHARM_DIR")
+    if env_dir:
+        integrator_dir = Path(env_dir)
+        if not (integrator_dir / "charmcraft.yaml").is_file():
+            pytest.fail(f"INTEGRATOR_CHARM_DIR={env_dir} is not a charm source directory")
+    else:
+        integrator_dir = _clone_integrator()
+
+    result = _run("charmcraft", "pack", cwd=str(integrator_dir))
+    if result.returncode != 0:
+        pytest.fail(
+            f"charmcraft pack failed for lxd-integrator-k8s in {integrator_dir}:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+    charms = sorted(integrator_dir.glob("*.charm"))
+    if not charms:
+        pytest.fail(
+            f"charmcraft pack reported success in {integrator_dir} but produced no .charm file"
+        )
+
+    return str(_ensure_juju_readable(charms[-1]))
+
+
+def _clone_integrator() -> Path:
+    """Shallow-clone the integrator repository into the cache directory."""
+    repo = os.environ.get(
+        "INTEGRATOR_CHARM_REPO", "https://github.com/canonical/lxd-integrator-k8s.git"
+    )
+    branch = os.environ.get("INTEGRATOR_CHARM_REF", "main")
+    target = Path.home() / ".cache" / "openshell-gateway-integration" / "lxd-integrator-k8s"
+
+    if (target / "charmcraft.yaml").is_file():
+        logger.info("Reusing integrator checkout at %s", target)
+        return target
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(target, ignore_errors=True)
+    logger.info("Cloning %s (%s) into %s", repo, branch, target)
+    result = _run("git", "clone", "--depth", "1", "--branch", branch, repo, str(target))
+    if result.returncode != 0:
+        pytest.fail(
+            f"Failed to clone the lxd-integrator-k8s charm from {repo} ({branch}):\n"
+            f"{result.stderr}\n"
+            "Set INTEGRATOR_CHARM_FILE to a prebuilt .charm or INTEGRATOR_CHARM_DIR to a "
+            "local checkout if this host has no access to the repository."
+        )
+    return target
 
 
 @pytest.fixture(scope="module")
@@ -690,8 +736,14 @@ def deploy_integrator(
     host_lxd_endpoint: HostLxdEndpoint,
     app: str = INTEGRATOR_APP,
     charm_file: str | None = None,
+    project: str | None = None,
 ) -> str:
-    """Deploy ``lxd-integrator-k8s`` against the host LXD and return the secret URI."""
+    """Deploy ``lxd-integrator-k8s`` against the host LXD and return the secret URI.
+
+    *project* names the LXD project requirers are to operate in. Left None the
+    integrator publishes none and requirers fall back to LXD's ``default``
+    project, which is the other half of the placement matrix this suite covers.
+    """
     deploy_args = {"app": app}
     if charm_file is None:
         deploy_args["channel"] = "latest/edge"
@@ -702,13 +754,13 @@ def deploy_integrator(
         endpoint_netloc = host_lxd_endpoint.address.removeprefix("https://").removeprefix(
             "http://"
         )
-        juju.config(
-            app,
-            {
-                "lxd-credentials": str(secret_uri),
-                "lxd-endpoints": endpoint_netloc,
-            },
-        )
+        config: dict[str, Any] = {
+            "lxd-credentials": str(secret_uri),
+            "lxd-endpoints": endpoint_netloc,
+        }
+        if project is not None:
+            config["project"] = project
+        juju.config(app, config)
     except Exception:
         try:
             juju.cli("remove-secret", "lxd-credentials")
@@ -716,6 +768,112 @@ def deploy_integrator(
             logger.exception("failed to clean up lxd-credentials secret")
         raise
     return secret_uri
+
+
+def _has_integrator_relation(juju: jubilant.Juju) -> bool:
+    """Return True when the gateway is currently related to the integrator."""
+    status = juju.status()
+    app = status.apps.get(APP_NAME)
+    if app is None:
+        return False
+    return any(relation.related_app == INTEGRATOR_APP for relation in app.relations.get("lxd", []))
+
+
+def ensure_integrator_relation(juju: jubilant.Juju, timeout: int = 900) -> None:
+    """Guarantee an established ``lxd`` relation between gateway and integrator.
+
+    A no-op when the relation already exists. The trust-lifecycle tests
+    deliberately leave the relation removed and the gateway blocked, so any
+    test that needs an active stack declares that requirement through this
+    helper instead of assuming the module left the relation in place.
+    """
+    if _has_integrator_relation(juju):
+        return
+    juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
+    juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=timeout)
+
+
+# The LXD project the custom-project half of the placement matrix uses. The
+# driver reads placement from the project's ``default`` profile and never
+# creates the project itself, so the ``it_project`` fixture provisions it on
+# the host LXD before any test configures the integrator with it.
+IT_PROJECT = os.environ.get("OPENSHELL_TEST_LXD_PROJECT", "openshell-it")
+
+
+@pytest.fixture(scope="class")
+def it_project(host_lxd_endpoint: HostLxdEndpoint) -> str:
+    """Guarantee the custom LXD project exists on the host LXD, driver-ready.
+
+    The project, its ``default`` profile devices, and the sandbox image alias
+    are provisioned idempotently by :func:`ensure_lxd_project`. The project is
+    left in place afterwards: the gateway's driver keeps running in it for the
+    rest of the module, and a fresh run re-creates whatever it finds missing.
+    """
+    ensure_lxd_project(host_lxd_endpoint.host_runner, IT_PROJECT)
+    return IT_PROJECT
+
+
+def gateway_status(juju: jubilant.Juju) -> dict[str, str]:
+    """Return the results of the gateway's ``get-gateway-status`` action."""
+    result = juju.run(f"{APP_NAME}/0", "get-gateway-status")
+    if result.status != "completed":
+        pytest.fail(f"get-gateway-status did not complete: {result.status}")
+    return dict(result.results)
+
+
+def wait_for_lxd_project(juju: jubilant.Juju, expected: str, timeout: int = 300) -> dict[str, str]:
+    """Wait until the gateway reports *expected* as its LXD project.
+
+    An empty string means the provider named no project, so the driver uses
+    LXD's own default. Config changes reach the gateway through the provider's
+    databag, so this polls rather than assuming the next hook has already run.
+
+    A blocked gateway unit fails the wait immediately with its blocked
+    message: a blocked gateway cannot converge onto any project, and polling
+    toward the timeout buries the diagnosis. An *active* gateway with no
+    project published still reports ``lxd-project=''`` and the wait succeeds.
+    """
+    deadline = time.monotonic() + timeout
+    last: dict[str, str] = {}
+    while True:
+        last = gateway_status(juju)
+        app = juju.status().apps.get(APP_NAME)
+        if app is not None and app.app_status.current == "blocked":
+            pytest.fail(
+                f"gateway blocked while waiting for lxd-project={expected!r}: "
+                f"{app.app_status.message}"
+            )
+        if last.get("lxd-project", "") == expected:
+            return last
+        if time.monotonic() > deadline:
+            pytest.fail(
+                f"gateway still reports lxd-project={last.get('lxd-project')!r} "
+                f"after {timeout}s, expected {expected!r}"
+            )
+        time.sleep(5)
+
+
+def lxc_instance_projects(runner: Callable[..., Any], name_prefix: str) -> dict[str, str]:
+    """Return ``{instance name: project}`` for instances whose name starts with *name_prefix*.
+
+    Every project is searched, so a sandbox that landed in the wrong one is
+    visible rather than merely absent from the one that was expected.
+    """
+    result = runner("project", "list", "--format=json")
+    if result.returncode != 0:
+        pytest.fail(f"could not list LXD projects: {result.stderr}")
+    projects = [entry["name"] for entry in json.loads(result.stdout or "[]")]
+
+    found: dict[str, str] = {}
+    for project in projects:
+        listed = runner("list", "--project", project, "--format=json")
+        if listed.returncode != 0:
+            continue
+        for instance in json.loads(listed.stdout or "[]"):
+            name = instance.get("name", "")
+            if name.startswith(name_prefix):
+                found[name] = project
+    return found
 
 
 def _openshell_gateway_remove(name: str) -> None:
@@ -806,6 +964,7 @@ def _run_gated_sandbox_e2e(
     audience: str,
     gateway_name: str,
     sandbox_name: str,
+    while_running: Callable[[], None] | None = None,
 ) -> None:
     """Add a gateway, launch a sandbox, verify shell access, and clean up.
 
@@ -814,6 +973,9 @@ def _run_gated_sandbox_e2e(
     gateway, verifies the CLI reports "Status: Connected", creates the sandbox,
     waits for it to report running, execs a marker command to verify shell
     access, and cleans up in a ``finally`` block.
+
+    *while_running* is called once the sandbox reports running and before it is
+    torn down, for assertions that need to observe the live instance.
     """
     _openshell_gateway_remove(gateway_name)
     _openshell_gateway_add(
@@ -831,6 +993,8 @@ def _run_gated_sandbox_e2e(
     try:
         _openshell_sandbox_create(sandbox_name, gateway_name=gateway_name)
         _openshell_sandbox_wait_running(sandbox_name, gateway_name=gateway_name)
+        if while_running is not None:
+            while_running()
         marker = _unique_marker(sandbox_name)
         stdout = _openshell_sandbox_exec(sandbox_name, marker, gateway_name=gateway_name)
         assert marker in stdout, stdout

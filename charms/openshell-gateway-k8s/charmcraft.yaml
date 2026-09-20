@@ -73,6 +73,9 @@ requires:
   lxd:
     interface: lxd-https
     limit: 1
+    # The provider also names the LXD project sandboxes are created in. That
+    # is the LXD administrator's decision, so it arrives over this relation
+    # rather than through this charm's config.
 
 provides:
   send-ca-cert:
@@ -84,7 +87,10 @@ actions:
   get-lxd-client-cert:
     description: Return this application's LXD client certificate and the provider's fingerprint.
   get-gateway-status:
-    description: Report the current readiness and configuration state of the gateway.
+    description: >
+      Report the current readiness and configuration state of the gateway,
+      including the LXD project sandboxes are created in and the endpoint
+      sandbox supervisors are told to dial back on.
   restart:
     description: Request a rolling restart of the gateway workload across units.
   rotate-jwt-signing-key:
@@ -140,11 +146,6 @@ config:
       description: >
         Lifetime, in seconds, of tokens minted by the gateway for sandbox
         supervisor authentication. Must be a positive integer.
-    lxd-projects:
-      type: string
-      description: >
-        Comma-separated list of LXD projects to restrict the gateway to.
-        Leave unset to allow all projects.
     lxd-sandbox-image:
       type: string
       default: openshell-sandbox

@@ -42,6 +42,9 @@ from config_model import (
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
     LXD_SERVER_CA_PATH,
+    SANDBOX_TLS_CA_PATH,
+    SANDBOX_TLS_CERT_PATH,
+    SANDBOX_TLS_KEY_PATH,
 )
 
 RBAC_REQUIRED_MSG = "both oidc-admin-role and oidc-user-role must be set (RBAC required)"
@@ -72,12 +75,39 @@ _FAKE_LXD_IDENTITY = {
     "certificate": "-----BEGIN CERTIFICATE-----\nLXDCERT\n-----END CERTIFICATE-----",
     "private-key": "-----BEGIN PRIVATE KEY-----\nLXDKEY\n-----END PRIVATE KEY-----",
 }
+_FAKE_SANDBOX_IDENTITY = {
+    "certificate": "-----BEGIN CERTIFICATE-----\nSBXCERT\n-----END CERTIFICATE-----",
+    "private-key": "-----BEGIN PRIVATE KEY-----\nSBXKEY\n-----END PRIVATE KEY-----",
+}
 _LXD_URL = "https://10.0.0.1:8443"
 _LXD_CONN = _LxdConnection(
     url=_LXD_URL,
     server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
     fingerprint="ab:cd:ef",
 )
+
+
+class _Patches:
+    """Enter several patchers as one context manager.
+
+    The ready-patch tuple is addressed positionally all over this module, so a
+    new patch is grouped with the one it belongs beside rather than appended,
+    which would silently leave it out of every existing call site.
+    """
+
+    def __init__(self, *patchers):
+        self._patchers = patchers
+        self._entered: list = []
+
+    def __enter__(self):
+        self._entered = [patcher.__enter__() for patcher in self._patchers]
+        return self._entered
+
+    def __exit__(self, *exc_info):
+        for patcher in reversed(self._patchers):
+            patcher.__exit__(*exc_info)
+        self._entered = []
+        return False
 
 
 def _all_relations():
@@ -99,13 +129,39 @@ def _all_ready_patches():
         patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
         patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
         patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
-        patch.object(
-            OpenshellGatewayK8sCharm,
-            "_ensure_lxd_client_identity",
-            return_value=_FAKE_LXD_IDENTITY,
+        _Patches(
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
         ),
-        patch.object(
-            OpenshellGatewayK8sCharm, "_read_lxd_client_identity", return_value=_FAKE_LXD_IDENTITY
+        _Patches(
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
         ),
         patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
     )
@@ -245,6 +301,8 @@ class TestRelationDataResilience:
             "_read_jwt_keypair": _FAKE_JWT,
             "_ensure_lxd_client_identity": _FAKE_LXD_IDENTITY,
             "_read_lxd_client_identity": _FAKE_LXD_IDENTITY,
+            "_ensure_sandbox_client_identity": _FAKE_SANDBOX_IDENTITY,
+            "_read_sandbox_client_identity": _FAKE_SANDBOX_IDENTITY,
             "_lxd_connection": _LXD_CONN,
         }
         defaults.update(overrides)
@@ -521,6 +579,16 @@ class TestGatewayEndpoint:
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
             ctx.run(ctx.on.config_changed(), state)
@@ -651,6 +719,16 @@ class TestTeardown:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
@@ -880,6 +958,16 @@ class TestJwtRotationConvergence:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
@@ -1476,11 +1564,18 @@ class TestLxdDatabag:
         assert lxd_rel_out.local_unit_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
         assert "projects" not in lxd_rel_out.local_unit_data
 
-    def test_lxd_databag_publishes_projects_when_configured(self):
+    def test_lxd_databag_clears_a_legacy_projects_key(self):
+        # An older revision published a config-derived "projects" restriction.
+        # After upgrade the key is the integrator's to decide, so the charm
+        # removes what it used to own instead of leaving it to rot.
         ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
+        lxd_rel = Relation(
+            LXD_RELATION,
+            local_app_data={"projects": "default,project-a"},
+            local_unit_data={"projects": "default,project-a"},
+        )
         state = State(
-            config={**BOTH_ROLES, "lxd-projects": "default,project-a"},
+            config=BOTH_ROLES,
             leader=True,
             containers=[_CONN_CONTAINER],
             relations=[
@@ -1495,8 +1590,8 @@ class TestLxdDatabag:
         with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
-        assert lxd_rel_out.local_app_data["projects"] == "default,project-a"
-        assert lxd_rel_out.local_unit_data["projects"] == "default,project-a"
+        assert "projects" not in lxd_rel_out.local_app_data
+        assert "projects" not in lxd_rel_out.local_unit_data
 
     def test_lxd_databag_unit_data_published_when_not_leader(self):
         ctx = Context(OpenshellGatewayK8sCharm)
@@ -1545,6 +1640,16 @@ class TestLxdConnection:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
             ),
         ):
             ctx.run(ctx.on.action("get-lxd-client-cert"), state)
@@ -1688,6 +1793,16 @@ class TestLxdConnection:
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
             ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
         ):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
@@ -1757,6 +1872,167 @@ class TestLxdFilesAndLayer:
         assert "--log-level info" in cmd
         assert "--gateway-endpoint https://my-gateway.prod.svc.cluster.local:8443" in cmd
         assert "--lxd-socket" not in cmd
+
+    def test_sandbox_tls_files_written(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(LXD_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
+        sandbox_dir = fs / "etc" / "openshell" / "sandbox-tls"
+        assert (sandbox_dir / "ca.crt").read_text() == str(_FAKE_TLS_CERT.ca)
+        assert (sandbox_dir / "client.crt").read_text() == _FAKE_SANDBOX_IDENTITY["certificate"]
+        assert (sandbox_dir / "client.key").read_text() == _FAKE_SANDBOX_IDENTITY["private-key"]
+        mode_key = stat.S_IMODE(os.stat(sandbox_dir / "client.key").st_mode)
+        assert mode_key == 0o600, f"sandbox client.key mode {oct(mode_key)} != 0o600"
+
+    def test_lxd_client_identity_never_reaches_a_sandbox(self):
+        # The LXD client certificate is an administrative credential. It must
+        # stay in the gateway pod, never in the material copied into sandboxes.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(LXD_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
+        sandbox_dir = fs / "etc" / "openshell" / "sandbox-tls"
+        for name in ("client.crt", "client.key", "ca.crt"):
+            content = (sandbox_dir / name).read_text()
+            assert _FAKE_LXD_IDENTITY["certificate"] != content
+            assert _FAKE_LXD_IDENTITY["private-key"] != content
+
+    def test_driver_layer_passes_guest_tls_material(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(LXD_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+        assert f"--guest-tls-ca {SANDBOX_TLS_CA_PATH}" in cmd
+        assert f"--guest-tls-cert {SANDBOX_TLS_CERT_PATH}" in cmd
+        assert f"--guest-tls-key {SANDBOX_TLS_KEY_PATH}" in cmd
+        assert "--allow-plaintext-gateway" not in cmd
+
+    def test_driver_layer_uses_project_from_the_provider(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(
+            LXD_RELATION,
+            remote_app_data={
+                "certificate_fingerprint": "abc:def",
+                "addresses": "10.0.0.1:8443",
+                "project": "openshell",
+            },
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+        assert "--project openshell" in cmd
+
+    def test_driver_layer_omits_project_when_the_provider_names_none(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(
+            LXD_RELATION,
+            remote_app_data={
+                "certificate_fingerprint": "abc:def",
+                "addresses": "10.0.0.1:8443",
+            },
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+        assert "--project" not in cmd
+
+    def test_unusable_project_blocks_instead_of_falling_back(self):
+        # Silently dropping the project would place sandboxes in LXD's
+        # "default" project, outside the isolation the operator asked for.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        lxd_rel = Relation(
+            LXD_RELATION,
+            remote_app_data={
+                "certificate_fingerprint": "abc:def",
+                "addresses": "10.0.0.1:8443",
+                "project": "bad/project",
+            },
+        )
+        state = State(
+            config=BOTH_ROLES,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                PeerRelation(PEER_RELATION),
+                lxd_rel,
+            ],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "lxd connection details" in out.unit_status.message
 
     def test_driver_layer_uses_fingerprint_when_ca_omitted(self):
         ctx = Context(OpenshellGatewayK8sCharm)
@@ -1960,11 +2236,49 @@ class TestLxdReadinessGaps:
             patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
             patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
             patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
             patch.object(OpenshellGatewayK8sCharm, "_read_lxd_client_identity", return_value=None),
         ):
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert isinstance(out.unit_status, WaitingStatus)
         assert "lxd client identity" in out.unit_status.message
+
+    def test_gap_waiting_no_sandbox_identity(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = State(
+            config=BOTH_ROLES,
+            containers=[_CONN_CONTAINER],
+            relations=[
+                Relation("database"),
+                Relation("certificates"),
+                Relation("oauth"),
+                Relation(LXD_RELATION),
+            ],
+        )
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[7],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm, "_read_sandbox_client_identity", return_value=None
+            ),
+        ):
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, WaitingStatus)
+        assert "sandbox client identity" in out.unit_status.message
 
     def test_lxd_gap_waiting_empty_databag(self):
         ctx = Context(OpenshellGatewayK8sCharm)
@@ -2054,6 +2368,55 @@ class TestLxdHash:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=rotated_identity,
+            ),
+            p[6],
+            p[7],
+            patch("ops.model.Container.restart") as restart_mock,
+        ):
+            out2 = ctx.run(ctx.on.config_changed(), out1)
+
+        restart_mock.assert_called_once_with(SERVICE_NAME, DRIVER_SERVICE_NAME)
+        peer_rel2 = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
+        assert peer_rel2.local_unit_data[APPLIED_HASH_KEY] != hash_before
+
+    def test_hash_changes_on_sandbox_identity_rotation(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = self._ready_state_with_lxd()
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
+        hash_before = peer_rel1.local_unit_data[APPLIED_HASH_KEY]
+
+        rotated = {
+            "certificate": "-----BEGIN CERTIFICATE-----\nSBXROT\n-----END CERTIFICATE-----",
+            "private-key": "-----BEGIN PRIVATE KEY-----\nSBXROT\n-----END PRIVATE KEY-----",
+        }
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=rotated,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=rotated,
             ),
             p[7],
             patch("ops.model.Container.restart") as restart_mock,
@@ -2206,6 +2569,16 @@ class TestLxdAction:
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_sandbox_client_identity",
+                return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
         ):
