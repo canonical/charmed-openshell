@@ -10,7 +10,6 @@ until the upstream ``--gateway-endpoint`` driver flag lands.
 
 from __future__ import annotations
 
-import json
 import logging
 
 import jubilant
@@ -28,7 +27,9 @@ from .conftest import (
     assert_trust_withdrawn,
     deploy_integrator,
     ensure_integrator_relation,
+    gateway_client_cert_fingerprint,
     lxc_instance_projects,
+    lxc_trust_entry,
     lxc_trust_fingerprints,
     prepare_openshell_client,
     wait_for_lxd_project,
@@ -156,10 +157,19 @@ class TestLxdProjectPlacement:
         assert status["readiness-gaps"] == "none", status
 
         # LXD restricts the gateway's trust entry to the same project, so the
-        # isolation does not depend on the gateway behaving itself.
+        # isolation does not depend on the gateway behaving itself. Asserted
+        # against LXD, because what LXD enforces is the thing that matters.
+        fingerprint = gateway_client_cert_fingerprint(juju)
+        entry = lxc_trust_entry(host_lxd_endpoint.host_runner, fingerprint)
+        assert entry, f"the gateway's certificate {fingerprint} is not in the trust store"
+        assert entry.get("restricted") is True, entry
+        assert entry.get("projects") == [IT_PROJECT], entry
+
+        # The integrator reports the same thing, so an operator can see it
+        # without reaching for the LXD CLI.
         result = juju.run(f"{INTEGRATOR_APP}/0", "list-trusted-clients")
         assert result.status == "completed", result.status
-        assert IT_PROJECT in json.dumps(result.results), result.results
+        assert IT_PROJECT in str(result.results), result.results
 
     def test_sandbox_lands_in_the_project_the_integrator_named(
         self,

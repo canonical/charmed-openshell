@@ -28,6 +28,21 @@ from pydantic_core import PydanticCustomError
 BIND_ADDRESS: str = "0.0.0.0"  # noqa: S104 — intentional; see comment above
 
 GATEWAY_PORT: str = "8443"  # TLS-only listen port
+
+# Default port for the workload's Prometheus endpoint. The gateway defaults
+# it to 0 (disabled); this charm turns it on because an operator who relates
+# a collector expects metrics, and a port nothing scrapes costs nothing.
+# The listener is plain HTTP and unauthenticated, so it is deliberately never
+# routed through ingress; see the metrics-port description in charmcraft.yaml
+# and the observability section of the README.
+DEFAULT_METRICS_PORT: int = 9090
+METRICS_DISABLED: int = 0
+
+# Image every sandbox is created from unless the request names another.
+# openshell-driver-lxd resolves --default-image as an OCI reference and
+# pulls it, so a bare LXD image alias (what this used to default to) fails
+# on the first create. This mirrors the driver's own default.
+DEFAULT_SANDBOX_IMAGE: str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 DRIVERS: str = "lxd"
 # Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"
@@ -43,6 +58,13 @@ LXD_DIR: str = "/etc/openshell/lxd"
 LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
 LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
 LXD_SERVER_CA_PATH: str = f"{LXD_DIR}/server.crt"
+
+# The image's own CA bundle, and the charm's pristine copy of it.
+# The charm adds its CA to the system bundle so the workload trusts the
+# issuer whichever way it resolves roots, and keeps the untouched original
+# beside it so that rewrite is idempotent rather than cumulative.
+SYSTEM_CA_BUNDLE_PATH: str = "/etc/ssl/certs/ca-certificates.crt"
+PRISTINE_CA_BUNDLE_PATH: str = f"{TLS_DIR}/system-ca.crt"
 
 # Material every sandbox receives so its supervisor can reach the gateway
 # over TLS.  The CA is the gateway's own issuer, so a sandbox verifies the
@@ -89,7 +111,8 @@ class GatewayConfig(pydantic.BaseModel):
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
     gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
     jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
-    lxd_sandbox_image: str = Field(default="openshell-sandbox", alias="lxd-sandbox-image")
+    metrics_port: int = Field(default=DEFAULT_METRICS_PORT, alias="metrics-port")
+    lxd_sandbox_image: str = Field(default=DEFAULT_SANDBOX_IMAGE, alias="lxd-sandbox-image")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
@@ -134,6 +157,31 @@ class GatewayConfig(pydantic.BaseModel):
             raise PydanticCustomError(
                 "control_characters",
                 "config value must not contain C0 control characters or DEL",
+            )
+        return v
+
+    @field_validator("metrics_port", mode="after")
+    @classmethod
+    def _metrics_port_usable(cls, v: int) -> int:
+        """Reject a metrics port the workload would refuse or that clashes.
+
+        ``0`` disables the listener, which the workload supports. Anything else
+        must be a real port, must not collide with the gateway's own TLS
+        listener, and must be unprivileged: the workload runs as a non-root
+        user and cannot bind below 1024.
+        """
+        if v == METRICS_DISABLED:
+            return v
+        if not 1024 <= v <= 65535:
+            raise PydanticCustomError(
+                "metrics_port_range",
+                "metrics-port must be 0 (disabled) or between 1024 and 65535",
+            )
+        if v == int(GATEWAY_PORT):
+            raise PydanticCustomError(
+                "metrics_port_conflict",
+                "metrics-port must differ from the gateway port ({port})",
+                {"port": GATEWAY_PORT},
             )
         return v
 
@@ -299,6 +347,10 @@ def render_env(cfg: GatewayConfig) -> dict[str, str]:
         "OPENSHELL_OIDC_ADMIN_ROLE": cfg.oidc_admin_role,
         "OPENSHELL_OIDC_USER_ROLE": cfg.oidc_user_role,
         "OPENSHELL_LOG_LEVEL": cfg.log_level,
+        # Always emitted, including the disabling "0", so turning metrics
+        # off changes the layer and actually restarts the workload rather
+        # than leaving the previous listener up.
+        "OPENSHELL_METRICS_PORT": str(cfg.metrics_port),
     }
     # Optional: only emitted when set
     if cfg.external_hostname is not None:

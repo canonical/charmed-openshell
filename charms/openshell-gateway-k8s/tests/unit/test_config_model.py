@@ -7,12 +7,15 @@ from pydantic import ValidationError
 
 from config_model import (
     BIND_ADDRESS,
+    DEFAULT_METRICS_PORT,
+    DEFAULT_SANDBOX_IMAGE,
     DRIVER_SOCKET,
     GATEWAY_ID,
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
     LXD_SERVER_CA_PATH,
+    METRICS_DISABLED,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
@@ -64,7 +67,10 @@ class TestConfigSurface:
 
     def test_lxd_config_defaults(self):
         cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
-        assert cfg.lxd_sandbox_image == "openshell-sandbox"
+        assert cfg.lxd_sandbox_image == DEFAULT_SANDBOX_IMAGE
+        # The driver resolves this as an OCI reference, so a bare LXD
+        # image alias would fail on the first sandbox created.
+        assert "/" in cfg.lxd_sandbox_image
         assert cfg.lxd_operation_timeout_secs == 60
 
     def test_no_lxd_projects_field(self):
@@ -253,6 +259,7 @@ CONFIG_DERIVED_KEYS = {
     "OPENSHELL_OIDC_ADMIN_ROLE",
     "OPENSHELL_OIDC_USER_ROLE",
     "OPENSHELL_LOG_LEVEL",
+    "OPENSHELL_METRICS_PORT",
 }
 DEFERRED_KEYS = {"OPENSHELL_DB_URL", "OPENSHELL_TLS_CERT", "OPENSHELL_OIDC_ISSUER"}
 
@@ -654,3 +661,42 @@ class TestParseLxdProject:
     )
     def test_rejects_unusable_names(self, name):
         assert _parse_lxd_project(name) is None
+
+
+class TestMetricsPort:
+    def test_default_is_enabled(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.metrics_port == DEFAULT_METRICS_PORT
+
+    def test_zero_disables(self):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 0})
+        assert cfg.metrics_port == METRICS_DISABLED
+
+    @pytest.mark.parametrize("port", [1024, 9090, 65535])
+    def test_accepts_unprivileged_ports(self, port):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": port})
+        assert cfg.metrics_port == port
+
+    @pytest.mark.parametrize("port", [-1, 1, 80, 1023, 65536, 70000])
+    def test_rejects_unusable_ports(self, port):
+        model, error = load_config({**BOTH_ROLES_MINIMAL, "metrics-port": port})
+        assert model is None
+        assert error is not None
+        assert "metrics-port" in error
+
+    def test_rejects_the_gateway_port(self):
+        # The workload refuses to start when --port and --metrics-port match.
+        model, error = load_config({**BOTH_ROLES_MINIMAL, "metrics-port": int(GATEWAY_PORT)})
+        assert model is None
+        assert error is not None
+        assert "gateway port" in error
+
+    def test_env_carries_the_port(self):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 9464})
+        assert render_env(cfg)["OPENSHELL_METRICS_PORT"] == "9464"
+
+    def test_env_carries_the_disabling_zero(self):
+        # Emitted rather than omitted so turning metrics off changes the layer
+        # and actually restarts the workload.
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 0})
+        assert render_env(cfg)["OPENSHELL_METRICS_PORT"] == "0"

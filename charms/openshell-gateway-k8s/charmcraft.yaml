@@ -46,6 +46,10 @@ charm-libs:
     version: "1"
   - lib: traefik_k8s.traefik_route
     version: "0"
+  - lib: prometheus_k8s.prometheus_scrape
+    version: "0"
+  - lib: vault_k8s.vault_kv
+    version: "0"
 
 containers:
   gateway:
@@ -76,10 +80,18 @@ requires:
     # The provider also names the LXD project sandboxes are created in. That
     # is the LXD administrator's decision, so it arrives over this relation
     # rather than through this charm's config.
+  vault-kv:
+    interface: vault-kv
+    limit: 1
+    optional: true
+    # Optional by design. With no vault-kv relation the gateway's JWT signing
+    # keypair stays in the Juju application secret it has always lived in.
 
 provides:
   send-ca-cert:
     interface: certificate_transfer
+  metrics-endpoint:
+    interface: prometheus_scrape
 
 actions:
   get-oidc-client-config:
@@ -129,6 +141,18 @@ config:
       description: >
         OIDC role value that grants regular user access. Must be set together
         with oidc-admin-role (RBAC required by default).
+    metrics-port:
+      type: int
+      default: 9090
+      description: >
+        Port for the gateway's Prometheus metrics endpoint. Set to 0 to disable
+        the listener entirely. The endpoint is plain HTTP and unauthenticated:
+        the workload offers no TLS and no authentication for it. It is
+        therefore reachable only inside the pod network and is deliberately
+        never routed through ingress. This is a bounded exception to the
+        charm's "TLS is always enabled" posture, and it applies to this
+        endpoint alone. Use the collector's OTLP path instead if an
+        unauthenticated plain-HTTP listener at the pod level is unacceptable.
     log-level:
       type: string
       default: info
@@ -148,8 +172,13 @@ config:
         supervisor authentication. Must be a positive integer.
     lxd-sandbox-image:
       type: string
-      default: openshell-sandbox
-      description: Default image alias passed to the LXD driver as --default-image.
+      default: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      description: >
+        OCI image reference every sandbox is created from unless the request
+        names another one. Passed to the LXD driver as --default-image; the
+        driver pulls it and converts it into an LXD image on first use, so it
+        must be a registry reference and not an LXD image alias. The Kubernetes
+        node running the gateway needs to reach the registry it names.
     lxd-operation-timeout-secs:
       type: int
       default: 60

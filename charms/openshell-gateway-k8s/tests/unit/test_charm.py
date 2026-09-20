@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import json
 import os
 import stat
 from pathlib import Path
@@ -13,7 +15,17 @@ import yaml
 from charms.data_platform_libs.v0.data_interfaces import CachedSecret
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, ModelError, SecretNotFoundError, WaitingStatus
-from ops.testing import Container, Context, Model, PeerRelation, Relation, Secret, State
+from ops.testing import (
+    Container,
+    Context,
+    Model,
+    Mount,
+    PeerRelation,
+    Relation,
+    Secret,
+    State,
+    TCPPort,
+)
 
 import config_model
 from charm import (
@@ -27,6 +39,7 @@ from charm import (
     GATEWAY_CMD,
     LXD_INTERFACE_VERSION,
     LXD_RELATION,
+    METRICS_RELATION,
     PEER_RELATION,
     PEER_SECRET_ID_KEY,
     READINESS_CHECK_NAME,
@@ -37,6 +50,7 @@ from charm import (
     _LxdConnection,
 )
 from config_model import (
+    DEFAULT_SANDBOX_IMAGE,
     DRIVER_SOCKET,
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
@@ -1037,24 +1051,24 @@ class TestFilePermissions:
 
 
 class TestSecretAccessErrors:
-    """_read_jwt_keypair returns None rather than raising on any secret error."""
+    """The Juju-secret reader returns None rather than raising on any secret error."""
 
     def test_secret_not_found_returns_none(self):
-        """_read_jwt_keypair returns None (not raises) when the secret is absent."""
+        """Returns None (not raises) when the secret is absent."""
         import ops
 
         charm_mock = MagicMock()
         charm_mock.model.get_secret.side_effect = ops.SecretNotFoundError("not found")
-        result = OpenshellGatewayK8sCharm._read_jwt_keypair(charm_mock)
+        result = OpenshellGatewayK8sCharm._read_juju_jwt_keypair(charm_mock)
         assert result is None
 
     def test_model_error_returns_none(self):
-        """_read_jwt_keypair returns None (not raises) on ModelError (e.g. stale grant)."""
+        """Returns None (not raises) on ModelError (e.g. stale grant)."""
         import ops
 
         charm_mock = MagicMock()
         charm_mock.model.get_secret.side_effect = ops.ModelError("access denied")
-        result = OpenshellGatewayK8sCharm._read_jwt_keypair(charm_mock)
+        result = OpenshellGatewayK8sCharm._read_juju_jwt_keypair(charm_mock)
         assert result is None
 
 
@@ -1867,7 +1881,7 @@ class TestLxdFilesAndLayer:
         assert f"--lxd-client-key {LXD_CLIENT_KEY_PATH}" in cmd
         assert f"--lxd-server-fingerprint {_LXD_CONN.fingerprint}" in cmd
         assert "--lxd-server-ca" not in cmd
-        assert "--default-image openshell-sandbox" in cmd
+        assert f"--default-image {DEFAULT_SANDBOX_IMAGE}" in cmd
         assert "--operation-timeout-secs 60" in cmd
         assert "--log-level info" in cmd
         assert "--gateway-endpoint https://my-gateway.prod.svc.cluster.local:8443" in cmd
@@ -2585,3 +2599,185 @@ class TestLxdAction:
             ctx.run(ctx.on.action("get-lxd-client-cert"), state)
         assert ctx.action_results["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
         assert ctx.action_results["certificate-fingerprint"] == _LXD_CONN.fingerprint
+
+
+class TestMetricsEndpoint:
+    """The Prometheus scrape endpoint tracks the metrics-port config option."""
+
+    def _state(self, **config):
+        return State(
+            config={**BOTH_ROLES, **config},
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+
+    def test_provider_is_constructed_with_the_configured_port(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            state = self._state(**{"metrics-port": 9464})
+            with ctx(ctx.on.config_changed(), state) as manager:
+                manager.run()
+                charm = manager.charm
+        assert charm.metrics_endpoint is not None
+        jobs = charm.metrics_endpoint._jobs
+        assert len(jobs) == 1
+        assert jobs[0]["static_configs"] == [{"targets": ["*:9464"]}]
+        assert jobs[0]["metrics_path"] == "/metrics"
+
+    def test_provider_is_absent_when_metrics_are_disabled(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            state = self._state(**{"metrics-port": 0})
+            with ctx(ctx.on.config_changed(), state) as manager:
+                manager.run()
+                charm = manager.charm
+        assert charm.metrics_endpoint is None
+
+    def test_scrape_job_is_published_to_a_related_collector(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        metrics_rel = Relation(METRICS_RELATION, remote_app_name="opentelemetry-collector-k8s")
+        state = State(
+            config={**BOTH_ROLES, "metrics-port": 9464},
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION), metrics_rel],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.relation_joined(metrics_rel), state)
+        published = next(r for r in out.relations if r.endpoint == METRICS_RELATION)
+        jobs = json.loads(published.local_app_data["scrape_jobs"])
+        targets = [t for job in jobs for sc in job["static_configs"] for t in sc["targets"]]
+        assert targets == ["*:9464"]
+
+    def test_metrics_port_is_opened(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.config_changed(), self._state(**{"metrics-port": 9464}))
+        assert TCPPort(9464) in out.opened_ports
+
+    def test_metrics_port_is_closed_when_disabled(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out1 = ctx.run(ctx.on.config_changed(), self._state(**{"metrics-port": 9464}))
+        assert TCPPort(9464) in out1.opened_ports
+
+        disabled = dataclasses.replace(out1, config={**BOTH_ROLES, "metrics-port": 0})
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out2 = ctx.run(ctx.on.config_changed(), disabled)
+        assert TCPPort(9464) not in out2.opened_ports
+        # The gateway's own listener is untouched.
+        assert TCPPort(int(GATEWAY_PORT)) in out2.opened_ports
+
+    def test_env_carries_the_metrics_port(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(
+                ctx.on.pebble_ready(_CONN_CONTAINER), self._state(**{"metrics-port": 9464})
+            )
+        env = out.get_container(CONTAINER_NAME).plan.services[SERVICE_NAME].environment
+        assert env["OPENSHELL_METRICS_PORT"] == "9464"
+
+    def test_status_action_reports_metrics_state(self):
+        # ops surfaces one ActiveStatus, so another component's note can mask
+        # the metrics one. The action is the signal that always answers, and
+        # the integration test asserts on it for exactly that reason.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        metrics_rel = Relation(METRICS_RELATION, remote_app_name="opentelemetry-collector-k8s")
+        state = State(
+            config={**BOTH_ROLES, "metrics-port": 0},
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION), metrics_rel],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            ctx.run(ctx.on.action("get-gateway-status"), state)
+        assert ctx.action_results["metrics-port"] == "0"
+        assert ctx.action_results["metrics-endpoint-related"] == "True"
+
+    def test_status_action_reports_metrics_enabled(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            ctx.run(ctx.on.action("get-gateway-status"), self._state(**{"metrics-port": 9464}))
+        assert ctx.action_results["metrics-port"] == "9464"
+        assert ctx.action_results["metrics-endpoint-related"] == "False"
+
+    def test_related_collector_with_metrics_off_is_called_out(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        metrics_rel = Relation(METRICS_RELATION, remote_app_name="opentelemetry-collector-k8s")
+        state = State(
+            config={**BOTH_ROLES, "metrics-port": 0},
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION), metrics_rel],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert isinstance(out.unit_status, ActiveStatus)
+        assert "metrics-port is 0" in out.unit_status.message
+
+
+class TestSystemCaBundle:
+    """The charm's CA is added to the image's bundle without displacing it."""
+
+    _PUBLIC_ROOTS = (
+        "-----BEGIN CERTIFICATE-----\nROOTA\n-----END CERTIFICATE-----\n"
+        "-----BEGIN CERTIFICATE-----\nROOTB\n-----END CERTIFICATE-----\n"
+    )
+
+    def _state(self, container):
+        return State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[container],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+
+    def test_public_roots_survive_the_charm_ca(self, tmp_path):
+        # Running update-ca-certificates against the gateway rock replaces the
+        # public roots with the charm CA alone, and the driver then cannot pull
+        # a sandbox image from any public registry.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = Container(
+            CONTAINER_NAME,
+            can_connect=True,
+            mounts={"ssl": Mount(location="/etc/ssl/certs", source=tmp_path)},
+        )
+        (tmp_path / "ca-certificates.crt").write_text(self._PUBLIC_ROOTS)
+
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out = ctx.run(ctx.on.pebble_ready(container), self._state(container))
+
+        bundle = (tmp_path / "ca-certificates.crt").read_text()
+        assert "ROOTA" in bundle
+        assert "ROOTB" in bundle
+        assert str(_FAKE_TLS_CERT.ca) in bundle
+        assert out.unit_status is not None
+
+    def test_repeated_reconciles_do_not_accumulate(self, tmp_path):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = Container(
+            CONTAINER_NAME,
+            can_connect=True,
+            mounts={"ssl": Mount(location="/etc/ssl/certs", source=tmp_path)},
+        )
+        (tmp_path / "ca-certificates.crt").write_text(self._PUBLIC_ROOTS)
+
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            out1 = ctx.run(ctx.on.pebble_ready(container), self._state(container))
+            ctx.run(ctx.on.config_changed(), out1)
+
+        bundle = (tmp_path / "ca-certificates.crt").read_text()
+        assert bundle.count(str(_FAKE_TLS_CERT.ca).strip().splitlines()[1]) == 1
+        assert bundle.count("ROOTA") == 1

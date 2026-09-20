@@ -32,6 +32,7 @@ from .lxd_host import (
     setup_host_lxd_endpoint,
     teardown_host_lxd_endpoint,
 )
+from .sandbox_state import sandbox_is_running as _sandbox_is_running
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +297,45 @@ def _fail_on_app_error(
         return False
 
     return _error
+
+
+def kubectl_try(*args: str) -> subprocess.CompletedProcess:
+    """Run ``kubectl`` and return the completed process without failing.
+
+    For polling loops, where a command that has not succeeded *yet* must not
+    end the test. ``kubectl()`` calls ``pytest.fail``, which raises a
+    ``BaseException`` that a plain ``except Exception`` does not catch — a
+    retry loop built around it never retries.
+    """
+    for prefix in (["kubectl"], ["microk8s", "kubectl"]):
+        if shutil.which(prefix[0]) is None:
+            continue
+        return _run(*prefix, *args)
+    pytest.fail("no kubectl binary found on PATH")
+
+
+def kubectl(*args: str, allowed_returncodes: tuple[int, ...] = (0,)) -> str:
+    """Run ``kubectl`` (or ``microk8s kubectl``) and return stdout.
+
+    Fails the test rather than returning an empty string: a silent empty
+    result here reads as "the assertion passed with nothing in it".
+
+    *allowed_returncodes* widens what counts as success, for commands whose
+    exit code carries meaning rather than failure — ``vault status`` exits 2
+    when Vault is sealed, which is a state the caller wants to read, not an
+    error.
+    """
+    for prefix in (["kubectl"], ["microk8s", "kubectl"]):
+        if shutil.which(prefix[0]) is None:
+            continue
+        result = _run(*prefix, *args)
+        if result.returncode in allowed_returncodes:
+            return result.stdout
+        pytest.fail(
+            f"kubectl {' '.join(args)} failed ({result.returncode}):\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+    pytest.fail("no kubectl binary found on PATH")
 
 
 def _get_traefik_lb_address(juju: jubilant.Juju, timeout: int = 300) -> str:
@@ -853,6 +893,21 @@ def wait_for_lxd_project(juju: jubilant.Juju, expected: str, timeout: int = 300)
         time.sleep(5)
 
 
+def lxc_trust_entry(runner: Callable[..., Any], fingerprint: str) -> dict[str, Any]:
+    """Return the LXD trust-store entry for *fingerprint*, or an empty dict.
+
+    Read from LXD rather than from the integrator's action, because the point
+    of the restriction is what LXD enforces, not what the charm believes.
+    """
+    result = runner("config", "trust", "list", "--format=json")
+    if result.returncode != 0:
+        pytest.fail(f"could not list the LXD trust store: {result.stderr}")
+    for entry in json.loads(result.stdout or "[]"):
+        if entry.get("fingerprint", "").lower() == fingerprint.lower():
+            return entry
+    return {}
+
+
 def lxc_instance_projects(runner: Callable[..., Any], name_prefix: str) -> dict[str, str]:
     """Return ``{instance name: project}`` for instances whose name starts with *name_prefix*.
 
@@ -1001,34 +1056,6 @@ def _run_gated_sandbox_e2e(
     finally:
         _openshell_sandbox_delete(sandbox_name, gateway_name=gateway_name, check=False)
         _openshell_gateway_remove(gateway_name)
-
-
-def _sandbox_is_running(name: str, output: str) -> bool:
-    """Return True when *output* indicates that the named sandbox is running.
-
-    Prefer parsing the JSON list returned by ``openshell sandbox list``; fall
-    back to plain-text matching if JSON parsing fails or the format differs.
-    """
-    try:
-        data = json.loads(output)
-    except Exception:
-        normalized = output.lower()
-        return name in normalized and "running" in normalized
-
-    if isinstance(data, dict):
-        entry = data.get(name)
-        if isinstance(entry, dict):
-            return entry.get("status", "").lower() == "running"
-        normalized = output.lower()
-        return name in normalized and "running" in normalized
-
-    if isinstance(data, list):
-        for entry in data:
-            if isinstance(entry, dict) and entry.get("name") == name:
-                return entry.get("status", "").lower() == "running"
-
-    normalized = output.lower()
-    return name in normalized and "running" in normalized
 
 
 def _openshell_gateway_add(

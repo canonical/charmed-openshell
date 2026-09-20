@@ -5,6 +5,8 @@ pythonpath = ["src", "lib"]
 markers = [
     "integrator: tests for the lxd-integrator-k8s provider path",
     "offer: tests for the cross-model lxd charm offer provider path",
+    "observability: tests for the opentelemetry-collector-k8s metrics path",
+    "vault: tests for the vault-k8s credentials store",
 ]
 
 [tool.coverage.run]

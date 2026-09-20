@@ -21,6 +21,7 @@ from charms.certificate_transfer_interface.v1.certificate_transfer import (
 )
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.hydra.v0.oauth import ClientConfig, OAuthRequirer
+from charms.prometheus_k8s.v0.prometheus_scrape import MetricsEndpointProvider
 from charms.tls_certificates_interface.v4.tls_certificates import (
     CertificateRequestAttributes,
     TLSCertificatesRequiresV4,
@@ -45,9 +46,12 @@ from config_model import (
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
     LXD_SERVER_CA_PATH,
+    METRICS_DISABLED,
+    PRISTINE_CA_BUNDLE_PATH,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
+    SYSTEM_CA_BUNDLE_PATH,
     TLS_DIR,
     GatewayConfig,
     _parse_lxd_address,
@@ -58,6 +62,7 @@ from config_model import (
     render_env,
 )
 from ingress import GatewayIngress
+from vault_store import VaultJwtStore, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,8 @@ PEER_SANDBOX_SECRET_LABEL = "sandbox-client-identity"
 PEER_SANDBOX_SECRET_ID_KEY = "sandbox-secret-id"
 LXD_INTERFACE_VERSION = "1.0"
 LXD_RELATION = "lxd"
+METRICS_RELATION = "metrics-endpoint"
+VAULT_RELATION = "vault-kv"
 STATIC_REDIRECT_URI = "https://openshell.invalid/unused"
 DATABASE_NAME = "openshell"
 GATEWAY_CMD = "/usr/bin/openshell-gateway --config /etc/openshell/config.toml"
@@ -162,6 +169,24 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self.ca_transfer = CertificateTransferProvides(self, "send-ca-cert")
         self.ingress = GatewayIngress(self)
 
+        # Optional: with no vault-kv relation the JWT keypair stays in the
+        # Juju application secret it has always lived in.
+        self.vault = VaultJwtStore(self, VAULT_RELATION)
+
+        # Constructed only when the workload actually has a metrics listener.
+        # The library publishes a default job scraping port 80 when handed an
+        # empty job list, so "disabled" has to mean "no provider", not "a
+        # provider with nothing to say".
+        self.metrics_endpoint: MetricsEndpointProvider | None = None
+        metrics_port = self._metrics_port()
+        if metrics_port:
+            self.metrics_endpoint = MetricsEndpointProvider(
+                self,
+                relation_name=METRICS_RELATION,
+                jobs=[{"static_configs": [{"targets": [f"*:{metrics_port}"]}]}],
+                refresh_event=[self.on.config_changed],
+            )
+
         # Rolling restart coordination using the maintained charmlibs
         # implementation. The manager wires its own relation and lock events;
         # the action and upgrade-charm events request an async lock.
@@ -189,6 +214,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.oauth.on.oauth_info_removed,
             self.on[LXD_RELATION].relation_changed,
             self.on[LXD_RELATION].relation_joined,
+            self.vault.requires.on.ready,
+            self.vault.requires.on.gone_away,
         ):
             self.framework.observe(event, self._reconcile)
 
@@ -207,6 +234,34 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self.framework.observe(
             self.on.rotate_jwt_signing_key_action, self._on_rotate_jwt_signing_key
         )
+
+    def _metrics_port(self) -> int:
+        """Return the configured metrics port, or 0 when metrics are disabled.
+
+        Falls back to 0 when config failed validation: without a valid model
+        there is no port to trust, and a disabled listener is the safe read.
+        """
+        if self._model_cfg is None:
+            return METRICS_DISABLED
+        return self._model_cfg.metrics_port
+
+    def _sync_metrics_port(self) -> None:
+        """Open or close the metrics port to match config.
+
+        ``open_port``/``close_port`` are additive and subtractive on their own
+        port, so this leaves the gateway's 8443 (opened by the ingress
+        component) alone.
+        """
+        port = self._metrics_port()
+        if port:
+            self.unit.open_port("tcp", port)
+        for opened in self.unit.opened_ports():
+            if opened.protocol != "tcp" or opened.port is None:
+                continue
+            if opened.port == int(GATEWAY_PORT):
+                continue
+            if opened.port != port:
+                self.unit.close_port("tcp", opened.port)
 
     def _cert_request_attributes(self) -> CertificateRequestAttributes:
         sans_dns: list[str] = [
@@ -290,6 +345,25 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         return info.issuer_url if info else None
 
     def _read_jwt_keypair(self) -> dict | None:
+        """Read the JWT keypair from whichever store is authoritative.
+
+        Vault is authoritative whenever a ``vault-kv`` relation exists. A
+        relation that has joined but is not ready yet returns None rather than
+        falling back to the Juju secret: serving the old key while Vault is
+        about to take over would make the two stores disagree about which key
+        is current.
+        """
+        if self.vault.is_related():
+            if not self.vault.is_ready():
+                return None
+            try:
+                return self.vault.read()
+            except VaultUnavailableError:
+                logger.warning("vault-kv: could not read the JWT keypair", exc_info=True)
+                return None
+        return self._read_juju_jwt_keypair()
+
+    def _read_juju_jwt_keypair(self) -> dict | None:
         """Read the JWT keypair secret using the ID stored in peer relation data.
 
         Falls back to label-based lookup for forward compat.  Returns the
@@ -311,12 +385,52 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return None
 
     def _ensure_jwt_keypair(self) -> dict | None:
+        """Mint or read the JWT keypair from whichever store is authoritative."""
+        if self.vault.is_related():
+            if not self.vault.is_ready():
+                return None
+            return self._ensure_jwt_keypair_in_vault()
+        return self._ensure_juju_jwt_keypair()
+
+    def _ensure_jwt_keypair_in_vault(self) -> dict | None:
+        """Return the keypair Vault holds, seeding it on the first ready event.
+
+        Seeding prefers the keypair the charm already has in its Juju secret,
+        so relating Vault to a running gateway keeps the key that live sandbox
+        tokens were signed with. Only the leader seeds; other units wait for it
+        rather than racing to write a second keypair.
+        """
+        try:
+            existing = self.vault.read()
+        except VaultUnavailableError:
+            logger.warning("vault-kv: could not read the JWT keypair", exc_info=True)
+            return None
+
+        if existing is not None:
+            return existing
+
+        if not self.unit.is_leader():
+            return None
+
+        migrated = self._read_juju_jwt_keypair()
+        keypair = migrated if migrated is not None else _generate_jwt_keypair()
+        if migrated is not None:
+            logger.info("vault-kv: migrating the existing JWT keypair into Vault")
+
+        try:
+            self.vault.write(keypair)
+        except VaultUnavailableError:
+            logger.warning("vault-kv: could not seed the JWT keypair", exc_info=True)
+            return None
+        return keypair
+
+    def _ensure_juju_jwt_keypair(self) -> dict | None:
         """Mint (leader, first call) or read the JWT keypair from the peer secret.
 
         Stores the secret ID in peer relation app data so all units can reach it
-        via ``_read_jwt_keypair`` using the stable ID rather than a label lookup.
-        Only called from _reconcile (a regular event dispatch); status collection
-        uses _read_jwt_keypair instead to stay side-effect-free.
+        via ``_read_juju_jwt_keypair`` using the stable ID rather than a label
+        lookup. Only called from _reconcile (a regular event dispatch); status
+        collection uses _read_jwt_keypair instead to stay side-effect-free.
         """
         peer_rel = self.model.get_relation(PEER_RELATION)
         if peer_rel is None:
@@ -346,7 +460,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             if secret_id is not None:
                 peer_rel.data[self.app][PEER_SECRET_ID_KEY] = secret_id
 
-        return self._read_jwt_keypair()
+        return self._read_juju_jwt_keypair()
 
     def _read_lxd_client_identity(self) -> dict | None:
         """Read the LXD client identity secret using the ID stored in peer relation data.
@@ -614,7 +728,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         elif self._oauth_issuer() is None:
             gaps.append(_Gap("waiting for oauth provider info", "waiting"))
 
-        if self._read_jwt_keypair() is None:
+        if self.vault.is_related() and not self.vault.is_ready():
+            gaps.append(_Gap("waiting for vault-kv credentials", "waiting"))
+        elif self._read_jwt_keypair() is None:
             gaps.append(_Gap("waiting for JWT keypair", "waiting"))
 
         if self._read_sandbox_client_identity() is None:
@@ -820,17 +936,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         # Add the CA to the system trust store so the binary's OIDC discovery
         # client can verify the issuer's TLS certificate (e.g. Hydra behind a
         # self-signed Traefik).
-        container.push(
-            "/usr/local/share/ca-certificates/charm-ca.crt",
-            tls_ca_pem,
-            make_dirs=True,
-            permissions=0o644,
-        )
-        try:
-            proc = container.exec(["update-ca-certificates"], timeout=30)
-            proc.wait_output()
-        except Exception:
-            pass  # best-effort; OIDC discovery will fail if this does
+        self._install_ca_into_system_bundle(container, tls_ca_pem)
 
         # LXD mTLS material for the remote HTTPS driver.
         container.push(
@@ -859,10 +965,57 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         container.push(CONFIG_PATH, config_toml, make_dirs=True, permissions=0o600)
         return config_toml
 
+    def _install_ca_into_system_bundle(self, container: ops.Container, ca_pem: str) -> None:
+        """Append the charm's CA to the workload image's CA bundle.
+
+        Deliberately does not run ``update-ca-certificates``. That command
+        rebuilds the bundle from ``/etc/ca-certificates.conf``, and the gateway
+        rock ships the 121 public roots as a prebuilt bundle without that conf
+        file, so running it replaces every public root with the charm's single
+        CA. The driver then cannot pull the sandbox or supervisor image from
+        any public registry, and the failure surfaces much later as an opaque
+        x509 error from skopeo.
+
+        The image's original bundle is copied aside on first write and the
+        system bundle is rebuilt from that copy every time, so repeated
+        reconciles converge instead of appending the CA over and over.
+        """
+        try:
+            pristine = container.pull(PRISTINE_CA_BUNDLE_PATH).read()
+        except (ops.pebble.PathError, ops.pebble.APIError):
+            try:
+                pristine = container.pull(SYSTEM_CA_BUNDLE_PATH).read()
+            except (ops.pebble.PathError, ops.pebble.APIError):
+                logger.warning(
+                    "no CA bundle at %s; the workload image ships none",
+                    SYSTEM_CA_BUNDLE_PATH,
+                )
+                pristine = ""
+            container.push(PRISTINE_CA_BUNDLE_PATH, pristine, make_dirs=True, permissions=0o644)
+
+        bundle = pristine
+        if bundle and not bundle.endswith("\n"):
+            bundle += "\n"
+        if ca_pem not in pristine:
+            bundle += ca_pem
+            if not bundle.endswith("\n"):
+                bundle += "\n"
+
+        container.push(SYSTEM_CA_BUNDLE_PATH, bundle, make_dirs=True, permissions=0o644)
+
     def _reconcile(self, event: ops.EventBase) -> None:
         """Re-derive desired state from scratch and converge."""
         if self._config_error:
             return
+
+        # Independent of the workload: a port stays open or shut according to
+        # config even while the container is still coming up.
+        self._sync_metrics_port()
+
+        # A pod rescheduled onto another node changes egress subnet without a
+        # relation event, and Vault scopes the unit's role to that subnet.
+        if self.vault.is_related():
+            self.vault.request_credentials()
 
         container = self.unit.get_container(CONTAINER_NAME)
         if not container.can_connect():
@@ -1118,7 +1271,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         gaps = self._readiness_gaps()
         if not gaps:
-            event.add_status(ActiveStatus())
+            event.add_status(ActiveStatus(self._active_message()))
             return
 
         for gap in gaps:
@@ -1126,6 +1279,17 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 event.add_status(BlockedStatus(gap.message))
             else:
                 event.add_status(WaitingStatus(gap.message))
+
+    def _active_message(self) -> str:
+        """Return the note to carry alongside ActiveStatus, or an empty string.
+
+        A collector related to a gateway whose metrics listener is switched off
+        will never scrape anything. That is a misconfiguration worth saying out
+        loud, but not one that should take a working gateway out of service.
+        """
+        if self.model.get_relation(METRICS_RELATION) and not self._metrics_port():
+            return "metrics-endpoint is related but metrics-port is 0 (metrics disabled)"
+        return ""
 
     def _on_get_oidc_client_config(self, event: ops.ActionEvent) -> None:
         info = self.oauth.get_provider_info()
@@ -1184,6 +1348,17 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 # Operators need to see this: it has to be reachable from the
                 # sandbox network, which an in-cluster address rarely is.
                 "gateway-endpoint": self._gateway_endpoint(),
+                # Which store the signing key is served from, so an
+                # operator can confirm a Vault migration actually took.
+                "jwt-store": "vault" if self.vault.is_related() else "juju-secret",
+                # Reported as well as surfaced in status: ops shows only one
+                # ActiveStatus message, so another component's note (the
+                # ingress wildcard warning, say) can mask the metrics one.
+                # An operator needs a way to ask that always answers.
+                "metrics-port": str(self._metrics_port()),
+                "metrics-endpoint-related": str(
+                    self.model.get_relation(METRICS_RELATION) is not None
+                ),
             }
         )
 
@@ -1191,6 +1366,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         """Rotate the JWT signing keypair to a new revision of the peer secret."""
         if not self.unit.is_leader():
             event.fail("rotate-jwt-signing-key must run on the leader unit")
+            return
+
+        if self.vault.is_related():
+            self._rotate_jwt_in_vault(event)
             return
 
         peer_rel = self.model.get_relation(PEER_RELATION)
@@ -1222,7 +1401,23 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         new_material = _generate_jwt_keypair()
         secret.set_content(new_material)
         self._reconcile(event)
-        event.set_results({"kid": new_material["kid"]})
+        event.set_results({"kid": new_material["kid"], "store": "juju-secret"})
+
+    def _rotate_jwt_in_vault(self, event: ops.ActionEvent) -> None:
+        """Rotate the keypair Vault holds. Leader-only; checked by the caller."""
+        if not self.vault.is_ready():
+            event.fail("vault-kv relation is not ready yet; wait for the charm to become ready")
+            return
+
+        new_material = _generate_jwt_keypair()
+        try:
+            self.vault.write(new_material)
+        except VaultUnavailableError as exc:
+            event.fail(f"could not write the new signing key to Vault: {exc}")
+            return
+
+        self._reconcile(event)
+        event.set_results({"kid": new_material["kid"], "store": "vault"})
 
 
 if __name__ == "__main__":

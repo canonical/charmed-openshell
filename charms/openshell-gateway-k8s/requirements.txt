@@ -3,3 +3,11 @@ pydantic >= 2, < 3
 cryptography
 jsonschema
 charmlibs-rollingops >= 1.1, < 2
+# Required by lib/charms/prometheus_k8s/v0/prometheus_scrape.py (its PYDEPS).
+cosl >= 0.0.53
+# Required by src/vault_store.py to talk to Vault over the vault-kv relation.
+hvac >= 2, < 3
+# Declared by lib/charms/vault_k8s/v0/vault_kv.py in its PYDEPS. The library
+# imports interface_tester.schema_base at module scope, so it is a runtime
+# dependency of the charm despite the package's name.
+pytest-interface-tester
