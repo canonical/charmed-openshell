@@ -13,9 +13,11 @@ does not invalidate tokens that live sandboxes are still presenting.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -181,13 +183,15 @@ class VaultJwtStore(ops.Object):
         Raises ``VaultUnavailableError`` when Vault is ready but unreachable,
         so the caller can wait instead of treating an outage as an empty store.
         """
-        client, mount = self._connected_client()
-        try:
-            response = client.secrets.kv.v2.read_secret(path=JWT_SECRET_PATH, mount_point=mount)
-        except Exception as exc:  # hvac raises a family of errors
-            if _is_not_found(exc):
-                return None
-            raise VaultUnavailableError(f"could not read the JWT keypair: {exc}") from exc
+        with self._connected_client() as (client, mount):
+            try:
+                response = client.secrets.kv.v2.read_secret(
+                    path=JWT_SECRET_PATH, mount_point=mount
+                )
+            except Exception as exc:  # hvac raises a family of errors
+                if _is_not_found(exc):
+                    return None
+                raise VaultUnavailableError(f"could not read the JWT keypair: {exc}") from exc
 
         data = response.get("data", {}).get("data", {})
         if not all(data.get(key) for key in KEYPAIR_KEYS):
@@ -200,18 +204,19 @@ class VaultJwtStore(ops.Object):
         if missing:
             raise ValueError(f"keypair is missing {', '.join(missing)}")
 
-        client, mount = self._connected_client()
-        try:
-            client.secrets.kv.v2.create_or_update_secret(
-                path=JWT_SECRET_PATH,
-                secret={key: keypair[key] for key in KEYPAIR_KEYS},
-                mount_point=mount,
-            )
-        except Exception as exc:
-            raise VaultUnavailableError(f"could not write the JWT keypair: {exc}") from exc
+        with self._connected_client() as (client, mount):
+            try:
+                client.secrets.kv.v2.create_or_update_secret(
+                    path=JWT_SECRET_PATH,
+                    secret={key: keypair[key] for key in KEYPAIR_KEYS},
+                    mount_point=mount,
+                )
+            except Exception as exc:
+                raise VaultUnavailableError(f"could not write the JWT keypair: {exc}") from exc
 
-    def _connected_client(self) -> tuple[Any, str]:
-        """Return ``_client()``'s result, as ``VaultUnavailableError`` on failure.
+    @contextlib.contextmanager
+    def _connected_client(self) -> Iterator[tuple[Any, str]]:
+        """Yield ``_client()``'s result, as ``VaultUnavailableError`` on failure.
 
         Logging in reaches the network and can fail for reasons the charm must
         survive — Vault sealed, the AppRole's CIDR restriction not yet matching
@@ -219,25 +224,29 @@ class VaultJwtStore(ops.Object):
         turns any of those into an error state an operator has to resolve by
         hand, so they surface as this error and the charm waits.
         """
-        try:
-            return self._client()
-        except VaultUnavailableError:
-            raise
-        except Exception as exc:
-            raise VaultUnavailableError(f"could not reach Vault: {exc}") from exc
+        with tempfile.TemporaryDirectory(prefix="vault-ca-") as ca_dir:
+            try:
+                yield self._client(Path(ca_dir))
+            except VaultUnavailableError:
+                raise
+            except Exception as exc:
+                raise VaultUnavailableError(f"could not reach Vault: {exc}") from exc
 
-    def _client(self) -> tuple[Any, str]:
-        """Return an authenticated hvac client and the KV mount to use."""
+    def _client(self, ca_dir: Path) -> tuple[Any, str]:
+        """Return an authenticated hvac client and the KV mount to use.
+
+        ``ca_dir`` is a directory the caller removes afterwards: hvac verifies
+        against a CA file, so the relation's PEM has to exist on disk for the
+        duration of the call. The charm container has no persistent storage of
+        its own and adding one for this would change the pod spec for a value
+        that arrives fresh on every hook.
+        """
         connection = self._connection()
         if connection is None:
             raise VaultUnavailableError("vault-kv relation is not ready")
         url, ca, mount, role_id, role_secret_id = connection
 
-        # hvac verifies against a CA file, so the relation's PEM is written to
-        # a temporary file for the lifetime of the hook. The charm container
-        # has no persistent storage of its own and adding one for this would
-        # change the pod spec for a value that arrives fresh on every hook.
-        ca_file = Path(tempfile.mkdtemp(prefix="vault-ca-")) / "ca.pem"
+        ca_file = ca_dir / "ca.pem"
         ca_file.write_text(ca)
 
         import hvac  # imported lazily: only a Vault-related charm needs it

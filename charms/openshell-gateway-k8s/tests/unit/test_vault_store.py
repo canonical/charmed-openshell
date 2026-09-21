@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -115,10 +117,18 @@ class InvalidPathError(Exception):
 InvalidPathError.__name__ = "InvalidPath"
 
 
+def _connected(client: _FakeVaultClient):
+    """Return a stand-in for the ``_connected_client`` context manager."""
+
+    @contextlib.contextmanager
+    def _cm(_self):
+        yield (client, "mount")
+
+    return _cm
+
+
 def _patch_client(client: _FakeVaultClient):
-    return patch.object(
-        vault_store.VaultJwtStore, "_connected_client", return_value=(client, "mount")
-    )
+    return patch.object(vault_store.VaultJwtStore, "_connected_client", _connected(client))
 
 
 class TestStoreSelection:
@@ -395,9 +405,7 @@ class TestVaultStoreUnit:
         client = _FakeVaultClient(stored=_STORED, fail=True)
         store = object.__new__(vault_store.VaultJwtStore)
         with (
-            patch.object(
-                vault_store.VaultJwtStore, "_connected_client", return_value=(client, "mount")
-            ),
+            patch.object(vault_store.VaultJwtStore, "_connected_client", _connected(client)),
             pytest.raises(VaultUnavailableError),
         ):
             vault_store.VaultJwtStore.read(store)
@@ -415,8 +423,29 @@ class TestClientErrors:
                 side_effect=RuntimeError("source address unauthorized"),
             ),
             pytest.raises(VaultUnavailableError, match="could not reach Vault"),
+            vault_store.VaultJwtStore._connected_client(store),
         ):
-            vault_store.VaultJwtStore._connected_client(store)
+            pass
+
+    def test_the_ca_file_is_removed_when_the_call_is_done(self):
+        # The charm container is long-lived and Vault is consulted on every
+        # hook, so a temporary directory left behind is a leak that grows for
+        # as long as the unit runs.
+        store = object.__new__(vault_store.VaultJwtStore)
+        seen: list[Path] = []
+
+        def _record(_self, ca_dir: Path):
+            seen.append(ca_dir)
+            assert ca_dir.is_dir()
+            return (MagicMock(), "mount")
+
+        with (
+            patch.object(vault_store.VaultJwtStore, "_client", _record),
+            vault_store.VaultJwtStore._connected_client(store),
+        ):
+            pass
+
+        assert seen and not seen[0].exists()
 
     def test_egress_subnets_include_the_pod_interface(self):
         # On Kubernetes the binding's egress subnet is the service ClusterIP,
