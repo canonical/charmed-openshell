@@ -144,6 +144,12 @@ def _generate_jwt_keypair() -> dict[str, str]:
     return {"signing-key": signing_key_pem, "public-key": public_key_pem, "kid": kid}
 
 
+def _certificate_fingerprint(certificate_pem: str) -> str:
+    """Return a PEM certificate's lowercase SHA-256 fingerprint, as LXD spells it."""
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
+    return certificate.fingerprint(hashes.SHA256()).hex()
+
+
 @dataclass
 class _Gap:
     message: str
@@ -261,6 +267,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self.framework.observe(self.on.get_gateway_status_action, self._on_get_gateway_status)
         self.framework.observe(
             self.on.rotate_jwt_signing_key_action, self._on_rotate_jwt_signing_key
+        )
+        self.framework.observe(
+            self.on.rotate_sandbox_client_identity_action,
+            self._on_rotate_sandbox_client_identity,
         )
 
     def _metrics_port(self) -> int:
@@ -1740,6 +1750,60 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 ),
                 "sandbox-image": cfg.sandbox_image if cfg else "",
                 "supervisor-image": cfg.supervisor_image if cfg else "",
+            }
+        )
+
+    def _peer_secret(self, secret_id_key: str, label: str) -> ops.Secret | None:
+        """Return a peer-owned secret by the ID in peer app data, or by label."""
+        peer_rel = self.model.get_relation(PEER_RELATION)
+        if peer_rel is None:
+            return None
+        secret_id = peer_rel.data[self.app].get(secret_id_key)
+        if secret_id:
+            try:
+                return self.model.get_secret(id=secret_id)
+            except (ops.SecretNotFoundError, ops.ModelError):
+                pass
+        try:
+            return self.model.get_secret(label=label)
+        except (ops.SecretNotFoundError, ops.ModelError):
+            return None
+
+    def _on_rotate_sandbox_client_identity(self, event: ops.ActionEvent) -> None:
+        """Mint a new sandbox client CA and leaf, replacing the current pair.
+
+        Deliberately rotates the CA as well as the certificate it signs.
+        Rotating the leaf alone would leave the compromised one valid, because
+        the gateway trusts the issuer, not the leaf — which makes the action
+        useless for the reason anyone would run it.
+
+        The cost is that certificates held by running sandboxes stop being
+        accepted once the workload restarts with the new CA. Their supervisors
+        cannot reconnect and the sandboxes have to be recreated.
+        """
+        if not self.unit.is_leader():
+            event.fail("rotate-sandbox-client-identity must run on the leader unit")
+            return
+
+        secret = self._peer_secret(PEER_SANDBOX_SECRET_ID_KEY, PEER_SANDBOX_SECRET_LABEL)
+        if secret is None:
+            event.fail(
+                "sandbox client identity not initialised yet; wait for the charm to become ready"
+            )
+            return
+
+        new_material = self._generate_sandbox_client_identity()
+        secret.set_content(new_material)
+        self._reconcile(event)
+
+        event.set_results(
+            {
+                "ca-fingerprint": _certificate_fingerprint(new_material["ca-certificate"]),
+                "certificate-fingerprint": _certificate_fingerprint(new_material["certificate"]),
+                "note": (
+                    "running sandboxes keep the previous certificate and cannot reconnect "
+                    "once the workload restarts; recreate them"
+                ),
             }
         )
 

@@ -280,6 +280,11 @@ Its private key stays in the peer secret and never reaches the workload containe
 A secret from before this existed holds a self-signed leaf with no `ca-certificate`
 key; the leader re-issues it, and until it does no `client_ca_path` is rendered.
 
+`rotate-sandbox-client-identity` replaces both. Rotating the leaf alone would be
+pointless — the gateway trusts the issuer, so a leaked leaf stays valid until its CA
+goes with it — and rotating both means running sandboxes cannot reconnect after the
+workload restarts. The action says so in its results; there is no overlap window.
+
 ## Pull Request Guidelines
 
 Follow conventional commit style in PR titles:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from cryptography.hazmat.primitives import hashes
 from ops.testing import Container, Context, PeerRelation, Relation, Secret, State
 
 from charm import (
@@ -12,6 +13,8 @@ from charm import (
     DRIVER_SERVICE_NAME,
     LXD_RELATION,
     PEER_RELATION,
+    PEER_SANDBOX_SECRET_ID_KEY,
+    PEER_SANDBOX_SECRET_LABEL,
     PEER_SECRET_ID_KEY,
     RESTART_RELATION,
     SERVICE_NAME,
@@ -499,3 +502,84 @@ class TestGatewayStatusReportsWhatStatusCannotSay:
 
     def test_the_number_of_transferred_trust_anchors_is_reported(self):
         assert self._results()["received-ca-certificates"] == "0"
+
+
+class TestRotateSandboxClientIdentity:
+    """Rotating the sandbox identity has to rotate the CA, not just the leaf."""
+
+    def _state(self, *, leader=True, with_secret=True):
+        relations = [
+            Relation("database"),
+            Relation("certificates"),
+            Relation("oauth"),
+            Relation(LXD_RELATION),
+        ]
+        secrets = []
+        if with_secret:
+            secret = Secret(
+                tracked_content={
+                    "ca-certificate": "-----BEGIN CERTIFICATE-----\nOLDCA\n-----END CERTIFICATE-----",
+                    "ca-private-key": "-----BEGIN PRIVATE KEY-----\nOLDCAKEY\n-----END PRIVATE KEY-----",
+                    "certificate": "-----BEGIN CERTIFICATE-----\nOLDLEAF\n-----END CERTIFICATE-----",
+                    "private-key": "-----BEGIN PRIVATE KEY-----\nOLDLEAFKEY\n-----END PRIVATE KEY-----",
+                },
+                label=PEER_SANDBOX_SECRET_LABEL,
+                owner="app",
+            )
+            secrets.append(secret)
+            relations.append(
+                PeerRelation(PEER_RELATION, local_app_data={PEER_SANDBOX_SECRET_ID_KEY: secret.id})
+            )
+        else:
+            relations.append(PeerRelation(PEER_RELATION))
+        return State(
+            config=BOTH_ROLES,
+            leader=leader,
+            containers=[Container(CONTAINER_NAME, can_connect=True)],
+            relations=relations,
+            secrets=secrets,
+        )
+
+    def test_it_mints_a_new_ca_and_a_leaf_issued_by_it(self):
+        from cryptography import x509
+
+        ctx = Context(OpenshellGatewayK8sCharm)
+        out = ctx.run(ctx.on.action("rotate-sandbox-client-identity"), self._state())
+
+        content = out.get_secret(label=PEER_SANDBOX_SECRET_LABEL).latest_content
+        assert content is not None
+        assert "OLDCA" not in content["ca-certificate"]
+        assert "OLDLEAF" not in content["certificate"]
+
+        ca = x509.load_pem_x509_certificate(content["ca-certificate"].encode())
+        leaf = x509.load_pem_x509_certificate(content["certificate"].encode())
+        assert leaf.issuer == ca.subject
+
+        results = ctx.action_results
+        assert results is not None
+        assert results["ca-fingerprint"] == ca.fingerprint(hashes.SHA256()).hex()
+        assert results["certificate-fingerprint"] == leaf.fingerprint(hashes.SHA256()).hex()
+        # The disruption is the whole reason to say something here.
+        assert "recreate" in results["note"]
+
+    def test_a_follower_refuses(self):
+        import pytest
+        from ops._private.harness import ActionFailed
+
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with pytest.raises(ActionFailed, match="leader"):
+            ctx.run(
+                ctx.on.action("rotate-sandbox-client-identity"),
+                self._state(leader=False),
+            )
+
+    def test_it_refuses_before_the_identity_exists(self):
+        import pytest
+        from ops._private.harness import ActionFailed
+
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with pytest.raises(ActionFailed, match="not initialised"):
+            ctx.run(
+                ctx.on.action("rotate-sandbox-client-identity"),
+                self._state(with_secret=False),
+            )

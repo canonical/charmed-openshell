@@ -185,6 +185,12 @@ OIDC issuer is configured, and this charm always configures one, so certificates
 validated when presented and never demanded. The CLI presents none and authenticates
 with OIDC.
 
+``rotate-sandbox-client-identity`` mints a new CA and a new certificate signed by it.
+It rotates the CA on purpose: the gateway trusts the issuer rather than the
+certificate, so replacing the certificate alone would leave a leaked one valid.
+Running sandboxes keep the old certificate and cannot reconnect once the workload
+restarts, so recreate them after rotating.
+
 ### Sandbox network egress
 
 ``restrict-sandbox-egress`` (on by default) puts every sandbox NIC behind an LXD

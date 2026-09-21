@@ -128,6 +128,16 @@ actions:
     description: >
       Generate a new Ed25519 JWT signing keypair and publish it as a new
       revision of the gateway's shared signing-key secret. Leader unit only.
+  rotate-sandbox-client-identity:
+    description: >
+      Generate a new sandbox client CA and a new certificate signed by it,
+      replacing the pair every sandbox is given and the gateway verifies
+      against. The CA is rotated too, deliberately: the gateway trusts the
+      issuer rather than the certificate, so replacing the certificate alone
+      would leave a leaked one valid. Certificates held by running sandboxes
+      stop being accepted once the workload restarts, so their supervisors
+      cannot reconnect and those sandboxes have to be recreated. Leader unit
+      only.
 
 resources:
   gateway-image:
