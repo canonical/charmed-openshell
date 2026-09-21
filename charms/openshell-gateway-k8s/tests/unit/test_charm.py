@@ -97,6 +97,10 @@ _FAKE_SANDBOX_IDENTITY = {
     "private-key": "-----BEGIN PRIVATE KEY-----\nSBXKEY\n-----END PRIVATE KEY-----",
 }
 _LXD_URL = "https://10.0.0.1:8443"
+# Digests shaped the way the sanitizer requires: 64 hex characters.
+_APP_FP = "a" * 64
+_UNIT_FP = "b" * 64
+
 _LXD_CONN = _LxdConnection(
     url=_LXD_URL,
     server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
@@ -167,11 +171,6 @@ def _all_ready_patches():
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_ensure_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_sandbox_client_identity",
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(
@@ -1677,17 +1676,17 @@ class TestLxdConnection:
             app_data={
                 "version": "1.0",
                 "certificate": "APPCA",
-                "certificate_fingerprint": "app:fp",
+                "certificate_fingerprint": _APP_FP,
                 "addresses": "10.0.0.1:8443",
             },
             unit_data={
                 "certificate": "UNITCA",
-                "certificate_fingerprint": "unit:fp",
+                "certificate_fingerprint": _UNIT_FP,
                 "addresses": "10.0.0.2:8443",
             },
         )
         results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == "app:fp"
+        assert results["certificate-fingerprint"] == _APP_FP
 
     def test_lxd_connection_falls_back_to_unit_bag(self):
         rel = self._make_relation(
@@ -1695,12 +1694,39 @@ class TestLxdConnection:
             unit_data={
                 "version": "1.0",
                 "certificate": "UNITCA",
-                "certificate_fingerprint": "unit:fp",
+                "certificate_fingerprint": _UNIT_FP,
                 "addresses": "10.0.0.2:8443",
             },
         )
         results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == "unit:fp"
+        assert results["certificate-fingerprint"] == _UNIT_FP
+
+    def test_lxd_connection_rejects_an_unusable_fingerprint(self):
+        # The fingerprint is interpolated into the driver's command line, which
+        # Pebble splits on whitespace: a value carrying a space would otherwise
+        # become extra arguments to the driver.
+        for bad in (f"{_APP_FP} --sandbox-nesting", "ab", "z" * 64, f"{_APP_FP}x"):
+            rel = self._make_relation(
+                app_data={
+                    "version": "1.0",
+                    "certificate_fingerprint": bad,
+                    "addresses": "10.0.0.1:8443",
+                }
+            )
+            results = self._run_action(rel)
+            assert results["certificate-fingerprint"] == "", bad
+
+    def test_lxd_connection_normalises_a_colon_separated_fingerprint(self):
+        colons = ":".join("ab" for _ in range(32))
+        rel = self._make_relation(
+            app_data={
+                "version": "1.0",
+                "certificate_fingerprint": colons,
+                "addresses": "10.0.0.1:8443",
+            }
+        )
+        results = self._run_action(rel)
+        assert results["certificate-fingerprint"] == "ab" * 32
 
     def test_lxd_connection_none_when_incomplete(self):
         rel = self._make_relation(app_data={"certificate": "CA"})
@@ -1972,7 +1998,7 @@ class TestLxdFilesAndLayer:
         lxd_rel = Relation(
             LXD_RELATION,
             remote_app_data={
-                "certificate_fingerprint": "abc:def",
+                "certificate_fingerprint": "cd" * 32,
                 "addresses": "10.0.0.1:8443",
                 "project": "openshell",
             },
@@ -2000,7 +2026,7 @@ class TestLxdFilesAndLayer:
         lxd_rel = Relation(
             LXD_RELATION,
             remote_app_data={
-                "certificate_fingerprint": "abc:def",
+                "certificate_fingerprint": "cd" * 32,
                 "addresses": "10.0.0.1:8443",
             },
         )
@@ -2029,7 +2055,7 @@ class TestLxdFilesAndLayer:
         lxd_rel = Relation(
             LXD_RELATION,
             remote_app_data={
-                "certificate_fingerprint": "abc:def",
+                "certificate_fingerprint": "cd" * 32,
                 "addresses": "10.0.0.1:8443",
                 "project": "bad/project",
             },
@@ -2056,7 +2082,7 @@ class TestLxdFilesAndLayer:
         lxd_rel = Relation(
             LXD_RELATION,
             remote_app_data={
-                "certificate_fingerprint": "abc:def",
+                "certificate_fingerprint": "cd" * 32,
                 "addresses": "10.0.0.1:8443",
             },
         )

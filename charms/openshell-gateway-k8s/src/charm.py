@@ -58,6 +58,7 @@ from config_model import (
     TLS_DIR,
     GatewayConfig,
     _parse_lxd_address,
+    _parse_lxd_fingerprint,
     _parse_lxd_project,
     load_config,
     parse_insecure_registries,
@@ -644,11 +645,28 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         addresses_raw = data.get("addresses", "")
         server_ca = data.get("certificate", "")
-        fingerprint = data.get("certificate_fingerprint", "")
+        fingerprint_raw = data.get("certificate_fingerprint", "")
         project_raw = data.get("project", "")
 
-        if not addresses_raw or not (server_ca or fingerprint):
+        if not addresses_raw or not (server_ca or fingerprint_raw):
             return None
+
+        # The fingerprint is interpolated into the driver's command line, which
+        # Pebble splits on whitespace, so a value carrying a space would become
+        # extra arguments to the driver. An unusable one is a hard stop rather
+        # than something to drop: silently falling back to CA verification
+        # would change how the server is trusted without saying so.
+        fingerprint = ""
+        if fingerprint_raw:
+            parsed_fingerprint = _parse_lxd_fingerprint(fingerprint_raw)
+            if parsed_fingerprint is None:
+                logger.warning(
+                    "lxd: provider published an unusable certificate fingerprint %r; "
+                    "refusing to build a driver command line from it",
+                    fingerprint_raw,
+                )
+                return None
+            fingerprint = parsed_fingerprint
 
         # A published-but-unusable project is a hard stop, not something to
         # silently drop: falling back to LXD's "default" project would place

@@ -568,6 +568,28 @@ def _parse_lxd_project(raw: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# LXD server fingerprint sanitizer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def _parse_lxd_fingerprint(raw: str) -> str | None:
+    """Validate and return a lowercase SHA-256 hex fingerprint, or None.
+
+    The value arrives over the ``lxd-https`` relation and is interpolated into
+    the driver's command line, which Pebble splits on whitespace. A value
+    carrying a space therefore becomes extra arguments to the driver, so the
+    accepted form is exactly what a digest can be: 64 hex characters, with the
+    colons LXD's own output uses optionally present.
+    """
+    value = raw.strip().replace(":", "").lower()
+    if len(value) != 64:
+        return None
+    if not all(c in "0123456789abcdef" for c in value):
+        return None
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Registry policy renderer — pure, no ops imports
 # ---------------------------------------------------------------------------
 

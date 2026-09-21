@@ -22,6 +22,7 @@ from config_model import (
     SANDBOX_TLS_KEY_PATH,
     GatewayConfig,
     _parse_lxd_address,
+    _parse_lxd_fingerprint,
     _parse_lxd_project,
     append_sslmode,
     load_config,
@@ -772,3 +773,25 @@ class TestInsecureRegistries:
         assert 'location = "192.168.1.166:5000"' in rendered
         assert 'location = "reg.example"' in rendered
         assert rendered.count("insecure = true") == 2
+
+
+class TestParseLxdFingerprint:
+    """The value lands on a command line Pebble splits on whitespace."""
+
+    def test_accepts_a_bare_digest(self):
+        assert _parse_lxd_fingerprint("AB" * 32) == "ab" * 32
+
+    def test_accepts_colon_separated_and_surrounding_space(self):
+        colons = ":".join("ab" for _ in range(32))
+        assert _parse_lxd_fingerprint(f"  {colons}  ") == "ab" * 32
+
+    def test_rejects_anything_that_could_add_an_argument(self):
+        for bad in (
+            "",
+            "ab",
+            "z" * 64,
+            "ab" * 32 + "x",
+            "ab" * 32 + " --sandbox-nesting",
+            "--sandbox-nesting",
+        ):
+            assert _parse_lxd_fingerprint(bad) is None, bad
