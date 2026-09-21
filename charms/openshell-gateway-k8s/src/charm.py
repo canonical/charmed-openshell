@@ -50,6 +50,7 @@ from config_model import (
     LXD_SERVER_CA_PATH,
     METRICS_DISABLED,
     PRISTINE_CA_BUNDLE_PATH,
+    REGISTRIES_CONF_PATH,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
@@ -59,9 +60,11 @@ from config_model import (
     _parse_lxd_address,
     _parse_lxd_project,
     load_config,
+    parse_insecure_registries,
     render_config_toml,
     render_driver_command,
     render_env,
+    render_registries_conf,
 )
 from ingress import GatewayIngress
 from vault_store import VaultJwtStore, VaultUnavailableError
@@ -973,6 +976,20 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         )
         container.push(
             SANDBOX_TLS_KEY_PATH, sandbox_client_key_pem, make_dirs=True, permissions=0o600
+        )
+
+        # Registry policy for skopeo, which the driver shells out to for the
+        # sandbox and supervisor images. Written unconditionally so removing a
+        # host from config takes effect rather than lingering in the file.
+        container.push(
+            REGISTRIES_CONF_PATH,
+            render_registries_conf(
+                parse_insecure_registries(
+                    self._model_cfg.insecure_registries if self._model_cfg else None
+                )
+            ),
+            make_dirs=True,
+            permissions=0o644,
         )
 
         config_toml = self._render_config_toml(db_uri, issuer_url)

@@ -83,6 +83,10 @@ SANDBOX_TLS_CA_PATH: str = f"{SANDBOX_TLS_DIR}/ca.crt"
 SANDBOX_TLS_CERT_PATH: str = f"{SANDBOX_TLS_DIR}/client.crt"
 SANDBOX_TLS_KEY_PATH: str = f"{SANDBOX_TLS_DIR}/client.key"
 
+# skopeo, which the driver shells out to for every image pull, reads its
+# registry policy from this path.
+REGISTRIES_CONF_PATH: str = "/etc/containers/registries.conf"
+
 # Stable workload identity embedded in every minted JWT.  Must match the
 # openshell-server binary's expected default; cross-reference when
 # crates/openshell-server lands its config parser (FD-004).
@@ -121,13 +125,20 @@ class GatewayConfig(pydantic.BaseModel):
     metrics_port: int = Field(default=DEFAULT_METRICS_PORT, alias="metrics-port")
     lxd_sandbox_image: str = Field(default=DEFAULT_SANDBOX_IMAGE, alias="lxd-sandbox-image")
     supervisor_image: str = Field(default=DEFAULT_SUPERVISOR_IMAGE, alias="supervisor-image")
+    insecure_registries: str | None = Field(default=None, alias="insecure-registries")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
     # Field validators
     # ------------------------------------------------------------------
 
-    @field_validator("external_hostname", "oidc_admin_role", "oidc_user_role", mode="before")
+    @field_validator(
+        "external_hostname",
+        "oidc_admin_role",
+        "oidc_user_role",
+        "insecure_registries",
+        mode="before",
+    )
     @classmethod
     def _empty_string_to_none(cls, v: Any) -> Any:
         """Normalise Juju's empty-string representation of 'unset' to None.
@@ -149,6 +160,7 @@ class GatewayConfig(pydantic.BaseModel):
         "gateway_id",
         "lxd_sandbox_image",
         "supervisor_image",
+        "insecure_registries",
         mode="after",
     )
     @classmethod
@@ -553,3 +565,50 @@ def _parse_lxd_project(raw: str) -> str | None:
         return None
 
     return value
+
+
+# ---------------------------------------------------------------------------
+# Registry policy renderer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def parse_insecure_registries(raw: str | None) -> list[str]:
+    """Return the configured registry hosts, in order, without duplicates.
+
+    Each entry is a ``host`` or ``host:port`` that skopeo will be told to reach
+    over plain HTTP. Entries that could not be a registry location — whitespace,
+    a scheme, a path, shell metacharacters — are dropped rather than written
+    into a config file the workload parses.
+    """
+    if not raw:
+        return []
+
+    hosts: list[str] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value or "://" in value or "/" in value:
+            continue
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            continue
+        if not all(c.isascii() and (c.isalnum() or c in ".:_-[]") for c in value):
+            continue
+        if value not in hosts:
+            hosts.append(value)
+    return hosts
+
+
+def render_registries_conf(insecure_registries: list[str]) -> str:
+    """Return the contents of ``registries.conf`` for *insecure_registries*.
+
+    skopeo verifies TLS against every registry by default, which is right. This
+    exists for the deployments that pull the gateway's own companion images from
+    a local registry serving plain HTTP, where the alternative is no images at
+    all.
+    """
+    lines = [
+        "# Managed by openshell-gateway-k8s. Written from the",
+        "# insecure-registries config option; edits here are overwritten.",
+    ]
+    for host in insecure_registries:
+        lines += ["", "[[registry]]", f'location = "{host}"', "insecure = true"]
+    return "\n".join(lines) + "\n"

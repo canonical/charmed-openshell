@@ -183,6 +183,15 @@ config:
       description: >
         Lifetime, in seconds, of tokens minted by the gateway for sandbox
         supervisor authentication. Must be a positive integer.
+    insecure-registries:
+      type: string
+      description: >
+        Comma-separated list of registry hosts ("host" or "host:port") the
+        workload may pull images from over plain HTTP. skopeo verifies TLS
+        against every registry by default, which is right; this exists for
+        deployments that serve the gateway's companion images from a local
+        registry without a certificate, where the alternative is no images at
+        all. Prefer a registry with TLS the workload already trusts.
     supervisor-image:
       type: string
       default: ghcr.io/nvidia/openshell/supervisor:latest

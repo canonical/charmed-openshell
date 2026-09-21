@@ -25,9 +25,11 @@ from config_model import (
     _parse_lxd_project,
     append_sslmode,
     load_config,
+    parse_insecure_registries,
     render_config_toml,
     render_driver_command,
     render_env,
+    render_registries_conf,
 )
 
 # ---------------------------------------------------------------------------
@@ -733,3 +735,40 @@ class TestSupervisorImage:
         model, error = load_config({**BOTH_ROLES_MINIMAL, "supervisor-image": "bad\nvalue"})
         assert model is None
         assert error is not None
+
+
+class TestInsecureRegistries:
+    def test_unset_yields_no_entries(self):
+        assert parse_insecure_registries(None) == []
+        assert parse_insecure_registries("") == []
+
+    def test_hosts_are_parsed_in_order_without_duplicates(self):
+        parsed = parse_insecure_registries("a:5000, b.example, a:5000 , c")
+        assert parsed == ["a:5000", "b.example", "c"]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "http://reg:5000",
+            "reg:5000/path",
+            "reg 5000",
+            "reg;rm -rf /",
+            "reg\nother",
+        ],
+    )
+    def test_unusable_entries_are_dropped(self, raw):
+        # These would land in a config file the workload parses; dropping beats
+        # writing something skopeo may read in a way we did not intend.
+        assert parse_insecure_registries(raw) == []
+
+    def test_rendered_conf_is_empty_of_registries_when_unset(self):
+        rendered = render_registries_conf([])
+        assert "[[registry]]" not in rendered
+        assert rendered.endswith("\n")
+
+    def test_rendered_conf_marks_each_host_insecure(self):
+        rendered = render_registries_conf(["192.168.1.166:5000", "reg.example"])
+        assert rendered.count("[[registry]]") == 2
+        assert 'location = "192.168.1.166:5000"' in rendered
+        assert 'location = "reg.example"' in rendered
+        assert rendered.count("insecure = true") == 2
