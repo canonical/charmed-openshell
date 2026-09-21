@@ -639,9 +639,16 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return None
 
         data = rel.data.get(rel.app, {}) or {}
-        if not data:
-            unit = next(iter(rel.units), None)
-            data = rel.data.get(unit, {}) if unit is not None else {}
+        if not data.get("addresses"):
+            # A non-clustered provider publishes to its *leader's* unit bag, so
+            # every joined unit has to be tried: the leader is not necessarily
+            # the first one iteration yields, and picking a follower's empty bag
+            # would leave this charm waiting for details that are already there.
+            for unit in rel.units:
+                unit_data = rel.data.get(unit, {}) or {}
+                if unit_data.get("addresses"):
+                    data = unit_data
+                    break
 
         addresses_raw = data.get("addresses", "")
         server_ca = data.get("certificate", "")

@@ -1701,6 +1701,25 @@ class TestLxdConnection:
         results = self._run_action(rel)
         assert results["certificate-fingerprint"] == _UNIT_FP
 
+    def test_lxd_connection_reads_the_unit_bag_that_has_the_details(self):
+        # A non-clustered provider publishes to its leader's unit bag only, and
+        # the leader is not necessarily the first unit iteration yields.
+        rel = Relation(
+            LXD_RELATION,
+            remote_app_data={},
+            remote_units_data={
+                0: {},
+                1: {
+                    "version": "1.0",
+                    "certificate": "UNITCA",
+                    "certificate_fingerprint": _UNIT_FP,
+                    "addresses": "10.0.0.2:8443",
+                },
+            },
+        )
+        results = self._run_action(rel)
+        assert results["certificate-fingerprint"] == _UNIT_FP
+
     def test_lxd_connection_rejects_an_unusable_fingerprint(self):
         # The fingerprint is interpolated into the driver's command line, which
         # Pebble splits on whitespace: a value carrying a space would otherwise
