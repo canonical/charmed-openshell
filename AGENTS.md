@@ -251,30 +251,34 @@ ServiceAccount, and without the section the binary exits with "K8s ServiceAccoun
 bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled
 in-cluster".
 
-### Sandbox client certificates are not what authenticates a sandbox
+### The sandbox client certificate gates connections; the JWT identifies sandboxes
 
-Every sandbox receives the same client certificate from a peer secret, and the driver
-refuses to start without it. What authenticates a sandbox is not that certificate but
-its own gateway-minted JWT, pushed into the instance root-only before start.
+Every sandbox gets the same client certificate, and the gateway verifies it —
+`_render_config_toml` sets `client_ca_path` to a CA the charm mints for this one
+purpose. Two things follow that are easy to get wrong:
 
-The gateway *can* verify client certificates — `[openshell.gateway.tls]` takes
-`client_ca_path` and `require_client_auth`, and the binary then logs "TLS client
-certificate verification enabled" — but this charm renders neither, so today the
-certificate is presented and ignored. Two reasons not to simply turn it on:
+- **It is not identity.** One certificate is shared by every sandbox, so it proves
+  "a sandbox of this deployment", not *which* sandbox. What identifies a sandbox is
+  its own gateway-minted JWT, pushed into the instance root-only before start.
+- **It never locks out CLI users.** The gateway derives its policy:
+  `require_client_auth: has_client_ca && !has_oidc` (upstream `cli.rs`). This charm
+  always configures OIDC, so certificates are validated when presented and never
+  demanded. Users come through Traefik in TLS passthrough and present none.
 
-- `require_client_auth` applies to the listener, and one listener serves both sandbox
-  supervisors and `openshell` CLI users. Turning it on would demand a client
-  certificate from CLI users, which nothing here issues.
-- With one certificate shared by every sandbox it would prove only "something holding
-  the sandbox identity", not *which* sandbox.
+Two separate CAs, deliberately:
 
-So the shared certificate is not the credential it looks like — but it would become
-one the moment verification is enabled, and it cannot be revoked per sandbox. If that
-changes, per-sandbox issuance has to change with it, and note that issuing per sandbox
-means a CA private key in the workload container: a wider blast radius than the leaf
-it replaces. The cheaper alternative is to stop shipping a credential nobody checks
-and pass only `--guest-tls-ca`, which needs a driver change since the three flags
-currently require each other.
+| File | Who trusts it | For what |
+|---|---|---|
+| `/etc/openshell/sandbox-tls/ca.crt` | the sandbox | verifying the gateway's certificate |
+| `/etc/openshell/tls/sandbox-client-ca.crt` | the gateway | verifying the sandbox's certificate |
+
+The client CA is minted by the charm rather than requested over the `certificates`
+relation, because `TLSCertificatesRequiresV4` keeps **one private key per relation**:
+a second request there would hand every sandbox the gateway's own server private key.
+Its private key stays in the peer secret and never reaches the workload container.
+
+A secret from before this existed holds a self-signed leaf with no `ca-certificate`
+key; the leader re-issues it, and until it does no `client_ca_path` is rendered.
 
 ## Pull Request Guidelines
 

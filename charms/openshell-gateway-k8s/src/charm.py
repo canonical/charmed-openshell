@@ -38,6 +38,7 @@ from cryptography.hazmat.primitives.serialization import (
     PrivateFormat,
     PublicFormat,
 )
+from cryptography.x509.oid import ExtendedKeyUsageOID
 from ops import ActiveStatus, BlockedStatus, WaitingStatus
 
 from config_model import (
@@ -51,6 +52,7 @@ from config_model import (
     METRICS_DISABLED,
     PRISTINE_CA_BUNDLE_PATH,
     REGISTRIES_CONF_PATH,
+    SANDBOX_CLIENT_CA_PATH,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
@@ -532,27 +534,126 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         return self._generate_client_identity(f"{self.app.name}-{self.model.uuid}")
 
     def _generate_sandbox_client_identity(self) -> dict[str, str]:
-        """Generate the client identity copied into every sandbox.
+        """Generate the client CA and the leaf certificate every sandbox gets.
 
         Deliberately separate from the LXD client identity: that one is an
         administrative credential for the LXD API and must never leave the
-        gateway pod. This one only ever travels to sandboxes, so a compromised
-        sandbox yields nothing beyond what the sandbox already had.
+        gateway pod. This one only ever travels to sandboxes.
 
-        It is the client half of a TLS handshake the gateway does not
-        authenticate against: nothing here configures the gateway with a client
-        CA, so it does not verify these certificates and they are not what
-        identifies a sandbox. Each sandbox is authenticated by its own
-        gateway-minted JWT, which the driver pushes into it root-only before
-        start. One identity shared by every sandbox is therefore not the
-        credential it looks like — but it would become one the moment the
-        gateway is asked to verify client certificates, so keep the two facts
-        together.
+        The leaf is issued by a CA minted here rather than by the deployment's
+        own CA, for two reasons. The ``certificates`` relation's library keeps
+        one private key per relation, so asking it for a second certificate
+        would hand every sandbox the gateway's *server* private key. And a
+        purpose-built CA trusted for nothing else means "the gateway accepts
+        this as a sandbox" rather than "the gateway accepts anything the
+        deployment's CA ever signed".
+
+        The CA private key stays in the peer secret. Only the CA certificate
+        reaches the workload, and only the leaf and its key reach sandboxes.
+
+        Returns ``ca-certificate``, ``ca-private-key``, ``certificate`` and
+        ``private-key``, all PEM.
         """
         # The model UUID alone identifies the deployment; the application name
-        # is left out so the common name stays inside X.509's 64-character
+        # is left out so the common names stay inside X.509's 64-character
         # limit whatever the application is called.
-        return self._generate_client_identity(f"openshell-sandbox-{self.model.uuid}")
+        now = datetime.datetime.now(datetime.UTC)
+        expiry = now + datetime.timedelta(days=3650)
+
+        ca_key = ec.generate_private_key(ec.SECP384R1())
+        ca_name = x509.Name(
+            [
+                x509.NameAttribute(
+                    x509.NameOID.COMMON_NAME, f"openshell-sandbox-ca-{self.model.uuid}"
+                )
+            ]
+        )
+        ca_cert = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(expiry)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=False,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=True,
+                    crl_sign=True,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
+            )
+            .sign(ca_key, hashes.SHA384())
+        )
+
+        leaf_key = ec.generate_private_key(ec.SECP384R1())
+        leaf_cert = (
+            x509.CertificateBuilder()
+            .subject_name(
+                x509.Name(
+                    [
+                        x509.NameAttribute(
+                            x509.NameOID.COMMON_NAME, f"openshell-sandbox-{self.model.uuid}"
+                        )
+                    ]
+                )
+            )
+            .issuer_name(ca_name)
+            .public_key(leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(expiry)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            # rustls accepts a client certificate that carries the clientAuth
+            # usage or no usage extension at all. Saying it explicitly keeps
+            # the certificate honest about what it is for.
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), critical=False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA384())
+        )
+
+        def pem_key(key: ec.EllipticCurvePrivateKey) -> str:
+            return key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode()
+
+        return {
+            "ca-certificate": ca_cert.public_bytes(Encoding.PEM).decode(),
+            "ca-private-key": pem_key(ca_key),
+            "certificate": leaf_cert.public_bytes(Encoding.PEM).decode(),
+            "private-key": pem_key(leaf_key),
+        }
 
     def _generate_client_identity(self, common_name: str) -> dict[str, str]:
         """Generate a self-signed EC P-384 client certificate with *common_name*."""
@@ -658,7 +759,23 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             if secret_id is not None:
                 peer_rel.data[self.app][PEER_SANDBOX_SECRET_ID_KEY] = secret_id
 
-        return self._read_sandbox_client_identity()
+        identity = self._read_sandbox_client_identity()
+
+        # Earlier revisions minted a self-signed leaf with no issuer anything
+        # could verify, which is why the gateway was never given a client CA.
+        # Such a secret is replaced with a CA and a leaf issued by it.
+        if identity is not None and not identity.get("ca-certificate"):
+            if not self.unit.is_leader():
+                return None
+            logger.info("re-issuing the sandbox client identity from a client CA")
+            try:
+                secret = self.model.get_secret(label=PEER_SANDBOX_SECRET_LABEL)
+            except (ops.SecretNotFoundError, ops.ModelError):
+                return None
+            secret.set_content(self._generate_sandbox_client_identity())
+            identity = self._read_sandbox_client_identity()
+
+        return identity
 
     def _lxd_connection(self) -> _LxdConnection | None:
         """Consume the provider's lxd-https databag and return a validated connection.
@@ -994,6 +1111,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self,
         db_uri: str,
         issuer_url: str,
+        *,
+        client_ca: bool = False,
     ) -> str:
         """Render gateway.toml from the current desired state."""
         assert self._model_cfg is not None
@@ -1009,6 +1128,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt_kid_path=f"{JWT_DIR}/kid",
             redirect_uri=self._redirect_uri(),
             k8s_namespace=k8s_namespace,
+            client_ca_path=SANDBOX_CLIENT_CA_PATH if client_ca else None,
         )
 
     def _read_pod_namespace(self) -> str:
@@ -1081,6 +1201,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         lxd_server_ca_pem: str | None,
         sandbox_client_cert_pem: str,
         sandbox_client_key_pem: str,
+        sandbox_client_ca_pem: str,
     ) -> str:
         """Push all rendered files to the container and return the rendered config TOML."""
 
@@ -1115,6 +1236,12 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         push(SANDBOX_TLS_CERT_PATH, sandbox_client_cert_pem, 0o644)
         push(SANDBOX_TLS_KEY_PATH, sandbox_client_key_pem, 0o600)
 
+        # The issuer of that certificate, for the gateway to verify presented
+        # client certificates against. Only the certificate: its private key
+        # stays in the peer secret and never reaches this container.
+        if sandbox_client_ca_pem:
+            push(SANDBOX_CLIENT_CA_PATH, sandbox_client_ca_pem, 0o644)
+
         # Registry policy for skopeo, which the driver shells out to for the
         # sandbox and supervisor images. Rendered unconditionally so removing a
         # host from config takes effect rather than lingering in the file.
@@ -1128,7 +1255,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             0o644,
         )
 
-        config_toml = self._render_config_toml(db_uri, issuer_url)
+        config_toml = self._render_config_toml(
+            db_uri, issuer_url, client_ca=bool(sandbox_client_ca_pem)
+        )
         push(CONFIG_PATH, config_toml, 0o600)
         return config_toml
 
@@ -1294,6 +1423,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             lxd_server_ca_pem=lxd_conn.server_ca,
             sandbox_client_cert_pem=sandbox_identity["certificate"],
             sandbox_client_key_pem=sandbox_identity["private-key"],
+            sandbox_client_ca_pem=sandbox_identity.get("ca-certificate", ""),
         )
         layer = self._pebble_layer(db_uri, lxd_conn)
         container.add_layer(CONTAINER_NAME, layer, combine=True)
@@ -1312,6 +1442,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             sandbox_identity["certificate"],
             sandbox_identity["private-key"],
             self._transferred_trust(),
+            sandbox_identity.get("ca-certificate", ""),
         )
         self._ensure_restart_state(event, desired_hash, container)
 
@@ -1334,6 +1465,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         sandbox_client_cert_pem: str = "",
         sandbox_client_key_pem: str = "",
         transferred_trust: str = "",
+        sandbox_client_ca_pem: str = "",
     ) -> str:
         """Return a deterministic hex SHA-256 of the workload inputs.
 
@@ -1357,6 +1489,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             + sandbox_client_cert_pem
             + sandbox_client_key_pem
             + transferred_trust
+            + sandbox_client_ca_pem
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1445,7 +1578,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return OperationResult.RETRY_RELEASE
 
         layer = self._pebble_layer(db_uri, lxd_conn)
-        config_toml = self._render_config_toml(db_uri, issuer)
+        config_toml = self._render_config_toml(
+            db_uri, issuer, client_ca=bool(sandbox_identity.get("ca-certificate"))
+        )
         container.add_layer(CONTAINER_NAME, layer, combine=True)
         container.restart(SERVICE_NAME, DRIVER_SERVICE_NAME)
         self._set_applied_hash(
@@ -1463,6 +1598,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 sandbox_identity["certificate"],
                 sandbox_identity["private-key"],
                 self._transferred_trust(),
+                sandbox_identity.get("ca-certificate", ""),
             )
         )
         return OperationResult.RELEASE
@@ -1595,6 +1731,13 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 )
                 or "none",
                 "received-ca-certificates": str(len(self._received_ca_certificates())),
+                # Whether the gateway verifies the certificate sandboxes
+                # present. It never demands one — the policy the gateway
+                # derives is "require only without OIDC", and OIDC is always
+                # configured here — so CLI users are unaffected either way.
+                "sandbox-client-ca-configured": str(
+                    bool((self._read_sandbox_client_identity() or {}).get("ca-certificate"))
+                ),
                 "sandbox-image": cfg.sandbox_image if cfg else "",
                 "supervisor-image": cfg.supervisor_image if cfg else "",
             }

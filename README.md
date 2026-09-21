@@ -171,6 +171,20 @@ off; use ``insecure-registries`` only where that is impossible and the network b
 the workload and the registry is trusted. ``get-gateway-status`` reports the effective
 list so the setting is visible without reading ``juju config``.
 
+### Sandbox authentication
+
+Each sandbox authenticates to the gateway with its own gateway-minted JWT, delivered
+as a root-only file inside the instance. Alongside it every sandbox receives a client
+certificate, shared across the deployment, which the gateway verifies against a CA the
+charm mints for that purpose alone — so a connection has to come from something this
+deployment issued before the JWT is even looked at. The certificate does not say
+*which* sandbox is calling; the token does.
+
+This never affects CLI users. The gateway requires a client certificate only when no
+OIDC issuer is configured, and this charm always configures one, so certificates are
+validated when presented and never demanded. The CLI presents none and authenticates
+with OIDC.
+
 ### Sandbox network egress
 
 ``restrict-sandbox-egress`` (on by default) puts every sandbox NIC behind an LXD

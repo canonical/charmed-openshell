@@ -46,6 +46,8 @@ from charm import (
     LXD_RELATION,
     METRICS_RELATION,
     PEER_RELATION,
+    PEER_SANDBOX_SECRET_ID_KEY,
+    PEER_SANDBOX_SECRET_LABEL,
     PEER_SECRET_ID_KEY,
     READINESS_CHECK_NAME,
     RECEIVE_CA_RELATION,
@@ -63,9 +65,11 @@ from config_model import (
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
     LXD_SERVER_CERT_PATH,
+    SANDBOX_CLIENT_CA_PATH,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
+    TLS_DIR,
 )
 
 RBAC_REQUIRED_MSG = "both oidc-admin-role and oidc-user-role must be set (RBAC required)"
@@ -97,8 +101,15 @@ _FAKE_LXD_IDENTITY = {
     "private-key": "-----BEGIN PRIVATE KEY-----\nLXDKEY\n-----END PRIVATE KEY-----",
 }
 _FAKE_SANDBOX_IDENTITY = {
+    "ca-certificate": "-----BEGIN CERTIFICATE-----\nSBXCA\n-----END CERTIFICATE-----",
+    "ca-private-key": "-----BEGIN PRIVATE KEY-----\nSBXCAKEY\n-----END PRIVATE KEY-----",
     "certificate": "-----BEGIN CERTIFICATE-----\nSBXCERT\n-----END CERTIFICATE-----",
     "private-key": "-----BEGIN PRIVATE KEY-----\nSBXKEY\n-----END PRIVATE KEY-----",
+}
+# What earlier revisions stored: a self-signed leaf and nothing to verify it.
+_LEGACY_SANDBOX_IDENTITY = {
+    "certificate": "-----BEGIN CERTIFICATE-----\nOLDCERT\n-----END CERTIFICATE-----",
+    "private-key": "-----BEGIN PRIVATE KEY-----\nOLDKEY\n-----END PRIVATE KEY-----",
 }
 _LXD_URL = "https://10.0.0.1:8443"
 # Digests shaped the way the sanitizer requires: 64 hex characters.
@@ -2959,3 +2970,164 @@ class TestPushOnlyWhatChanged:
                 assert push_mock.call_count == 0
                 charm._push_if_changed(container, CONFIG_PATH, "something else", 0o600)
                 assert push_mock.call_count == 1
+
+
+class TestSandboxClientCa:
+    """The certificate sandboxes present has to be one the gateway can verify."""
+
+    def _identity(self):
+        # `model` is a read-only property on the real charm, so the generator
+        # is called against a stand-in that only has to answer for the UUID
+        # the common names are built from.
+        charm = SimpleNamespace(model=SimpleNamespace(uuid="e46d3446-6f50-4b63-818e-f2c2ee233d0e"))
+        return OpenshellGatewayK8sCharm._generate_sandbox_client_identity(charm)
+
+    def test_the_leaf_is_issued_by_the_ca_and_is_a_client_certificate(self):
+        from cryptography import x509
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
+        identity = self._identity()
+        ca = x509.load_pem_x509_certificate(identity["ca-certificate"].encode())
+        leaf = x509.load_pem_x509_certificate(identity["certificate"].encode())
+
+        assert ca.subject == ca.issuer
+        assert ca.extensions.get_extension_for_class(x509.BasicConstraints).value.ca is True
+        assert leaf.issuer == ca.subject
+        assert leaf.extensions.get_extension_for_class(x509.BasicConstraints).value.ca is False
+        assert (
+            ExtendedKeyUsageOID.CLIENT_AUTH
+            in leaf.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+        )
+
+        # The signature has to check out, or the gateway rejects the handshake.
+        ca.public_key().verify(
+            leaf.signature,
+            leaf.tbs_certificate_bytes,
+            ec.ECDSA(leaf.signature_hash_algorithm),
+        )
+
+    def test_the_leaf_key_is_not_the_ca_key(self):
+        # The library behind the `certificates` relation keeps one private key
+        # per relation, which is why this identity is minted here instead: a
+        # second request there would put the gateway's server key in every
+        # sandbox.
+        identity = self._identity()
+        assert identity["private-key"] != identity["ca-private-key"]
+
+    def test_the_ca_certificate_reaches_the_workload_and_its_key_does_not(self, tmp_path):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = Container(
+            CONTAINER_NAME,
+            can_connect=True,
+            mounts={"tls": Mount(location=TLS_DIR, source=tmp_path)},
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[container],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+        with _all_ready():
+            ctx.run(ctx.on.pebble_ready(container), state)
+
+        written = {f.name: f.read_text() for f in tmp_path.iterdir() if f.is_file()}
+        assert "SBXCA" in written["sandbox-client-ca.crt"]
+        assert not any("SBXCAKEY" in content for content in written.values())
+
+    def test_the_config_names_the_client_ca(self, tmp_path):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = Container(
+            CONTAINER_NAME,
+            can_connect=True,
+            mounts={"etc": Mount(location="/etc/openshell", source=tmp_path)},
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[container],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+        with _all_ready():
+            ctx.run(ctx.on.pebble_ready(container), state)
+        config = (tmp_path / "config.toml").read_text()
+        assert f'client_ca_path = "{SANDBOX_CLIENT_CA_PATH}"' in config
+
+    def test_no_client_ca_is_named_for_a_legacy_identity(self, tmp_path):
+        # A pre-CA secret that could not be re-issued (a follower unit) must
+        # not leave the gateway pointing at a CA file nobody wrote.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = Container(
+            CONTAINER_NAME,
+            can_connect=True,
+            mounts={"etc": Mount(location="/etc/openshell", source=tmp_path)},
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[container],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+        with _all_ready(
+            extra=[
+                patch.object(
+                    OpenshellGatewayK8sCharm,
+                    "_ensure_sandbox_client_identity",
+                    return_value=_LEGACY_SANDBOX_IDENTITY,
+                ),
+                patch.object(
+                    OpenshellGatewayK8sCharm,
+                    "_read_sandbox_client_identity",
+                    return_value=_LEGACY_SANDBOX_IDENTITY,
+                ),
+            ]
+        ):
+            ctx.run(ctx.on.pebble_ready(container), state)
+        assert "client_ca_path" not in (tmp_path / "config.toml").read_text()
+
+    def test_a_legacy_secret_is_reissued_by_the_leader(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        secret = Secret(
+            tracked_content=dict(_LEGACY_SANDBOX_IDENTITY),
+            label=PEER_SANDBOX_SECRET_LABEL,
+            owner="app",
+        )
+        peer = PeerRelation(
+            PEER_RELATION,
+            local_app_data={PEER_SANDBOX_SECRET_ID_KEY: secret.id},
+        )
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [peer],
+            secrets=[secret],
+        )
+        with (
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_DB_URI),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_tls_material",
+                return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
+            patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_ensure_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_read_lxd_client_identity",
+                return_value=_FAKE_LXD_IDENTITY,
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+        ):
+            out = ctx.run(ctx.on.config_changed(), state)
+
+        content = out.get_secret(label=PEER_SANDBOX_SECRET_LABEL).latest_content
+        assert content is not None
+        assert content["ca-certificate"].startswith("-----BEGIN CERTIFICATE-----")
+        assert content["certificate"] != _LEGACY_SANDBOX_IDENTITY["certificate"]

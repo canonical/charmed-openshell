@@ -87,6 +87,16 @@ SANDBOX_TLS_CA_PATH: str = f"{SANDBOX_TLS_DIR}/ca.crt"
 SANDBOX_TLS_CERT_PATH: str = f"{SANDBOX_TLS_DIR}/client.crt"
 SANDBOX_TLS_KEY_PATH: str = f"{SANDBOX_TLS_DIR}/client.key"
 
+# The issuer of the certificate above, which the gateway verifies presented
+# client certificates against (``client_ca_path``). Deliberately a different
+# CA from the one at SANDBOX_TLS_CA_PATH: that one is the gateway's own issuer,
+# which sandboxes use to verify the gateway, and trusting it for client
+# authentication too would let anything holding a certificate from the
+# deployment's CA present itself as a sandbox. This one is trusted for one
+# thing only. Its private key stays in a Juju secret and never reaches the
+# workload container.
+SANDBOX_CLIENT_CA_PATH: str = f"{TLS_DIR}/sandbox-client-ca.crt"
+
 # skopeo, which the driver shells out to for every image pull, reads its
 # registry policy from this path.
 REGISTRIES_CONF_PATH: str = "/etc/containers/registries.conf"
@@ -289,6 +299,7 @@ def render_config_toml(
     redirect_uri: str,
     k8s_namespace: str = "openshell",
     k8s_service_account_name: str = "default",
+    client_ca_path: str | None = None,
 ) -> str:
     """Return the workload ``config.toml`` as a string.
 
@@ -301,6 +312,14 @@ def render_config_toml(
     var (handled by the Pebble layer), not here.  ``redirect_uri`` is kept as
     an argument for backwards compatibility but is not rendered in this
     version.
+
+    ``client_ca_path`` names the CA that presented client certificates are
+    verified against.  The gateway derives its client-auth policy from it:
+    ``require_client_auth`` is ``has_client_ca && !has_oidc``, and this charm
+    always configures OIDC, so certificates are validated when presented and
+    never demanded.  CLI users, who present none and authenticate with OIDC,
+    are unaffected; a sandbox presenting one signed by another CA is refused
+    at the handshake.
     """
     assert cfg.oidc_admin_role is not None
     assert cfg.oidc_user_role is not None
@@ -316,6 +335,7 @@ def render_config_toml(
         "[openshell.gateway.tls]",
         f"cert_path = {q(tls_cert_path)}",
         f"key_path = {q(tls_key_path)}",
+        *([f"client_ca_path = {q(client_ca_path)}"] if client_ca_path else []),
         "",
         "[openshell.gateway.oidc]",
         f"issuer = {q(issuer_url)}",
