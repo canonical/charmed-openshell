@@ -22,7 +22,7 @@ from .test_charm import (
     _CONN_CONTAINER,
     _FAKE_JWT,
     BOTH_ROLES,
-    _all_ready_patches,
+    _all_ready,
     _all_relations,
 )
 
@@ -89,11 +89,13 @@ class _FakeVaultClient:
         self.stored = dict(stored) if stored else None
         self.fail = fail
         self.writes: list[dict[str, str]] = []
+        self.reads = 0
         self.secrets = MagicMock()
         self.secrets.kv.v2.read_secret.side_effect = self._read
         self.secrets.kv.v2.create_or_update_secret.side_effect = self._write
 
     def _read(self, path: str, mount_point: str):
+        self.reads += 1
         if self.fail:
             raise RuntimeError("vault is sealed")
         if self.stored is None:
@@ -134,19 +136,16 @@ def _patch_client(client: _FakeVaultClient):
 class TestStoreSelection:
     def test_juju_secret_is_used_when_vault_is_not_related(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             ctx(ctx.on.config_changed(), _state(None)) as manager,
         ):
             manager.run()
             charm = manager.charm
             assert charm.vault.is_related() is False
+            # The read is memoised for the hook, and this hook has already
+            # made it; drop the memo so the delegation is what is observed.
+            charm._forget_jwt_keypair()
             with patch.object(
                 OpenshellGatewayK8sCharm,
                 "_read_juju_jwt_keypair",
@@ -154,17 +153,34 @@ class TestStoreSelection:
             ):
                 assert charm._read_jwt_keypair() == _FAKE_JWT
 
+    def test_the_keypair_is_read_from_vault_once_per_hook(self):
+        # collect-unit-status reads the keypair on every hook, and with Vault
+        # that read is an AppRole login plus a KV read. Without the memo a
+        # plain update-status costs two round trips and a sealed Vault slows
+        # every unrelated event.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        client = _FakeVaultClient(stored=_STORED)
+        with (
+            _all_ready(jwt=False),
+            _patch_client(client),
+            ctx(ctx.on.update_status(), _state(_vault_relation())) as manager,
+        ):
+            manager.run()
+            charm = manager.charm
+            reads_after_hook = client.reads
+            assert charm._read_jwt_keypair() is not None
+            assert client.reads == reads_after_hook
+
+            # A rotation drops the memo, so the next read sees the new key.
+            charm._forget_jwt_keypair()
+            assert charm._read_jwt_keypair() is not None
+            assert client.reads == reads_after_hook + 1
+
     def test_vault_is_authoritative_once_related_and_ready(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             ctx(ctx.on.config_changed(), _state(_vault_relation())) as manager,
         ):
@@ -175,8 +191,7 @@ class TestStoreSelection:
 
     def test_joined_but_not_ready_waits_instead_of_falling_back(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.collect_unit_status(), _state(_vault_relation(ready=False)))
         assert isinstance(out.unit_status, WaitingStatus)
         assert "vault-kv" in out.unit_status.message
@@ -187,14 +202,8 @@ class TestMigration:
         # The key live sandbox tokens were signed with has to survive the move.
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=None)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             patch.object(
                 OpenshellGatewayK8sCharm, "_read_juju_jwt_keypair", return_value=_FAKE_JWT
@@ -209,14 +218,8 @@ class TestMigration:
     def test_vault_content_wins_over_the_juju_secret(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             patch.object(
                 OpenshellGatewayK8sCharm, "_read_juju_jwt_keypair", return_value=_FAKE_JWT
@@ -231,14 +234,8 @@ class TestMigration:
     def test_a_fresh_keypair_is_minted_when_neither_store_has_one(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=None)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             patch.object(OpenshellGatewayK8sCharm, "_read_juju_jwt_keypair", return_value=None),
             ctx(ctx.on.config_changed(), _state(_vault_relation())) as manager,
@@ -255,14 +252,8 @@ class TestMigration:
         # key the other half rejects.
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=None)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             patch.object(
                 OpenshellGatewayK8sCharm, "_read_juju_jwt_keypair", return_value=_FAKE_JWT
@@ -278,14 +269,8 @@ class TestMigration:
     def test_an_unreachable_vault_does_not_mint_a_second_keypair(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED, fail=True)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             patch.object(
                 OpenshellGatewayK8sCharm, "_read_juju_jwt_keypair", return_value=_FAKE_JWT
@@ -302,8 +287,7 @@ class TestRotation:
     def test_rotation_writes_to_vault_when_related(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[5], p[6], p[7], _patch_client(client):
+        with _all_ready(jwt=False), _patch_client(client):
             ctx.run(ctx.on.action("rotate-jwt-signing-key"), _state(_vault_relation()))
         assert ctx.action_results is not None
         assert ctx.action_results["store"] == "vault"
@@ -314,8 +298,7 @@ class TestRotation:
     def test_rotation_stays_leader_only(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[5], p[6], p[7], _patch_client(client):
+        with _all_ready(jwt=False), _patch_client(client):
             state = _state(_vault_relation(), leader=False)
             with pytest.raises(Exception, match="leader"):
                 ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
@@ -324,14 +307,8 @@ class TestRotation:
     def test_rotation_fails_loudly_when_vault_cannot_be_written(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED, fail=True)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(jwt=False),
             _patch_client(client),
             pytest.raises(Exception, match="Vault"),
         ):
@@ -342,32 +319,22 @@ class TestStatusAndNonce:
     def test_status_action_names_the_active_store(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         client = _FakeVaultClient(stored=_STORED)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[5], p[6], p[7], _patch_client(client):
+        with _all_ready(jwt=False), _patch_client(client):
             ctx.run(ctx.on.action("get-gateway-status"), _state(_vault_relation()))
         assert ctx.action_results["jwt-store"] == "vault"
 
     def test_status_action_names_the_juju_secret_store_by_default(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             ctx.run(ctx.on.action("get-gateway-status"), _state(None))
         assert ctx.action_results["jwt-store"] == "juju-secret"
 
     def test_nonce_is_stable_across_hooks(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         nonces = []
-        p = _all_ready_patches()
         for _ in range(2):
             with (
-                p[0],
-                p[1],
-                p[2],
-                p[3],
-                p[4],
-                p[5],
-                p[6],
-                p[7],
+                _all_ready(),
                 ctx(ctx.on.config_changed(), _state(_vault_relation(ready=False))) as manager,
             ):
                 manager.run()
@@ -383,8 +350,7 @@ class TestStatusAndNonce:
             containers=[_CONN_CONTAINER],
             relations=_all_relations() + [PeerRelation(PEER_RELATION), vault_rel],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.relation_joined(vault_rel), state)
         published = next(r for r in out.relations if r.endpoint == VAULT_RELATION)
         assert published.local_unit_data["nonce"]

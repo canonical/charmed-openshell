@@ -150,7 +150,36 @@ offers no TLS or authentication for it — so it is reachable only inside the po
 network and is deliberately never routed through ingress. This is a bounded exception
 to the charm's "TLS is always enabled" posture and applies to this endpoint alone.
 
-Log forwarding (``loki_push_api``) and Grafana dashboards are not shipped yet.
+Log forwarding (``loki_push_api``) is not shipped yet.
+
+### Sandbox images and the registries they come from
+
+``sandbox-image`` is the OCI reference every sandbox is created from unless the
+request names another, and ``supervisor-image`` is where the driver extracts the
+sandbox boundary binary from. Both are registry references the driver pulls and
+converts, not LXD image aliases, and the Kubernetes node has to reach the registries
+they name. ``supervisor-image`` must come from the same OpenShell release as the
+gateway image; a mismatched pair fails to sync policy and the supervisor exits.
+
+``insecure-registries`` names hosts the workload pulls from **without verifying
+TLS**. That is not only "permit plain HTTP": for a host named here any certificate is
+accepted over HTTPS too, so anything on the path can substitute the image — including
+the supervisor image, whose contents become the process that enforces the sandbox
+boundary inside every sandbox. Prefer relating the registry's CA over
+``receive-ca-cert``, which makes the workload trust it without turning verification
+off; use ``insecure-registries`` only where that is impossible and the network between
+the workload and the registry is trusted. ``get-gateway-status`` reports the effective
+list so the setting is visible without reading ``juju config``.
+
+### Sandbox network egress
+
+``restrict-sandbox-egress`` (on by default) puts every sandbox NIC behind an LXD
+network ACL that permits the gateway endpoint and public internet addresses and
+nothing else. Without it a sandbox reaches whatever its network reaches: the LAN it
+sits on, the LXD host, the LXD API itself and other instances. Sandboxes run
+untrusted agent workloads, so the restriction is the default. LXD applies network
+ACLs to individual NICs only on OVN networks — set the option to false when sandboxes
+run on a bridge, where the driver cannot enforce it.
 
 ### Credentials store
 

@@ -85,9 +85,13 @@ requires:
   receive-ca-cert:
     interface: certificate_transfer
     optional: true
+    limit: 1
     # Trust anchors for issuers the workload image does not already trust —
     # the Canonical Identity Platform signs its issuer certificate with its own
-    # CA, and OIDC discovery fails without it.
+    # CA, and OIDC discovery fails without it. Limited to one provider: every
+    # certificate transferred here becomes a trust anchor in the workload, and
+    # an unbounded number of applications able to add one is an unbounded trust
+    # decision. get-gateway-status reports how many arrived.
   vault-kv:
     interface: vault-kv
     limit: 1
@@ -113,9 +117,11 @@ actions:
     description: Return this application's LXD client certificate and the provider's fingerprint.
   get-gateway-status:
     description: >
-      Report the current readiness and configuration state of the gateway,
-      including the LXD project sandboxes are created in and the endpoint
-      sandbox supervisors are told to dial back on.
+      Report the current readiness, health and configuration state of the
+      gateway: the LXD project sandboxes are created in, the endpoint sandbox
+      supervisors are told to dial back on, whether each workload service and
+      Pebble check is up, and the settings that govern what a sandbox can
+      reach and which registries are trusted.
   restart:
     description: Request a rolling restart of the gateway workload across units.
   rotate-jwt-signing-key:
@@ -187,11 +193,15 @@ config:
       type: string
       description: >
         Comma-separated list of registry hosts ("host" or "host:port") the
-        workload may pull images from over plain HTTP. skopeo verifies TLS
-        against every registry by default, which is right; this exists for
-        deployments that serve the gateway's companion images from a local
-        registry without a certificate, where the alternative is no images at
-        all. Prefer a registry with TLS the workload already trusts.
+        workload pulls images from without verifying TLS. This does not only
+        permit plain HTTP: for a host named here, skopeo also accepts any
+        certificate over HTTPS, so anything on the path can substitute the
+        image. That matters most for supervisor-image, whose contents become
+        the process that enforces the sandbox boundary inside every sandbox.
+        Prefer relating the registry's CA over receive-ca-cert, which makes
+        the workload trust it without turning verification off. Use this only
+        where that is impossible and the network between the workload and the
+        registry is trusted. get-gateway-status reports the effective list.
     supervisor-image:
       type: string
       default: ghcr.io/nvidia/openshell/supervisor:latest
@@ -204,7 +214,7 @@ config:
         openshell-supervisor rock built alongside the gateway rock, or at a
         version-pinned upstream tag; the floating default is a convenience for
         trying things out, not a supported pairing.
-    lxd-sandbox-image:
+    sandbox-image:
       type: string
       default: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
       description: >
@@ -213,6 +223,17 @@ config:
         driver pulls it and converts it into an LXD image on first use, so it
         must be a registry reference and not an LXD image alias. The Kubernetes
         node running the gateway needs to reach the registry it names.
+    restrict-sandbox-egress:
+      type: boolean
+      default: true
+      description: >
+        Confine every sandbox to the gateway endpoint and public internet
+        addresses with an LXD network ACL. Without it a sandbox reaches
+        whatever its network reaches: the LAN it sits on, the LXD host, the
+        LXD API itself and other instances. Sandboxes run untrusted agent
+        workloads, so this is on by default. LXD applies network ACLs to
+        individual NICs only on OVN networks; set it to false when sandboxes
+        run on a bridge, where the driver cannot enforce it.
     lxd-operation-timeout-secs:
       type: int
       default: 60

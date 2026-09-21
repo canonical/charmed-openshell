@@ -64,7 +64,11 @@ TLS_DIR: str = "/etc/openshell/tls"
 LXD_DIR: str = "/etc/openshell/lxd"
 LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
 LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
-LXD_SERVER_CA_PATH: str = f"{LXD_DIR}/server.crt"
+# The certificate the LXD server presents, as the provider published it. It is
+# pinned with the driver's --lxd-server-cert, not trusted as a CA: LXD's own
+# certificate is self-signed and names only its hostname and the loopback
+# addresses, so CA verification rejects the routable address this pod dials.
+LXD_SERVER_CERT_PATH: str = f"{LXD_DIR}/server.crt"
 
 # The image's own CA bundle, and the charm's pristine copy of it.
 # The charm adds its CA to the system bundle so the workload trusts the
@@ -123,9 +127,10 @@ class GatewayConfig(pydantic.BaseModel):
     gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
     jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
     metrics_port: int = Field(default=DEFAULT_METRICS_PORT, alias="metrics-port")
-    lxd_sandbox_image: str = Field(default=DEFAULT_SANDBOX_IMAGE, alias="lxd-sandbox-image")
+    sandbox_image: str = Field(default=DEFAULT_SANDBOX_IMAGE, alias="sandbox-image")
     supervisor_image: str = Field(default=DEFAULT_SUPERVISOR_IMAGE, alias="supervisor-image")
     insecure_registries: str | None = Field(default=None, alias="insecure-registries")
+    restrict_sandbox_egress: bool = Field(default=True, alias="restrict-sandbox-egress")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
@@ -158,7 +163,7 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_admin_role",
         "oidc_user_role",
         "gateway_id",
-        "lxd_sandbox_image",
+        "sandbox_image",
         "supervisor_image",
         "insecure_registries",
         mode="after",
@@ -419,9 +424,10 @@ def render_driver_command(
     operation_timeout_secs: int,
     log_level: str,
     gateway_endpoint: str,
-    server_ca: str | None = None,
+    server_cert: str | None = None,
     server_fingerprint: str | None = None,
     project: str | None = None,
+    restrict_sandbox_egress: bool = True,
 ) -> str:
     """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
 
@@ -429,7 +435,14 @@ def render_driver_command(
     a remote LXD over HTTPS using the provider's address and pinned CA or
     certificate fingerprint.
 
-    Exactly one of ``server_ca`` or ``server_fingerprint`` must be supplied.
+    Exactly one of ``server_cert`` or ``server_fingerprint`` must be supplied.
+    ``server_cert`` is a path to the certificate the LXD server presents, which
+    the driver pins with ``--lxd-server-cert`` — trusted for whatever names it
+    carries, as ``lxc remote add`` does. It is deliberately not passed as
+    ``--lxd-server-ca``: that loads the file as a trust anchor and then does
+    ordinary chain and hostname verification, which LXD's self-signed
+    certificate — naming only its hostname and the loopback addresses — cannot
+    satisfy for the routable address this pod dials.
 
     ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
     flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
@@ -449,16 +462,23 @@ def render_driver_command(
     without it unless plaintext is explicitly allowed, and this charm never
     allows plaintext: a sandbox supervisor reaches the gateway over TLS or not
     at all.
+
+    ``restrict_sandbox_egress`` puts every sandbox NIC behind an LXD network
+    ACL that permits the gateway endpoint and public addresses and nothing
+    else.  Without it a sandbox reaches the LAN it happens to sit on, the LXD
+    host and the LXD API itself.  It needs sandboxes on an OVN network, which
+    is the only place LXD applies ACLs to individual NICs.
     """
-    if (server_ca is None) == (server_fingerprint is None):
-        raise ValueError("exactly one of server_ca or server_fingerprint must be set")
+    if (server_cert is None) == (server_fingerprint is None):
+        raise ValueError("exactly one of server_cert or server_fingerprint must be set")
 
     trust_arg = (
-        f" --lxd-server-ca {server_ca}"
-        if server_ca is not None
+        f" --lxd-server-cert {server_cert}"
+        if server_cert is not None
         else f" --lxd-server-fingerprint {server_fingerprint}"
     )
     project_arg = f" --project {project}" if project is not None else ""
+    egress_arg = " --restrict-sandbox-egress" if restrict_sandbox_egress else ""
 
     return (
         f"/usr/bin/openshell-driver-lxd"
@@ -468,6 +488,7 @@ def render_driver_command(
         f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
         f"{trust_arg}"
         f"{project_arg}"
+        f"{egress_arg}"
         f" --default-image {default_image}"
         f" --supervisor-image {supervisor_image}"
         f" --operation-timeout-secs {operation_timeout_secs}"

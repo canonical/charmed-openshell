@@ -443,3 +443,59 @@ class TestRotateJwtSigningKey:
         peer_rel2 = next(r for r in out2.relations if r.endpoint == RESTART_RELATION)
         hash_after = peer_rel2.local_unit_data[APPLIED_HASH_KEY]
         assert hash_after != hash_before
+
+
+class TestGatewayStatusReportsWhatStatusCannotSay:
+    """ops surfaces one ActiveStatus, so the facts an operator needs live here."""
+
+    def _results(self, **config):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = State(
+            config={**BOTH_ROLES, **config},
+            containers=[Container(CONTAINER_NAME, can_connect=True)],
+        )
+        with (
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_database_uri",
+                return_value="postgresql://u:p@db/openshell?sslmode=require",
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm, "_tls_material", return_value=(MagicMock(), MagicMock())
+            ),
+            patch.object(
+                OpenshellGatewayK8sCharm, "_oauth_issuer", return_value="https://hydra.example.com"
+            ),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
+        ):
+            ctx.run(ctx.on.action("get-gateway-status"), state)
+        return ctx.action_results
+
+    def test_the_driver_has_its_own_running_flag(self):
+        # workload-running only ever spoke for the gateway service; a driver
+        # that keeps exiting is what a broken deployment actually looks like.
+        assert self._results()["driver-running"] == "False"
+
+    def test_image_verification_being_off_is_reported(self):
+        # An operator should not have to read `juju config` to find out that
+        # the supervisor image is pulled without verifying TLS.
+        results = self._results(**{"insecure-registries": "192.168.1.166:5000, reg.example"})
+        assert results["insecure-registries"] == "192.168.1.166:5000, reg.example"
+        assert self._results()["insecure-registries"] == "none"
+
+    def test_the_sandbox_egress_restriction_is_reported(self):
+        assert self._results()["sandbox-egress-restricted"] == "True"
+        assert (
+            self._results(**{"restrict-sandbox-egress": False})["sandbox-egress-restricted"]
+            == "False"
+        )
+
+    def test_the_images_sandboxes_are_built_from_are_reported(self):
+        results = self._results(
+            **{"sandbox-image": "reg.example/base:1", "supervisor-image": "reg.example/sup:1"}
+        )
+        assert results["sandbox-image"] == "reg.example/base:1"
+        assert results["supervisor-image"] == "reg.example/sup:1"
+
+    def test_the_number_of_transferred_trust_anchors_is_reported(self):
+        assert self._results()["received-ca-certificates"] == "0"

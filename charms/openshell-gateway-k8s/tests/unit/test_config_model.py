@@ -15,7 +15,7 @@ from config_model import (
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CA_PATH,
+    LXD_SERVER_CERT_PATH,
     METRICS_DISABLED,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
@@ -71,10 +71,10 @@ class TestConfigSurface:
 
     def test_lxd_config_defaults(self):
         cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
-        assert cfg.lxd_sandbox_image == DEFAULT_SANDBOX_IMAGE
+        assert cfg.sandbox_image == DEFAULT_SANDBOX_IMAGE
         # The driver resolves this as an OCI reference, so a bare LXD
         # image alias would fail on the first sandbox created.
-        assert "/" in cfg.lxd_sandbox_image
+        assert "/" in cfg.sandbox_image
         assert cfg.lxd_operation_timeout_secs == 60
 
     def test_no_lxd_projects_field(self):
@@ -83,7 +83,7 @@ class TestConfigSurface:
         # never grow a config option for it again.
         assert "lxd_projects" not in GatewayConfig.model_fields
 
-    @pytest.mark.parametrize("field", ["lxd-sandbox-image"])
+    @pytest.mark.parametrize("field", ["sandbox-image"])
     def test_lxd_string_fields_reject_control_chars(self, field):
         base = {**BOTH_ROLES_MINIMAL}
         base[field] = "bad\nvalue"
@@ -491,7 +491,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert cmd == (
             "/usr/bin/openshell-driver-lxd"
@@ -499,8 +499,8 @@ class TestRenderDriverCommand:
             " --lxd-url https://10.0.0.1:8443"
             f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
             f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
-            f" --lxd-server-ca {LXD_SERVER_CA_PATH}"
-            " --default-image openshell-sandbox"
+            f" --lxd-server-cert {LXD_SERVER_CERT_PATH}"
+            " --restrict-sandbox-egress --default-image openshell-sandbox"
             " --supervisor-image ghcr.io/nvidia/openshell/supervisor:0.0.116"
             " --operation-timeout-secs 60"
             " --log-level info"
@@ -518,7 +518,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://gw:8443",
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
             project="openshell",
         )
         assert " --project openshell" in cmd
@@ -531,7 +531,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://gw:8443",
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert "--project" not in cmd
 
@@ -574,7 +574,7 @@ class TestRenderDriverCommand:
                 60,
                 "info",
                 "https://openshell-gateway.my-model.svc.cluster.local:8443",
-                server_ca=LXD_SERVER_CA_PATH,
+                server_cert=LXD_SERVER_CERT_PATH,
                 server_fingerprint="ab:cd",
             )
 
@@ -586,7 +586,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert "--lxd-socket" not in cmd
         assert "LXD_HOST_SOCKET" not in cmd
@@ -602,7 +602,7 @@ class TestRenderDriverCommand:
             60,
             "info",
             endpoint,
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert f"--gateway-endpoint {endpoint}" in cmd
 
@@ -795,3 +795,62 @@ class TestParseLxdFingerprint:
             "--sandbox-nesting",
         ):
             assert _parse_lxd_fingerprint(bad) is None, bad
+
+
+class TestSandboxEgressOption:
+    """A sandbox reaches only the gateway and the public internet by default."""
+
+    def test_it_is_on_by_default(self):
+        cfg, err = load_config({"oidc-admin-role": "a", "oidc-user-role": "u"})
+        assert err is None
+        assert cfg is not None
+        assert cfg.restrict_sandbox_egress is True
+
+    def test_the_flag_follows_the_option(self):
+        common = {
+            "url": "https://10.0.0.1:8443",
+            "default_image": "img",
+            "supervisor_image": "sup",
+            "operation_timeout_secs": 60,
+            "log_level": "info",
+            "gateway_endpoint": "https://gw:8443",
+            "server_fingerprint": "ab" * 32,
+        }
+        assert "--restrict-sandbox-egress" in render_driver_command(**common)
+        assert "--restrict-sandbox-egress" not in render_driver_command(
+            **common, restrict_sandbox_egress=False
+        )
+
+
+class TestSandboxImageOptionName:
+    def test_the_option_is_not_prefixed_lxd(self):
+        # It is an OCI reference the driver pulls and converts, not an LXD
+        # image alias, and the old name read as though it were one.
+        cfg, err = load_config(
+            {
+                "oidc-admin-role": "a",
+                "oidc-user-role": "u",
+                "sandbox-image": "reg.example/base:1",
+            }
+        )
+        assert err is None
+        assert cfg is not None
+        assert cfg.sandbox_image == "reg.example/base:1"
+
+
+class TestServerCertificateIsPinnedNotTrustedAsACa:
+    def test_the_published_certificate_is_pinned(self):
+        # --lxd-server-ca loads the file as a trust anchor and then verifies
+        # chain and hostname, which LXD's self-signed certificate cannot
+        # satisfy for the routable address this pod dials.
+        cmd = render_driver_command(
+            url="https://10.0.0.1:8443",
+            default_image="img",
+            supervisor_image="sup",
+            operation_timeout_secs=60,
+            log_level="info",
+            gateway_endpoint="https://gw:8443",
+            server_cert=LXD_SERVER_CERT_PATH,
+        )
+        assert f"--lxd-server-cert {LXD_SERVER_CERT_PATH}" in cmd
+        assert "--lxd-server-ca" not in cmd

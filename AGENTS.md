@@ -207,9 +207,11 @@ which is an administrative credential for the LXD API.
 ### Never run `update-ca-certificates` in the workload container
 
 The gateway rock ships the public roots as a prebuilt bundle but has no
-`/etc/ca-certificates.conf` (a package postinst that rocks do not run writes it), so
-`update-ca-certificates` rebuilds the bundle from an empty list and replaces all 121
-public roots with whatever the charm put in `/usr/local/share/ca-certificates`. The
+`/etc/ca-certificates.conf` before `openshell-driver-lxd` commit `301529a`, which the
+gateway rock is built from. Without that file `update-ca-certificates` rebuilds the
+bundle from an empty list and replaces all 121 public roots with whatever the charm put
+in `/usr/local/share/ca-certificates`; with it, the rebuild keeps the public roots but
+still drops the charm's own CA, which lives outside that directory. Either way the
 driver then cannot pull a sandbox or supervisor image from any registry, and the
 failure surfaces much later as an opaque x509 error from skopeo. The charm appends its
 CA to the image's bundle instead, keeping an untouched copy at
@@ -232,10 +234,47 @@ NetworkEndpoint.tls ... invalid wire type` from `sandbox list`, and a misleading
 "sandbox not found" from `sandbox create`, on a sandbox that was created fine.
 Track `latest/stable` unless the rock is pinned to something newer.
 
-### `lxd-sandbox-image` is an OCI reference, not an LXD alias
+### `sandbox-image` is an OCI reference, not an LXD alias
 
 The driver resolves `--default-image` as a registry reference and imports it on first
-use. The Kubernetes node needs to reach whatever registry it names.
+use. The Kubernetes node needs to reach whatever registry it names. The option was
+called `lxd-sandbox-image` until it was renamed before first publish: the `lxd-`
+prefix read as though the value were an LXD image alias, which is the mistake the
+default value exists to prevent.
+
+### `[openshell.drivers.kubernetes]` is required even with the LXD driver
+
+`render_config_toml` always emits it, and `_read_pod_namespace` reads the downward-API
+namespace file to fill it, although `OPENSHELL_DRIVERS` is `lxd`. That is not left-over
+configuration: issuing sandbox JWTs in-cluster bootstraps from a Kubernetes
+ServiceAccount, and without the section the binary exits with "K8s ServiceAccount
+bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled
+in-cluster".
+
+### Sandbox client certificates are not what authenticates a sandbox
+
+Every sandbox receives the same client certificate from a peer secret, and the driver
+refuses to start without it. What authenticates a sandbox is not that certificate but
+its own gateway-minted JWT, pushed into the instance root-only before start.
+
+The gateway *can* verify client certificates — `[openshell.gateway.tls]` takes
+`client_ca_path` and `require_client_auth`, and the binary then logs "TLS client
+certificate verification enabled" — but this charm renders neither, so today the
+certificate is presented and ignored. Two reasons not to simply turn it on:
+
+- `require_client_auth` applies to the listener, and one listener serves both sandbox
+  supervisors and `openshell` CLI users. Turning it on would demand a client
+  certificate from CLI users, which nothing here issues.
+- With one certificate shared by every sandbox it would prove only "something holding
+  the sandbox identity", not *which* sandbox.
+
+So the shared certificate is not the credential it looks like — but it would become
+one the moment verification is enabled, and it cannot be revoked per sandbox. If that
+changes, per-sandbox issuance has to change with it, and note that issuing per sandbox
+means a CA private key in the workload container: a wider blast radius than the leaf
+it replaces. The cheaper alternative is to stop shipping a credential nobody checks
+and pass only `--guest-tls-ca`, which needs a driver change since the three flags
+currently require each other.
 
 ## Pull Request Guidelines
 

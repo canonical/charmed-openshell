@@ -47,7 +47,7 @@ from config_model import (
     JWT_DIR,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CA_PATH,
+    LXD_SERVER_CERT_PATH,
     METRICS_DISABLED,
     PRISTINE_CA_BUNDLE_PATH,
     REGISTRIES_CONF_PATH,
@@ -159,6 +159,15 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self._model_cfg: GatewayConfig | None = None
         self._config_error: str | None = None
         self._model_cfg, self._config_error = load_config(dict(self.config))
+
+        # Per-hook memo for the JWT keypair. collect-unit-status runs on every
+        # hook and reads the keypair, and with a vault-kv relation that read is
+        # an AppRole login plus a KV read against Vault. Without this a plain
+        # update-status costs two Vault round trips and a slow or sealed Vault
+        # slows every unrelated event. The charm object does not outlive the
+        # hook, so there is nothing to invalidate.
+        self._jwt_keypair_read: dict | None = None
+        self._jwt_keypair_read_done = False
 
         # Re-registration sentinels — must be set before any reconcile reads them.
         self._stored.set_default(last_cert_sans=[], last_redirect_uri="")
@@ -369,7 +378,18 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         falling back to the Juju secret: serving the old key while Vault is
         about to take over would make the two stores disagree about which key
         is current.
+
+        Memoised for the hook: see ``_jwt_keypair_read`` in ``__init__``.
         """
+        if self._jwt_keypair_read_done:
+            return self._jwt_keypair_read
+
+        self._jwt_keypair_read = self._read_jwt_keypair_uncached()
+        self._jwt_keypair_read_done = True
+        return self._jwt_keypair_read
+
+    def _read_jwt_keypair_uncached(self) -> dict | None:
+        """Read the JWT keypair from the authoritative store, reaching Vault."""
         if self.vault.is_related():
             if not self.vault.is_ready():
                 return None
@@ -417,12 +437,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         tokens were signed with. Only the leader seeds; other units wait for it
         rather than racing to write a second keypair.
         """
-        try:
-            existing = self.vault.read()
-        except VaultUnavailableError:
-            logger.warning("vault-kv: could not read the JWT keypair", exc_info=True)
-            return None
-
+        # Through the memo: collect-unit-status has almost always read this
+        # already in the same hook, and each read is an AppRole login.
+        existing = self._read_jwt_keypair()
         if existing is not None:
             return existing
 
@@ -439,7 +456,13 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         except VaultUnavailableError:
             logger.warning("vault-kv: could not seed the JWT keypair", exc_info=True)
             return None
+        self._forget_jwt_keypair()
         return keypair
+
+    def _forget_jwt_keypair(self) -> None:
+        """Drop the per-hook memo after writing new key material."""
+        self._jwt_keypair_read = None
+        self._jwt_keypair_read_done = False
 
     def _ensure_juju_jwt_keypair(self) -> dict | None:
         """Mint (leader, first call) or read the JWT keypair from the peer secret.
@@ -515,6 +538,16 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         administrative credential for the LXD API and must never leave the
         gateway pod. This one only ever travels to sandboxes, so a compromised
         sandbox yields nothing beyond what the sandbox already had.
+
+        It is the client half of a TLS handshake the gateway does not
+        authenticate against: nothing here configures the gateway with a client
+        CA, so it does not verify these certificates and they are not what
+        identifies a sandbox. Each sandbox is authenticated by its own
+        gateway-minted JWT, which the driver pushes into it root-only before
+        start. One identity shared by every sandbox is therefore not the
+        credential it looks like — but it would become one the moment the
+        gateway is asked to verify client certificates, so keep the two facts
+        together.
         """
         # The model UUID alone identifies the deployment; the application name
         # is left out so the common name stays inside X.509's 64-character
@@ -784,7 +817,54 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         elif self._lxd_connection() is None:
             gaps.append(_Gap("waiting for lxd connection details", "waiting"))
 
+        gaps.extend(self._workload_gaps(container))
+
         return gaps
+
+    def _workload_gaps(self, container: ops.Container) -> list[_Gap]:
+        """Return gaps for workload services that should be running and are not.
+
+        Only meaningful once the charm has converged at least once: before
+        that the services are absent by design and the relation gaps above are
+        the story. After it, a service that keeps exiting — bad driver flags, a
+        missing LXD project, an unreachable registry — used to leave the unit
+        Active with nothing to say, and the first sign of trouble was a failing
+        sandbox create.
+        """
+        if self._applied_hash() is None:
+            return []
+
+        gaps: list[_Gap] = []
+        try:
+            services = container.get_services()
+        except (ops.pebble.APIError, ops.pebble.ConnectionError):
+            return []
+
+        for name, label in ((DRIVER_SERVICE_NAME, "lxd driver"), (SERVICE_NAME, "gateway")):
+            info = services.get(name)
+            if info is not None and not info.is_running():
+                gaps.append(_Gap(f"{label} service is not running", "waiting"))
+
+        failing = sorted(name for name, check in self._check_status().items() if not check)
+        if failing:
+            gaps.append(_Gap(f"workload checks failing: {', '.join(failing)}", "waiting"))
+
+        return gaps
+
+    def _check_status(self) -> dict[str, bool]:
+        """Return each Pebble check's name mapped to whether it is passing."""
+        container = self.unit.get_container(CONTAINER_NAME)
+        if not container.can_connect():
+            return {}
+        try:
+            checks = container.get_checks()
+        except (ops.pebble.APIError, ops.pebble.ConnectionError):
+            return {}
+        return {
+            name: check.status == ops.pebble.CheckStatus.UP
+            for name, check in checks.items()
+            if name in (READINESS_CHECK_NAME, DRIVER_CHECK_NAME)
+        }
 
     def _stop_workload(self, container: ops.Container) -> None:
         """Disable and stop the gateway and driver services idempotently."""
@@ -847,22 +927,23 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         if lxd_connection is not None:
             # Prefer the fingerprint pin whenever the provider publishes one.
-            # LXD's self-signed server certificate lists only the hostname and
-            # the loopback addresses as SANs, so CA verification rejects the
-            # routable address this pod dials. Pinning by digest skips the
-            # hostname check and is the only mode that works for such an
-            # endpoint; CA verification remains the fallback.
+            # Falling back to the published certificate pins that certificate
+            # (--lxd-server-cert), not a CA: LXD's self-signed certificate
+            # lists only the hostname and the loopback addresses as SANs, so
+            # chain-and-hostname verification rejects the routable address this
+            # pod dials whichever of the two files it is handed.
             pin_fingerprint = bool(lxd_connection.fingerprint)
             driver_command = render_driver_command(
                 url=lxd_connection.url,
-                default_image=self._model_cfg.lxd_sandbox_image,
+                default_image=self._model_cfg.sandbox_image,
                 supervisor_image=self._model_cfg.supervisor_image,
                 operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
                 log_level=self._model_cfg.log_level,
                 gateway_endpoint=self._gateway_endpoint(),
-                server_ca=(None if pin_fingerprint else LXD_SERVER_CA_PATH),
+                server_cert=(None if pin_fingerprint else LXD_SERVER_CERT_PATH),
                 server_fingerprint=(lxd_connection.fingerprint if pin_fingerprint else None),
                 project=lxd_connection.project,
+                restrict_sandbox_egress=self._model_cfg.restrict_sandbox_egress,
             )
         else:
             # No connection yet: keep the service defined but unable to start,
@@ -896,6 +977,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 },
                 DRIVER_CHECK_NAME: {
                     "override": "replace",
+                    # "ready", like the gateway's own check: the driver is the
+                    # only way this gateway creates a sandbox, so a unit whose
+                    # driver is not up is not ready, and Pebble's readiness
+                    # should say so rather than only this charm's status.
+                    "level": "ready",
                     "period": CHECK_PERIOD,
                     "timeout": CHECK_TIMEOUT,
                     "threshold": CHECK_THRESHOLD,
@@ -928,6 +1014,14 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
     def _read_pod_namespace(self) -> str:
         """Return the Kubernetes namespace the gateway pod runs in.
 
+        Feeds the ``[openshell.drivers.kubernetes]`` section, which the gateway
+        needs even with the LXD compute driver: issuing sandbox JWTs in-cluster
+        bootstraps from a Kubernetes ServiceAccount, and the binary refuses to
+        start without the section ("K8s ServiceAccount bootstrap requires
+        [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled
+        in-cluster"). It is not dead configuration left over from the
+        Kubernetes driver.
+
         Falls back to ``openshell`` when the downward-API namespace file is not
         readable, so the server can still start in non-Kubernetes test
         environments.
@@ -941,9 +1035,35 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 .read()
                 .strip()
             )
-        except Exception:
+        except (ops.pebble.PathError, ops.pebble.APIError, ops.pebble.ConnectionError):
             return "openshell"
         return namespace if namespace else "openshell"
+
+    def _push_if_changed(
+        self,
+        container: ops.Container,
+        path: str,
+        content: str,
+        permissions: int,
+    ) -> None:
+        """Push *content* to *path* only when it differs from what is there.
+
+        ``_reconcile`` runs on every hook, ``update-status`` included, and used
+        to rewrite all eleven workload files each time. Reading first costs one
+        Pebble round trip per file instead of one write, and leaves the file's
+        mtime alone so anything watching it is not woken for nothing.
+
+        Only the content is compared. Nothing but this charm writes these
+        paths, so a file whose bytes are right but whose mode drifted is not a
+        case worth a second round trip; a container restart re-pushes
+        everything anyway.
+        """
+        try:
+            if container.pull(path).read() == content:
+                return
+        except (ops.pebble.PathError, ops.pebble.APIError, ops.pebble.ConnectionError):
+            pass
+        container.push(path, content, make_dirs=True, permissions=permissions)
 
     def _write_container_files(
         self,
@@ -963,62 +1083,53 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         sandbox_client_key_pem: str,
     ) -> str:
         """Push all rendered files to the container and return the rendered config TOML."""
-        container.push(
-            f"{JWT_DIR}/signing.key", jwt_signing_key_pem, make_dirs=True, permissions=0o600
-        )
-        container.push(
-            f"{JWT_DIR}/public.pem", jwt_public_key_pem, make_dirs=True, permissions=0o644
-        )
+
+        def push(path: str, content: str, mode: int) -> None:
+            self._push_if_changed(container, path, content, mode)
+
+        push(f"{JWT_DIR}/signing.key", jwt_signing_key_pem, 0o600)
+        push(f"{JWT_DIR}/public.pem", jwt_public_key_pem, 0o644)
         # Key ID is delivered as a path-oriented file, matching how the other
         # JWT material is exposed to the workload.
-        container.push(f"{JWT_DIR}/kid", jwt_kid, make_dirs=True, permissions=0o644)
-        container.push(f"{TLS_DIR}/tls.crt", tls_cert_pem, make_dirs=True, permissions=0o644)
-        container.push(f"{TLS_DIR}/tls.key", tls_key_pem, make_dirs=True, permissions=0o600)
-        container.push(f"{TLS_DIR}/ca.crt", tls_ca_pem, make_dirs=True, permissions=0o644)
+        push(f"{JWT_DIR}/kid", jwt_kid, 0o644)
+        push(f"{TLS_DIR}/tls.crt", tls_cert_pem, 0o644)
+        push(f"{TLS_DIR}/tls.key", tls_key_pem, 0o600)
+        push(f"{TLS_DIR}/ca.crt", tls_ca_pem, 0o644)
         # Add the CA to the system trust store so the binary's OIDC discovery
         # client can verify the issuer's TLS certificate (e.g. Hydra behind a
         # self-signed Traefik).
         self._install_ca_into_system_bundle(container, tls_ca_pem)
 
         # LXD mTLS material for the remote HTTPS driver.
-        container.push(
-            LXD_CLIENT_CERT_PATH, lxd_client_cert_pem, make_dirs=True, permissions=0o644
-        )
-        container.push(LXD_CLIENT_KEY_PATH, lxd_client_key_pem, make_dirs=True, permissions=0o600)
+        push(LXD_CLIENT_CERT_PATH, lxd_client_cert_pem, 0o644)
+        push(LXD_CLIENT_KEY_PATH, lxd_client_key_pem, 0o600)
         if lxd_server_ca_pem is not None:
-            container.push(
-                LXD_SERVER_CA_PATH, lxd_server_ca_pem, make_dirs=True, permissions=0o644
-            )
+            push(LXD_SERVER_CERT_PATH, lxd_server_ca_pem, 0o644)
 
         # Sandbox TLS material. The CA is the gateway's own issuer, so a
         # sandbox supervisor can verify the certificate the gateway presents;
         # the client certificate is the dedicated sandbox identity, never the
         # LXD one. The driver reads all three on every create, so a rotated
         # certificate reaches new sandboxes without a restart.
-        container.push(SANDBOX_TLS_CA_PATH, tls_ca_pem, make_dirs=True, permissions=0o644)
-        container.push(
-            SANDBOX_TLS_CERT_PATH, sandbox_client_cert_pem, make_dirs=True, permissions=0o644
-        )
-        container.push(
-            SANDBOX_TLS_KEY_PATH, sandbox_client_key_pem, make_dirs=True, permissions=0o600
-        )
+        push(SANDBOX_TLS_CA_PATH, tls_ca_pem, 0o644)
+        push(SANDBOX_TLS_CERT_PATH, sandbox_client_cert_pem, 0o644)
+        push(SANDBOX_TLS_KEY_PATH, sandbox_client_key_pem, 0o600)
 
         # Registry policy for skopeo, which the driver shells out to for the
-        # sandbox and supervisor images. Written unconditionally so removing a
+        # sandbox and supervisor images. Rendered unconditionally so removing a
         # host from config takes effect rather than lingering in the file.
-        container.push(
+        push(
             REGISTRIES_CONF_PATH,
             render_registries_conf(
                 parse_insecure_registries(
                     self._model_cfg.insecure_registries if self._model_cfg else None
                 )
             ),
-            make_dirs=True,
-            permissions=0o644,
+            0o644,
         )
 
         config_toml = self._render_config_toml(db_uri, issuer_url)
-        container.push(CONFIG_PATH, config_toml, make_dirs=True, permissions=0o600)
+        push(CONFIG_PATH, config_toml, 0o600)
         return config_toml
 
     def _install_ca_into_system_bundle(self, container: ops.Container, ca_pem: str) -> None:
@@ -1035,6 +1146,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         The image's original bundle is copied aside on first write and the
         system bundle is rebuilt from that copy every time, so repeated
         reconciles converge instead of appending the CA over and over.
+
+        Which issuers end up in the bundle is part of the workload hash — see
+        ``_transferred_trust`` — so a change of trust anchors restarts the
+        workload rather than leaving it on the roots it loaded at start-up.
         """
         try:
             pristine = container.pull(PRISTINE_CA_BUNDLE_PATH).read()
@@ -1063,6 +1178,15 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                     bundle += "\n"
 
         container.push(SYSTEM_CA_BUNDLE_PATH, bundle, make_dirs=True, permissions=0o644)
+
+    def _transferred_trust(self) -> str:
+        """Return the ``receive-ca-cert`` anchors as one stable string.
+
+        Derived from live relation state so the rolling-restart callback,
+        which may run in a later hook than the reconcile that requested it,
+        computes the same value.
+        """
+        return "".join(sorted(self._received_ca_certificates()))
 
     def _received_ca_certificates(self) -> set[str]:
         """Return CA certificates transferred over ``receive-ca-cert``.
@@ -1187,6 +1311,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             lxd_conn.url,
             sandbox_identity["certificate"],
             sandbox_identity["private-key"],
+            self._transferred_trust(),
         )
         self._ensure_restart_state(event, desired_hash, container)
 
@@ -1208,8 +1333,16 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         lxd_url: str,
         sandbox_client_cert_pem: str = "",
         sandbox_client_key_pem: str = "",
+        transferred_trust: str = "",
     ) -> str:
-        """Return a deterministic hex SHA-256 of the workload inputs."""
+        """Return a deterministic hex SHA-256 of the workload inputs.
+
+        ``transferred_trust`` is what ``receive-ca-cert`` contributed to the
+        workload's trust store. It belongs here because relating or removing a
+        provider changes which issuers the workload trusts, and a workload that
+        keeps running may keep using the roots it loaded at start-up. Sorted,
+        so a reordering does not restart anything.
+        """
         payload = (
             json.dumps(layer, sort_keys=True)
             + config_toml
@@ -1223,6 +1356,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             + lxd_url
             + sandbox_client_cert_pem
             + sandbox_client_key_pem
+            + transferred_trust
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -1328,6 +1462,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 lxd_conn.url,
                 sandbox_identity["certificate"],
                 sandbox_identity["private-key"],
+                self._transferred_trust(),
             )
         )
         return OperationResult.RELEASE
@@ -1404,11 +1539,16 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         gaps = self._readiness_gaps()
         container = self.unit.get_container(CONTAINER_NAME)
         running = False
+        driver_running = False
         if container.can_connect():
             services = container.get_services()
             running = SERVICE_NAME in services and services[SERVICE_NAME].is_running()
+            driver_running = (
+                DRIVER_SERVICE_NAME in services and services[DRIVER_SERVICE_NAME].is_running()
+            )
         jwt = self._read_jwt_keypair()
         lxd_conn = self._lxd_connection()
+        cfg = self._model_cfg
         event.set_results(
             {
                 "database-ready": str(self._database_uri() is not None),
@@ -1435,6 +1575,28 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 "metrics-endpoint-related": str(
                     self.model.get_relation(METRICS_RELATION) is not None
                 ),
+                # Workload health. The relation gaps above say nothing about a
+                # service that starts and exits, which is what bad driver
+                # arguments, a missing LXD project or an unreachable registry
+                # look like from here.
+                "driver-running": str(driver_running),
+                "workload-checks": (
+                    ", ".join(
+                        f"{name}={'up' if up else 'down'}"
+                        for name, up in sorted(self._check_status().items())
+                    )
+                    or "none"
+                ),
+                # Security-relevant settings an operator should not have to
+                # reconstruct from `juju config`.
+                "sandbox-egress-restricted": str(bool(cfg and cfg.restrict_sandbox_egress)),
+                "insecure-registries": ", ".join(
+                    parse_insecure_registries(cfg.insecure_registries if cfg else None)
+                )
+                or "none",
+                "received-ca-certificates": str(len(self._received_ca_certificates())),
+                "sandbox-image": cfg.sandbox_image if cfg else "",
+                "supervisor-image": cfg.supervisor_image if cfg else "",
             }
         )
 
@@ -1476,6 +1638,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         new_material = _generate_jwt_keypair()
         secret.set_content(new_material)
+        self._forget_jwt_keypair()
         self._reconcile(event)
         event.set_results({"kid": new_material["kid"], "store": "juju-secret"})
 
@@ -1492,6 +1655,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             event.fail(f"could not write the new signing key to Vault: {exc}")
             return
 
+        self._forget_jwt_keypair()
         self._reconcile(event)
         event.set_results({"kid": new_material["kid"], "store": "vault"})
 

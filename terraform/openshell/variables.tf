@@ -51,9 +51,10 @@ variable "risk" {
 variable "ha" {
   description = <<-EOT
     Raise the default unit count for every component that can genuinely run
-    more than one unit: the gateway, the integrator, both PostgreSQL clusters,
-    Hydra, Traefik, Vault and the collector. A component's own `units` still
-    wins, so this is a floor rather than a constraint.
+    more than one unit: the gateway, the integrator, PostgreSQL, Traefik, the
+    certificate provider, Vault and the collector. Identity is not deployed by
+    this stack and has its own. A component's own `units` still wins, so this
+    is a floor rather than a constraint.
 
     It does not make a single-node Kubernetes highly available. On one node the
     extra units land on the same machine and buy process-level redundancy only.

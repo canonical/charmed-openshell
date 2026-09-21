@@ -8,9 +8,12 @@ import json
 import os
 import re
 import stat
+from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import ops
 import ops.pebble
 import yaml
 from charms.data_platform_libs.v0.data_interfaces import CachedSecret
@@ -53,12 +56,13 @@ from charm import (
     _LxdConnection,
 )
 from config_model import (
+    CONFIG_PATH,
     DEFAULT_SANDBOX_IMAGE,
     DRIVER_SOCKET,
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CA_PATH,
+    LXD_SERVER_CERT_PATH,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
@@ -108,29 +112,6 @@ _LXD_CONN = _LxdConnection(
 )
 
 
-class _Patches:
-    """Enter several patchers as one context manager.
-
-    The ready-patch tuple is addressed positionally all over this module, so a
-    new patch is grouped with the one it belongs beside rather than appended,
-    which would silently leave it out of every existing call site.
-    """
-
-    def __init__(self, *patchers):
-        self._patchers = patchers
-        self._entered: list = []
-
-    def __enter__(self):
-        self._entered = [patcher.__enter__() for patcher in self._patchers]
-        return self._entered
-
-    def __exit__(self, *exc_info):
-        for patcher in reversed(self._patchers):
-            patcher.__exit__(*exc_info)
-        self._entered = []
-        return False
-
-
 def _all_relations():
     """Mandatory relations so model.get_relation() returns non-None for each."""
     return [
@@ -141,46 +122,58 @@ def _all_relations():
     ]
 
 
-def _all_ready_patches():
-    return (
+@contextlib.contextmanager
+def _all_ready(*, jwt: bool = True, lxd_connection: bool = True, extra: Sequence = ()):
+    """Patch out everything a unit needs to be ready, by name rather than position.
+
+    This used to be a tuple addressed as ``p[0], p[1], …`` at every call site,
+    so adding a patch meant grouping it into an existing slot rather than
+    appending — and one had already been grouped in twice by mistake. Keyword
+    arguments name the variants the tests actually use: a unit whose LXD
+    provider has published nothing (``lxd_connection=False``), and one whose
+    JWT store is under test and must not be patched (``jwt=False``).
+    """
+    patches = [
         patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_DB_URI),
         patch.object(
             OpenshellGatewayK8sCharm, "_tls_material", return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY)
         ),
         patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
-        patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
-        patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
-        _Patches(
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_lxd_client_identity",
-                return_value=_FAKE_LXD_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
+        patch.object(
+            OpenshellGatewayK8sCharm,
+            "_ensure_lxd_client_identity",
+            return_value=_FAKE_LXD_IDENTITY,
         ),
-        _Patches(
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_lxd_client_identity",
-                return_value=_FAKE_LXD_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
+        patch.object(
+            OpenshellGatewayK8sCharm,
+            "_read_lxd_client_identity",
+            return_value=_FAKE_LXD_IDENTITY,
         ),
-        patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
-    )
+        patch.object(
+            OpenshellGatewayK8sCharm,
+            "_ensure_sandbox_client_identity",
+            return_value=_FAKE_SANDBOX_IDENTITY,
+        ),
+        patch.object(
+            OpenshellGatewayK8sCharm,
+            "_read_sandbox_client_identity",
+            return_value=_FAKE_SANDBOX_IDENTITY,
+        ),
+    ]
+    if jwt:
+        patches += [
+            patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
+        ]
+    if lxd_connection:
+        patches.append(
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN)
+        )
+
+    with contextlib.ExitStack() as stack:
+        for patcher in (*patches, *extra):
+            stack.enter_context(patcher)
+        yield
 
 
 def _all_ready_state():
@@ -465,16 +458,14 @@ class TestActiveScenario:
     def _run_pebble_ready(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         return out, ctx
 
     def test_active_when_all_ready(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert out.unit_status == ActiveStatus()
 
@@ -537,17 +528,16 @@ class TestExternalHostnameIp:
             containers=[_CONN_CONTAINER],
             relations=_all_relations(),
         )
-        p_db, _tls, p_issuer, p_jwt1, p_jwt2, _lxd1, _lxd2, _lxd3 = _all_ready_patches()
         with (
             patch.object(
                 TLSCertificatesRequiresV4,
                 "get_assigned_certificate",
                 return_value=(None, None),
             ) as mock_cert,
-            p_db,
-            p_issuer,
-            p_jwt1,
-            p_jwt2,
+            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_DB_URI),
+            patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
+            patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
+            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
         ):
             ctx.run(ctx.on.config_changed(), state)
         args = mock_cert.call_args
@@ -628,8 +618,7 @@ class TestGatewayEndpoint:
             ],
             model=Model(name="prod"),
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         return out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
 
@@ -700,16 +689,8 @@ class TestTeardown:
             containers=[_CONN_CONTAINER],
             relations=[restart_rel, *_all_relations()],
         )
-        ready = _all_ready_patches()
         with (
-            ready[0],
-            ready[1],
-            ready[2],
-            ready[3],
-            ready[4],
-            ready[5],
-            ready[6],
-            ready[7],
+            _all_ready(),
         ):
             running = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
 
@@ -752,17 +733,8 @@ class TestTeardown:
 
         restart_rel = next(r for r in stopped.relations if r.endpoint == RESTART_RELATION)
         assert APPLIED_HASH_KEY not in restart_rel.local_unit_data
-
-        ready = _all_ready_patches()
         with (
-            ready[0],
-            ready[1],
-            ready[2],
-            ready[3],
-            ready[4],
-            ready[5],
-            ready[6],
-            ready[7],
+            _all_ready(),
             patch("ops.model.Container.replan") as replan_mock,
         ):
             recovered = ctx.run(ctx.on.config_changed(), stopped)
@@ -837,8 +809,7 @@ class TestJwtKeypair:
     def test_pushed_signing_key_starts_with_pem_header(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         assert (
@@ -850,8 +821,7 @@ class TestJwtKeypair:
     def test_pushed_public_key_starts_with_pem_header(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         assert (
@@ -870,8 +840,7 @@ class TestFiles:
     def test_all_expected_files_exist_when_active(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         for rel_path in [
@@ -894,8 +863,7 @@ class TestCaTransfer:
     def test_no_error_when_no_send_ca_cert_relation(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
 
 
@@ -908,10 +876,9 @@ class TestIdempotency:
     def test_second_reconcile_no_error(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out2 = ctx.run(ctx.on.pebble_ready(out1.get_container(CONTAINER_NAME)), out1)
         assert out2 is not None
 
@@ -1010,8 +977,7 @@ class TestFilePermissions:
     def _run_active(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = _all_ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         return fs
@@ -1090,6 +1056,14 @@ class TestRollingRestartMetadata:
         assert "restart" in meta.get("peers", {})
         assert meta["peers"]["restart"]["interface"] == "rolling_op"
         assert "restart" in meta.get("actions", {})
+
+    def test_trust_transfer_is_limited_to_one_provider(self):
+        # Every certificate transferred here becomes a trust anchor in the
+        # workload; an unbounded number of applications able to add one is an
+        # unbounded trust decision.
+        meta_path = Path(__file__).parent.parent.parent / "charmcraft.yaml"
+        meta = yaml.safe_load(meta_path.read_text())
+        assert meta["requires"][RECEIVE_CA_RELATION]["limit"] == 1
 
 
 class TestWorkloadConfigHash:
@@ -1198,16 +1172,8 @@ class TestRollingRestartLifecycle:
     def test_first_reconcile_records_hash_no_restart(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
@@ -1219,18 +1185,10 @@ class TestRollingRestartLifecycle:
     def test_steady_state_no_restart(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
@@ -1243,8 +1201,7 @@ class TestRollingRestartLifecycle:
     def test_config_change_triggers_lock(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
 
         # Change a config option that flows into the rendered TOML.
@@ -1255,14 +1212,7 @@ class TestRollingRestartLifecycle:
             relations=list(out1.relations),
         )
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.config_changed(), state2)
@@ -1274,16 +1224,8 @@ class TestRollingRestartLifecycle:
     def test_upgrade_charm_acquires_lock(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out = ctx.run(ctx.on.upgrade_charm(), state)
@@ -1295,8 +1237,7 @@ class TestRollingRestartLifecycle:
     def test_cert_rotation_triggers_lock(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
 
         rotated_cert = MagicMock(
@@ -1304,14 +1245,7 @@ class TestRollingRestartLifecycle:
             ca="-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----",
         )
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_tls_material",
@@ -1332,8 +1266,7 @@ class TestRollingRestartLifecycle:
     def test_jwt_rotation_triggers_lock(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
 
         rotated_jwt = {
@@ -1342,14 +1275,7 @@ class TestRollingRestartLifecycle:
             "kid": "rotatedkid",
         }
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=rotated_jwt
             ),
@@ -1369,8 +1295,7 @@ class TestRollingRestartLifecycle:
     def test_jwt_rotation_writes_kid_file(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
 
         rotated_jwt = {
@@ -1379,14 +1304,7 @@ class TestRollingRestartLifecycle:
             "kid": "rotatedkid",
         }
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=rotated_jwt
             ),
@@ -1440,7 +1358,10 @@ class TestPebbleChecks:
 
         driver_check = cast(dict[str, Any], checks[DRIVER_CHECK_NAME])
         assert driver_check["override"] == "replace"
-        assert "level" not in driver_check
+        # "ready" like the gateway's own check: the driver is the only way this
+        # gateway creates a sandbox, so a unit whose driver is down is not
+        # ready and Pebble's readiness has to say so.
+        assert driver_check["level"] == "ready"
         assert driver_check["period"] == CHECK_PERIOD
         assert driver_check["timeout"] == CHECK_TIMEOUT
         assert driver_check["threshold"] == CHECK_THRESHOLD
@@ -1569,8 +1490,7 @@ class TestLxdDatabag:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
         assert lxd_rel_out.local_app_data["version"] == LXD_INTERFACE_VERSION
@@ -1602,8 +1522,7 @@ class TestLxdDatabag:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
         assert "projects" not in lxd_rel_out.local_app_data
@@ -1624,8 +1543,7 @@ class TestLxdDatabag:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
         assert lxd_rel_out.local_app_data == {}
@@ -1772,8 +1690,7 @@ class TestLxdConnection:
                 rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
         assert "--lxd-url https://10.0.0.1:8443" in cmd
@@ -1798,8 +1715,7 @@ class TestLxdConnection:
                 rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
         assert "--lxd-url https://10.0.0.1:8443" in cmd
@@ -1887,8 +1803,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         assert (fs / "etc" / "openshell" / "lxd" / "client.crt").read_text() == _FAKE_LXD_IDENTITY[
@@ -1919,8 +1834,7 @@ class TestLxdFilesAndLayer:
             ],
             model=Model(name="prod"),
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         plan = out.get_container(CONTAINER_NAME).plan
         cmd = plan.services[DRIVER_SERVICE_NAME].command
@@ -1950,8 +1864,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         sandbox_dir = fs / "etc" / "openshell" / "sandbox-tls"
@@ -1978,8 +1891,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
         sandbox_dir = fs / "etc" / "openshell" / "sandbox-tls"
@@ -2003,8 +1915,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
         assert f"--guest-tls-ca {SANDBOX_TLS_CA_PATH}" in cmd
@@ -2034,8 +1945,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+        with _all_ready(lxd_connection=False):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
         assert "--project openshell" in cmd
@@ -2061,8 +1971,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+        with _all_ready(lxd_connection=False):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
         assert "--project" not in cmd
@@ -2090,8 +1999,7 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+        with _all_ready(lxd_connection=False):
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert isinstance(out.unit_status, WaitingStatus)
         assert "lxd connection details" in out.unit_status.message
@@ -2118,15 +2026,8 @@ class TestLxdFilesAndLayer:
             ],
             model=Model(name="prod"),
         )
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
+            _all_ready(lxd_connection=False),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_lxd_connection",
@@ -2165,15 +2066,8 @@ class TestLxdFilesAndLayer:
             ],
             model=Model(name="prod"),
         )
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
+            _all_ready(lxd_connection=False),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_lxd_connection",
@@ -2205,15 +2099,8 @@ class TestLxdFilesAndLayer:
             ],
             model=Model(name="prod"),
         )
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
+            _all_ready(lxd_connection=False),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_lxd_connection",
@@ -2226,7 +2113,7 @@ class TestLxdFilesAndLayer:
         ):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert f"--lxd-server-ca {LXD_SERVER_CA_PATH}" in cmd
+        assert f"--lxd-server-cert {LXD_SERVER_CERT_PATH}" in cmd
         assert "--lxd-server-fingerprint" not in cmd
 
     def test_driver_layer_socket_only_when_no_connection(self):
@@ -2244,15 +2131,8 @@ class TestLxdFilesAndLayer:
                 lxd_rel,
             ],
         )
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
+            _all_ready(lxd_connection=False),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=None),
         ):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
@@ -2270,8 +2150,7 @@ class TestLxdReadinessGaps:
             containers=[_CONN_CONTAINER],
             relations=[Relation("database"), Relation("certificates"), Relation("oauth")],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert isinstance(out.unit_status, BlockedStatus)
         assert "lxd relation missing" in out.unit_status.message
@@ -2321,14 +2200,8 @@ class TestLxdReadinessGaps:
                 Relation(LXD_RELATION),
             ],
         )
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[7],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_read_lxd_client_identity",
@@ -2354,15 +2227,8 @@ class TestLxdReadinessGaps:
                 Relation(LXD_RELATION),
             ],
         )
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
+            _all_ready(lxd_connection=False),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=None),
         ):
             out = ctx.run(ctx.on.collect_unit_status(), state)
@@ -2381,8 +2247,7 @@ class TestLxdReadinessGaps:
                 Relation(LXD_RELATION),
             ],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert out.unit_status == ActiveStatus()
 
@@ -2405,8 +2270,7 @@ class TestLxdHash:
     def test_hash_changes_on_lxd_rotation(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state_with_lxd()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
         hash_before = peer_rel1.local_unit_data[APPLIED_HASH_KEY]
@@ -2416,11 +2280,7 @@ class TestLxdHash:
             "private-key": "-----BEGIN PRIVATE KEY-----\nROTATED\n-----END PRIVATE KEY-----",
         }
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_ensure_lxd_client_identity",
@@ -2431,8 +2291,6 @@ class TestLxdHash:
                 "_read_lxd_client_identity",
                 return_value=rotated_identity,
             ),
-            p[6],
-            p[7],
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
@@ -2444,8 +2302,7 @@ class TestLxdHash:
     def test_hash_changes_on_sandbox_identity_rotation(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state_with_lxd()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
         hash_before = peer_rel1.local_unit_data[APPLIED_HASH_KEY]
@@ -2455,11 +2312,7 @@ class TestLxdHash:
             "private-key": "-----BEGIN PRIVATE KEY-----\nSBXROT\n-----END PRIVATE KEY-----",
         }
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_ensure_lxd_client_identity",
@@ -2480,7 +2333,6 @@ class TestLxdHash:
                 "_read_sandbox_client_identity",
                 return_value=rotated,
             ),
-            p[7],
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
@@ -2492,8 +2344,7 @@ class TestLxdHash:
     def test_hash_changes_on_lxd_address_change(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state_with_lxd()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
         hash_before = peer_rel1.local_unit_data[APPLIED_HASH_KEY]
@@ -2504,13 +2355,7 @@ class TestLxdHash:
             fingerprint=_LXD_CONN.fingerprint,
         )
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
+            _all_ready(lxd_connection=False),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=new_conn),
             patch("ops.model.Container.restart") as restart_mock,
         ):
@@ -2523,18 +2368,10 @@ class TestLxdHash:
     def test_hash_stable_when_lxd_unchanged(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = self._ready_state_with_lxd()
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
@@ -2579,16 +2416,8 @@ class TestReplanResilience:
             if len(calls) == 1:
                 raise ops.pebble.ChangeError("replan failed", change=None)
 
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.replan", side_effect=flaky_replan),
         ):
             out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
@@ -2598,14 +2427,7 @@ class TestReplanResilience:
         assert len(calls) == 1
 
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch("ops.model.Container.replan", side_effect=flaky_replan),
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
@@ -2662,8 +2484,7 @@ class TestMetricsEndpoint:
 
     def test_provider_is_constructed_with_the_configured_port(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             state = self._state(**{"metrics-port": 9464})
             with ctx(ctx.on.config_changed(), state) as manager:
                 manager.run()
@@ -2676,8 +2497,7 @@ class TestMetricsEndpoint:
 
     def test_provider_is_absent_when_metrics_are_disabled(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             state = self._state(**{"metrics-port": 0})
             with ctx(ctx.on.config_changed(), state) as manager:
                 manager.run()
@@ -2693,8 +2513,7 @@ class TestMetricsEndpoint:
             containers=[_CONN_CONTAINER],
             relations=_all_relations() + [PeerRelation(PEER_RELATION), metrics_rel],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.relation_joined(metrics_rel), state)
         published = next(r for r in out.relations if r.endpoint == METRICS_RELATION)
         jobs = json.loads(published.local_app_data["scrape_jobs"])
@@ -2703,20 +2522,18 @@ class TestMetricsEndpoint:
 
     def test_metrics_port_is_opened(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.config_changed(), self._state(**{"metrics-port": 9464}))
         assert TCPPort(9464) in out.opened_ports
 
     def test_metrics_port_is_closed_when_disabled(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.config_changed(), self._state(**{"metrics-port": 9464}))
         assert TCPPort(9464) in out1.opened_ports
 
         disabled = dataclasses.replace(out1, config={**BOTH_ROLES, "metrics-port": 0})
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out2 = ctx.run(ctx.on.config_changed(), disabled)
         assert TCPPort(9464) not in out2.opened_ports
         # The gateway's own listener is untouched.
@@ -2724,8 +2541,7 @@ class TestMetricsEndpoint:
 
     def test_env_carries_the_metrics_port(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(
                 ctx.on.pebble_ready(_CONN_CONTAINER), self._state(**{"metrics-port": 9464})
             )
@@ -2744,16 +2560,14 @@ class TestMetricsEndpoint:
             containers=[_CONN_CONTAINER],
             relations=_all_relations() + [PeerRelation(PEER_RELATION), metrics_rel],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             ctx.run(ctx.on.action("get-gateway-status"), state)
         assert ctx.action_results["metrics-port"] == "0"
         assert ctx.action_results["metrics-endpoint-related"] == "True"
 
     def test_status_action_reports_metrics_enabled(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             ctx.run(ctx.on.action("get-gateway-status"), self._state(**{"metrics-port": 9464}))
         assert ctx.action_results["metrics-port"] == "9464"
         assert ctx.action_results["metrics-endpoint-related"] == "False"
@@ -2767,8 +2581,7 @@ class TestMetricsEndpoint:
             containers=[_CONN_CONTAINER],
             relations=_all_relations() + [PeerRelation(PEER_RELATION), metrics_rel],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.collect_unit_status(), state)
         assert isinstance(out.unit_status, ActiveStatus)
         assert "metrics-port is 0" in out.unit_status.message
@@ -2801,9 +2614,7 @@ class TestSystemCaBundle:
             mounts={"ssl": Mount(location="/etc/ssl/certs", source=tmp_path)},
         )
         (tmp_path / "ca-certificates.crt").write_text(self._PUBLIC_ROOTS)
-
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out = ctx.run(ctx.on.pebble_ready(container), self._state(container))
 
         bundle = (tmp_path / "ca-certificates.crt").read_text()
@@ -2820,9 +2631,7 @@ class TestSystemCaBundle:
             mounts={"ssl": Mount(location="/etc/ssl/certs", source=tmp_path)},
         )
         (tmp_path / "ca-certificates.crt").write_text(self._PUBLIC_ROOTS)
-
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             out1 = ctx.run(ctx.on.pebble_ready(container), self._state(container))
             ctx.run(ctx.on.config_changed(), out1)
 
@@ -2902,8 +2711,7 @@ class TestGrafanaDashboard:
             containers=[_CONN_CONTAINER],
             relations=_all_relations() + [PeerRelation(PEER_RELATION), rel],
         )
-        p = _all_ready_patches()
-        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+        with _all_ready():
             # The library scans the dashboards directory on config-changed,
             # leader-elected and upgrade-charm, not on relation-joined.
             out = ctx.run(ctx.on.config_changed(), state)
@@ -2940,16 +2748,8 @@ class TestReceivedCaCertificates:
         ctx = Context(OpenshellGatewayK8sCharm)
         container = self._container(tmp_path)
         rel = Relation(RECEIVE_CA_RELATION, remote_app_name="hydra")
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_received_ca_certificates",
@@ -2965,16 +2765,8 @@ class TestReceivedCaCertificates:
     def test_no_relation_means_no_extra_cas(self, tmp_path):
         ctx = Context(OpenshellGatewayK8sCharm)
         container = self._container(tmp_path)
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             ctx(ctx.on.pebble_ready(container), self._state(container, [])) as manager,
         ):
             manager.run()
@@ -2987,16 +2779,8 @@ class TestReceivedCaCertificates:
         container = self._container(tmp_path)
         rel = Relation(RECEIVE_CA_RELATION, remote_app_name="hydra")
         second = "-----BEGIN CERTIFICATE-----\nOTHERCA\n-----END CERTIFICATE-----\n"
-        p = _all_ready_patches()
         with (
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            p[4],
-            p[5],
-            p[6],
-            p[7],
+            _all_ready(),
             patch.object(
                 OpenshellGatewayK8sCharm,
                 "_received_ca_certificates",
@@ -3009,3 +2793,169 @@ class TestReceivedCaCertificates:
         assert (tmp_path / "ca-certificates.crt").read_text() == first
         assert first.count("IDENTITYCA") == 1
         assert first.count("OTHERCA") == 1
+
+
+class TestSandboxEgressRestriction:
+    """The driver confines a sandbox only when the charm asks it to."""
+
+    def _command(self, **config):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = State(
+            config={**BOTH_ROLES, **config},
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+        with _all_ready():
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        return out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+
+    def test_egress_is_restricted_by_default(self):
+        # Sandboxes run untrusted agent workloads. Unrestricted, one reaches
+        # the LAN it sits on, the LXD host and the LXD API itself.
+        assert "--restrict-sandbox-egress" in self._command()
+
+    def test_the_operator_can_turn_it_off_for_a_bridge(self):
+        # LXD applies network ACLs to individual NICs only on OVN networks.
+        assert "--restrict-sandbox-egress" not in self._command(
+            **{"restrict-sandbox-egress": False}
+        )
+
+
+class TestWorkloadHealthInStatus:
+    """A workload service that exits must not leave the unit reporting Active."""
+
+    def _status(self, *, driver_up=True, gateway_up=True, checks=None, converged=True):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        relations = _all_relations() + [PeerRelation(PEER_RELATION)]
+        if converged:
+            relations.append(
+                PeerRelation(
+                    RESTART_RELATION, local_unit_data={APPLIED_HASH_KEY: "converged-once"}
+                )
+            )
+        else:
+            relations.append(PeerRelation(RESTART_RELATION))
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            model=Model(name="my-model"),
+            containers=[_CONN_CONTAINER],
+            relations=relations,
+        )
+
+        def services(_self, *_args, **_kwargs):
+            def info(up):
+                return SimpleNamespace(is_running=lambda: up)
+
+            return {
+                SERVICE_NAME: info(gateway_up),
+                DRIVER_SERVICE_NAME: info(driver_up),
+            }
+
+        with (
+            _all_ready(),
+            patch.object(ops.model.Container, "get_services", services),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_check_status",
+                return_value=checks if checks is not None else {},
+            ),
+        ):
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        return out.unit_status
+
+    def test_a_dead_driver_is_not_active(self):
+        # Bad driver arguments, a missing LXD project or an unreachable
+        # registry all look like this, and used to leave the unit Active with
+        # an empty readiness-gaps until a sandbox create failed.
+        status = self._status(driver_up=False)
+        assert isinstance(status, WaitingStatus)
+        assert "lxd driver service is not running" in status.message
+
+    def test_a_dead_gateway_is_not_active(self):
+        status = self._status(gateway_up=False)
+        assert isinstance(status, WaitingStatus)
+        assert "gateway service is not running" in status.message
+
+    def test_a_failing_check_is_not_active(self):
+        status = self._status(checks={DRIVER_CHECK_NAME: False, READINESS_CHECK_NAME: True})
+        assert isinstance(status, WaitingStatus)
+        assert DRIVER_CHECK_NAME in status.message
+
+    def test_a_healthy_workload_is_active(self):
+        status = self._status(
+            checks={DRIVER_CHECK_NAME: True, READINESS_CHECK_NAME: True},
+        )
+        assert isinstance(status, ActiveStatus)
+
+    def test_services_absent_before_the_first_convergence_are_not_a_gap(self):
+        # Before the charm has converged once the services are absent by
+        # design, and the relation gaps are the story.
+        assert isinstance(self._status(driver_up=False, converged=False), ActiveStatus)
+
+
+class TestTrustBundleRestartsTheWorkload:
+    """Changing the workload's trust anchors has to reach the running process."""
+
+    _IDENTITY_CA = "-----BEGIN CERTIFICATE-----\nIDENTITYCA\n-----END CERTIFICATE-----\n"
+
+    def _hash(self, received):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        restart_rel = PeerRelation(RESTART_RELATION)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            # Fixed, because the gateway endpoint the driver command carries is
+            # built from the model name and a random one would make the hash
+            # differ for reasons that have nothing to do with trust.
+            model=Model(name="my-model"),
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION), restart_rel],
+        )
+        with (
+            _all_ready(),
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_received_ca_certificates",
+                return_value=received,
+            ),
+        ):
+            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
+        rel = next(r for r in out.relations if r.endpoint == RESTART_RELATION)
+        return rel.local_unit_data.get(APPLIED_HASH_KEY)
+
+    def test_a_new_trust_anchor_changes_the_workload_hash(self):
+        # Otherwise relating receive-ca-cert rewrites the trust store and the
+        # workload keeps using the roots it loaded at start-up.
+        assert self._hash(set()) != self._hash({self._IDENTITY_CA})
+
+    def test_the_same_anchors_leave_the_hash_alone(self):
+        assert self._hash({self._IDENTITY_CA}) == self._hash({self._IDENTITY_CA})
+
+
+class TestPushOnlyWhatChanged:
+    """_reconcile runs on every hook; rewriting every file each time is waste."""
+
+    def test_an_unchanged_file_is_not_pushed_again(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)],
+        )
+        with (
+            _all_ready(),
+            ctx(ctx.on.pebble_ready(_CONN_CONTAINER), state) as manager,
+        ):
+            manager.run()
+            charm = manager.charm
+            container = charm.unit.get_container(CONTAINER_NAME)
+            with patch("ops.model.Container.push") as push_mock:
+                charm._push_if_changed(
+                    container, CONFIG_PATH, container.pull(CONFIG_PATH).read(), 0o600
+                )
+                assert push_mock.call_count == 0
+                charm._push_if_changed(container, CONFIG_PATH, "something else", 0o600)
+                assert push_mock.call_count == 1
