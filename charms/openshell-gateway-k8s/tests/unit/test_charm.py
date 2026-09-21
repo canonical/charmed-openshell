@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import stat
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,7 @@ from charm import (
     CHECK_THRESHOLD,
     CHECK_TIMEOUT,
     CONTAINER_NAME,
+    DASHBOARD_RELATION,
     DRIVER_CHECK_NAME,
     DRIVER_SERVICE_NAME,
     GATEWAY_CMD,
@@ -2781,3 +2783,68 @@ class TestSystemCaBundle:
         bundle = (tmp_path / "ca-certificates.crt").read_text()
         assert bundle.count(str(_FAKE_TLS_CERT.ca).strip().splitlines()[1]) == 1
         assert bundle.count("ROOTA") == 1
+
+
+class TestGrafanaDashboard:
+    """The charm ships a dashboard built on the metrics it actually exports."""
+
+    _DASHBOARD = Path(__file__).parent.parent.parent / "src" / "grafana_dashboards"
+
+    def test_dashboard_file_is_valid_json(self):
+        files = sorted(self._DASHBOARD.glob("*.json"))
+        assert files, "no dashboard shipped in src/grafana_dashboards"
+        for path in files:
+            json.loads(path.read_text())
+
+    def test_dashboard_queries_only_metrics_the_gateway_exports(self):
+        # A panel querying a metric the workload never emits renders an empty
+        # graph and looks like an outage. These are the names registered in
+        # OpenShell v0.0.116's openshell-server crate.
+        exported = {
+            "up",
+            "openshell_server_grpc_requests_total",
+            "openshell_server_grpc_request_duration_seconds_bucket",
+            "openshell_server_http_requests_total",
+            "openshell_server_readiness_database_healthy",
+            "openshell_server_readiness_database_probe_duration_seconds_bucket",
+        }
+        pattern = re.compile(r"\b(openshell_[a-z0-9_]+|up)\b")
+        for path in sorted(self._DASHBOARD.glob("*.json")):
+            dashboard = json.loads(path.read_text())
+            for panel in dashboard["panels"]:
+                for target in panel.get("targets", []):
+                    for name in pattern.findall(target["expr"]):
+                        assert name in exported, f"{path.name}: unknown metric {name}"
+
+    def test_every_panel_is_scoped_by_juju_topology(self):
+        # Without the topology selectors one model's dashboard shows another
+        # model's data.
+        for path in sorted(self._DASHBOARD.glob("*.json")):
+            dashboard = json.loads(path.read_text())
+            names = {var["name"] for var in dashboard["templating"]["list"]}
+            assert {"juju_model", "juju_model_uuid", "juju_application", "juju_unit"} <= names
+            for panel in dashboard["panels"]:
+                for target in panel.get("targets", []):
+                    assert "juju_model=~" in target["expr"], panel["title"]
+                    assert "juju_application=~" in target["expr"], panel["title"]
+
+    def test_dashboard_is_published_to_a_related_grafana(self):
+        # charm_root points at the real charm directory: the provider reads the
+        # dashboards off disk relative to it, and Scenario's default root is an
+        # empty temporary directory that has no src/grafana_dashboards.
+        ctx = Context(OpenshellGatewayK8sCharm, charm_root=self._DASHBOARD.parent.parent)
+        rel = Relation(DASHBOARD_RELATION, remote_app_name="grafana-k8s")
+        state = State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION), rel],
+        )
+        p = _all_ready_patches()
+        with p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]:
+            # The library scans the dashboards directory on config-changed,
+            # leader-elected and upgrade-charm, not on relation-joined.
+            out = ctx.run(ctx.on.config_changed(), state)
+        published = next(r for r in out.relations if r.endpoint == DASHBOARD_RELATION)
+        assert published.local_app_data.get("dashboards"), published.local_app_data
+        assert "openshell-gateway" in published.local_app_data["dashboards"]

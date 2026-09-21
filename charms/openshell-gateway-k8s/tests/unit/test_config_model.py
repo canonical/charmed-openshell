@@ -9,6 +9,7 @@ from config_model import (
     BIND_ADDRESS,
     DEFAULT_METRICS_PORT,
     DEFAULT_SANDBOX_IMAGE,
+    DEFAULT_SUPERVISOR_IMAGE,
     DRIVER_SOCKET,
     GATEWAY_ID,
     GATEWAY_PORT,
@@ -483,6 +484,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
@@ -496,6 +498,7 @@ class TestRenderDriverCommand:
             f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
             f" --lxd-server-ca {LXD_SERVER_CA_PATH}"
             " --default-image openshell-sandbox"
+            " --supervisor-image ghcr.io/nvidia/openshell/supervisor:0.0.116"
             " --operation-timeout-secs 60"
             " --log-level info"
             " --gateway-endpoint https://openshell-gateway.my-model.svc.cluster.local:8443"
@@ -508,6 +511,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://gw:8443",
@@ -520,6 +524,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://gw:8443",
@@ -533,6 +538,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://gw:8443",
@@ -547,6 +553,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
@@ -560,6 +567,7 @@ class TestRenderDriverCommand:
             render_driver_command(
                 "https://10.0.0.1:8443",
                 "openshell-sandbox",
+                "ghcr.io/nvidia/openshell/supervisor:0.0.116",
                 60,
                 "info",
                 "https://openshell-gateway.my-model.svc.cluster.local:8443",
@@ -571,6 +579,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
@@ -586,6 +595,7 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             endpoint,
@@ -700,3 +710,26 @@ class TestMetricsPort:
         # and actually restarts the workload.
         cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 0})
         assert render_env(cfg)["OPENSHELL_METRICS_PORT"] == "0"
+
+
+class TestSupervisorImage:
+    def test_default_is_the_upstream_supervisor(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.supervisor_image == DEFAULT_SUPERVISOR_IMAGE
+
+    def test_rendered_into_the_driver_command(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "img",
+            "192.168.1.166:5000/openshell-supervisor:v0.0.116",
+            60,
+            "info",
+            "https://gw:8443",
+            server_fingerprint="abcdef",
+        )
+        assert " --supervisor-image 192.168.1.166:5000/openshell-supervisor:v0.0.116" in cmd
+
+    def test_rejects_control_characters(self):
+        model, error = load_config({**BOTH_ROLES_MINIMAL, "supervisor-image": "bad\nvalue"})
+        assert model is None
+        assert error is not None

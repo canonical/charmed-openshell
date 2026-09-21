@@ -50,6 +50,8 @@ charm-libs:
     version: "0"
   - lib: vault_k8s.vault_kv
     version: "0"
+  - lib: grafana_k8s.grafana_dashboard
+    version: "0"
 
 containers:
   gateway:
@@ -92,6 +94,11 @@ provides:
     interface: certificate_transfer
   metrics-endpoint:
     interface: prometheus_scrape
+  grafana-dashboard:
+    interface: grafana_dashboard
+    # The dashboard is built on the metrics the gateway exports, so it is only
+    # useful alongside a metrics-endpoint relation; relating it on its own
+    # gives Grafana a dashboard with no data behind it.
 
 actions:
   get-oidc-client-config:
@@ -170,6 +177,18 @@ config:
       description: >
         Lifetime, in seconds, of tokens minted by the gateway for sandbox
         supervisor authentication. Must be a positive integer.
+    supervisor-image:
+      type: string
+      default: ghcr.io/nvidia/openshell/supervisor:latest
+      description: >
+        OCI image reference the LXD driver extracts the sandbox boundary binary
+        from, passed as --supervisor-image. Despite the flag's name, what the
+        driver pulls out of it is /openshell-sandbox. It must come from the
+        same OpenShell release as the gateway image: a mismatched pair fails to
+        sync policy and the supervisor exits. Point this at the
+        openshell-supervisor rock built alongside the gateway rock, or at a
+        version-pinned upstream tag; the floating default is a convenience for
+        trying things out, not a supported pairing.
     lxd-sandbox-image:
       type: string
       default: ghcr.io/nvidia/openshell-community/sandboxes/base:latest

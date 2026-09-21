@@ -20,6 +20,7 @@ from charms.certificate_transfer_interface.v1.certificate_transfer import (
     CertificateTransferProvides,
 )
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
+from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
 from charms.hydra.v0.oauth import ClientConfig, OAuthRequirer
 from charms.prometheus_k8s.v0.prometheus_scrape import MetricsEndpointProvider
 from charms.tls_certificates_interface.v4.tls_certificates import (
@@ -81,6 +82,7 @@ PEER_SANDBOX_SECRET_ID_KEY = "sandbox-secret-id"
 LXD_INTERFACE_VERSION = "1.0"
 LXD_RELATION = "lxd"
 METRICS_RELATION = "metrics-endpoint"
+DASHBOARD_RELATION = "grafana-dashboard"
 VAULT_RELATION = "vault-kv"
 STATIC_REDIRECT_URI = "https://openshell.invalid/unused"
 DATABASE_NAME = "openshell"
@@ -177,6 +179,12 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         # The library publishes a default job scraping port 80 when handed an
         # empty job list, so "disabled" has to mean "no provider", not "a
         # provider with nothing to say".
+        # Always constructed, unlike the metrics provider: the dashboard is
+        # static content and costs nothing to publish, and an operator who
+        # relates Grafana before turning metrics on should still get the
+        # dashboard rather than silence.
+        self.grafana_dashboards = GrafanaDashboardProvider(self, relation_name=DASHBOARD_RELATION)
+
         self.metrics_endpoint: MetricsEndpointProvider | None = None
         metrics_port = self._metrics_port()
         if metrics_port:
@@ -815,6 +823,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             driver_command = render_driver_command(
                 url=lxd_connection.url,
                 default_image=self._model_cfg.lxd_sandbox_image,
+                supervisor_image=self._model_cfg.supervisor_image,
                 operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
                 log_level=self._model_cfg.log_level,
                 gateway_endpoint=self._gateway_endpoint(),

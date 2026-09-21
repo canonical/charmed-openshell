@@ -43,6 +43,13 @@ METRICS_DISABLED: int = 0
 # pulls it, so a bare LXD image alias (what this used to default to) fails
 # on the first create. This mirrors the driver's own default.
 DEFAULT_SANDBOX_IMAGE: str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+
+# Image the driver extracts the sandbox boundary binary from. Despite the
+# driver's flag being --supervisor-image, what it pulls out is
+# /openshell-sandbox. It must come from the same OpenShell release as the
+# gateway: a mismatched pair fails to sync policy and the supervisor exits,
+# which is why this is configurable rather than pinned to a floating tag.
+DEFAULT_SUPERVISOR_IMAGE: str = "ghcr.io/nvidia/openshell/supervisor:latest"
 DRIVERS: str = "lxd"
 # Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"
@@ -113,6 +120,7 @@ class GatewayConfig(pydantic.BaseModel):
     jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
     metrics_port: int = Field(default=DEFAULT_METRICS_PORT, alias="metrics-port")
     lxd_sandbox_image: str = Field(default=DEFAULT_SANDBOX_IMAGE, alias="lxd-sandbox-image")
+    supervisor_image: str = Field(default=DEFAULT_SUPERVISOR_IMAGE, alias="supervisor-image")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
@@ -140,6 +148,7 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_user_role",
         "gateway_id",
         "lxd_sandbox_image",
+        "supervisor_image",
         mode="after",
     )
     @classmethod
@@ -394,6 +403,7 @@ def load_config(raw: Mapping[str, Any]) -> tuple[GatewayConfig | None, str | Non
 def render_driver_command(
     url: str,
     default_image: str,
+    supervisor_image: str,
     operation_timeout_secs: int,
     log_level: str,
     gateway_endpoint: str,
@@ -412,6 +422,10 @@ def render_driver_command(
     ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
     flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
     (scheme + host + port) reachable by sandbox supervisors.
+
+    ``supervisor_image`` is where the driver gets the sandbox boundary binary.
+    It has to match the gateway's own OpenShell release; the driver's README
+    warns that a mismatched pair fails to sync policy and exits.
 
     ``project`` is the LXD project the driver places every sandbox, image and
     operation in.  It comes from the provider over the ``lxd-https`` relation,
@@ -443,6 +457,7 @@ def render_driver_command(
         f"{trust_arg}"
         f"{project_arg}"
         f" --default-image {default_image}"
+        f" --supervisor-image {supervisor_image}"
         f" --operation-timeout-secs {operation_timeout_secs}"
         f" --log-level {log_level}"
         f" --gateway-endpoint {gateway_endpoint}"
