@@ -173,8 +173,8 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "gRPC latency (p50/p90/p99)",
-      "description": "Quantiles over openshell_server_grpc_request_duration_seconds.",
+      "title": "gRPC latency by method (p50/p90/p99)",
+      "description": "openshell_server_grpc_request_duration_seconds. The workload exports this as a Prometheus summary with pre-computed quantile labels, not as a histogram, so the quantiles are read directly \u2014 there are no _bucket series and histogram_quantile() would return nothing.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prometheusds}"
@@ -191,8 +191,8 @@
             "type": "prometheus",
             "uid": "${prometheusds}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(openshell_server_grpc_request_duration_seconds_bucket{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\"}[5m])))",
-          "legendFormat": "p50",
+          "expr": "openshell_server_grpc_request_duration_seconds{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\",quantile=\"0.5\"}",
+          "legendFormat": "{{method}} p50",
           "refId": "A"
         },
         {
@@ -200,8 +200,8 @@
             "type": "prometheus",
             "uid": "${prometheusds}"
           },
-          "expr": "histogram_quantile(0.90, sum by (le) (rate(openshell_server_grpc_request_duration_seconds_bucket{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\"}[5m])))",
-          "legendFormat": "p90",
+          "expr": "openshell_server_grpc_request_duration_seconds{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\",quantile=\"0.9\"}",
+          "legendFormat": "{{method}} p90",
           "refId": "B"
         },
         {
@@ -209,8 +209,8 @@
             "type": "prometheus",
             "uid": "${prometheusds}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(openshell_server_grpc_request_duration_seconds_bucket{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\"}[5m])))",
-          "legendFormat": "p99",
+          "expr": "openshell_server_grpc_request_duration_seconds{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\",quantile=\"0.99\"}",
+          "legendFormat": "{{method}} p99",
           "refId": "C"
         }
       ],
@@ -258,7 +258,7 @@
       "id": 7,
       "type": "timeseries",
       "title": "Database probe duration (p90)",
-      "description": "How long the readiness probe's database check takes, split by outcome. A rising p90 precedes the healthy gauge flipping.",
+      "description": "How long the readiness probe's database check takes, split by outcome. A rising p90 precedes the healthy gauge flipping. Exported as a summary, so the quantile is read directly.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prometheusds}"
@@ -275,8 +275,8 @@
             "type": "prometheus",
             "uid": "${prometheusds}"
           },
-          "expr": "histogram_quantile(0.90, sum by (le, outcome) (rate(openshell_server_readiness_database_probe_duration_seconds_bucket{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\"}[5m])))",
-          "legendFormat": "{{outcome}}",
+          "expr": "openshell_server_readiness_database_probe_duration_seconds{juju_model=~\"$juju_model\",juju_model_uuid=~\"$juju_model_uuid\",juju_application=~\"$juju_application\",juju_unit=~\"$juju_unit\",quantile=\"0.9\"}",
+          "legendFormat": "{{outcome}} p90",
           "refId": "A"
         }
       ],

@@ -45,6 +45,7 @@ from charm import (
     PEER_RELATION,
     PEER_SECRET_ID_KEY,
     READINESS_CHECK_NAME,
+    RECEIVE_CA_RELATION,
     RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
@@ -2803,10 +2804,10 @@ class TestGrafanaDashboard:
         exported = {
             "up",
             "openshell_server_grpc_requests_total",
-            "openshell_server_grpc_request_duration_seconds_bucket",
+            "openshell_server_grpc_request_duration_seconds",
             "openshell_server_http_requests_total",
             "openshell_server_readiness_database_healthy",
-            "openshell_server_readiness_database_probe_duration_seconds_bucket",
+            "openshell_server_readiness_database_probe_duration_seconds",
         }
         pattern = re.compile(r"\b(openshell_[a-z0-9_]+|up)\b")
         for path in sorted(self._DASHBOARD.glob("*.json")):
@@ -2815,6 +2816,22 @@ class TestGrafanaDashboard:
                 for target in panel.get("targets", []):
                     for name in pattern.findall(target["expr"]):
                         assert name in exported, f"{path.name}: unknown metric {name}"
+
+    def test_durations_are_read_as_summaries_not_histograms(self):
+        # OpenShell's exporter renders its `histogram!` metrics as Prometheus
+        # *summaries*, with pre-computed quantile labels. There are no _bucket
+        # series, so histogram_quantile() silently returns nothing and the
+        # panel looks like an outage. Verified against a live gateway:
+        # `# TYPE openshell_server_grpc_request_duration_seconds summary`.
+        for path in sorted(self._DASHBOARD.glob("*.json")):
+            dashboard = json.loads(path.read_text())
+            for panel in dashboard["panels"]:
+                for target in panel.get("targets", []):
+                    expr = target["expr"]
+                    assert "_bucket" not in expr, panel["title"]
+                    assert "histogram_quantile" not in expr, panel["title"]
+                    if "duration_seconds" in expr:
+                        assert "quantile=" in expr, panel["title"]
 
     def test_every_panel_is_scoped_by_juju_topology(self):
         # Without the topology selectors one model's dashboard shows another
@@ -2848,3 +2865,102 @@ class TestGrafanaDashboard:
         published = next(r for r in out.relations if r.endpoint == DASHBOARD_RELATION)
         assert published.local_app_data.get("dashboards"), published.local_app_data
         assert "openshell-gateway" in published.local_app_data["dashboards"]
+
+
+class TestReceivedCaCertificates:
+    """CAs transferred over receive-ca-cert join the workload's trust bundle."""
+
+    _ROOTS = "-----BEGIN CERTIFICATE-----\nROOTA\n-----END CERTIFICATE-----\n"
+    _IDENTITY_CA = "-----BEGIN CERTIFICATE-----\nIDENTITYCA\n-----END CERTIFICATE-----\n"
+
+    def _container(self, tmp_path):
+        (tmp_path / "ca-certificates.crt").write_text(self._ROOTS)
+        return Container(
+            CONTAINER_NAME,
+            can_connect=True,
+            mounts={"ssl": Mount(location="/etc/ssl/certs", source=tmp_path)},
+        )
+
+    def _state(self, container, relations):
+        return State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[container],
+            relations=_all_relations() + [PeerRelation(PEER_RELATION)] + relations,
+        )
+
+    def test_transferred_ca_is_added_to_the_bundle(self, tmp_path):
+        # The identity provider's issuer is signed by a CA the workload image
+        # does not know, and OIDC discovery fails to verify it without this.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = self._container(tmp_path)
+        rel = Relation(RECEIVE_CA_RELATION, remote_app_name="hydra")
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_received_ca_certificates",
+                return_value={self._IDENTITY_CA},
+            ),
+        ):
+            ctx.run(ctx.on.pebble_ready(container), self._state(container, [rel]))
+        bundle = (tmp_path / "ca-certificates.crt").read_text()
+        assert "ROOTA" in bundle
+        assert "IDENTITYCA" in bundle
+        assert str(_FAKE_TLS_CERT.ca) in bundle
+
+    def test_no_relation_means_no_extra_cas(self, tmp_path):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = self._container(tmp_path)
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            ctx(ctx.on.pebble_ready(container), self._state(container, [])) as manager,
+        ):
+            manager.run()
+            assert manager.charm._received_ca_certificates() == set()
+
+    def test_bundle_is_stable_across_reconciles(self, tmp_path):
+        # An unstable ordering would change the workload config hash and
+        # restart the gateway on every hook.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        container = self._container(tmp_path)
+        rel = Relation(RECEIVE_CA_RELATION, remote_app_name="hydra")
+        second = "-----BEGIN CERTIFICATE-----\nOTHERCA\n-----END CERTIFICATE-----\n"
+        p = _all_ready_patches()
+        with (
+            p[0],
+            p[1],
+            p[2],
+            p[3],
+            p[4],
+            p[5],
+            p[6],
+            p[7],
+            patch.object(
+                OpenshellGatewayK8sCharm,
+                "_received_ca_certificates",
+                return_value={self._IDENTITY_CA, second},
+            ),
+        ):
+            out1 = ctx.run(ctx.on.pebble_ready(container), self._state(container, [rel]))
+            first = (tmp_path / "ca-certificates.crt").read_text()
+            ctx.run(ctx.on.config_changed(), out1)
+        assert (tmp_path / "ca-certificates.crt").read_text() == first
+        assert first.count("IDENTITYCA") == 1
+        assert first.count("OTHERCA") == 1

@@ -18,6 +18,7 @@ import ops
 from charmlibs.rollingops import OperationResult, RollingOpsManager
 from charms.certificate_transfer_interface.v1.certificate_transfer import (
     CertificateTransferProvides,
+    CertificateTransferRequires,
 )
 from charms.data_platform_libs.v0.data_interfaces import DatabaseRequires
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
@@ -83,6 +84,7 @@ LXD_INTERFACE_VERSION = "1.0"
 LXD_RELATION = "lxd"
 METRICS_RELATION = "metrics-endpoint"
 DASHBOARD_RELATION = "grafana-dashboard"
+RECEIVE_CA_RELATION = "receive-ca-cert"
 VAULT_RELATION = "vault-kv"
 STATIC_REDIRECT_URI = "https://openshell.invalid/unused"
 DATABASE_NAME = "openshell"
@@ -169,6 +171,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             relation_name="oauth",
         )
         self.ca_transfer = CertificateTransferProvides(self, "send-ca-cert")
+        self.ca_receiver = CertificateTransferRequires(self, RECEIVE_CA_RELATION)
         self.ingress = GatewayIngress(self)
 
         # Optional: with no vault-kv relation the JWT keypair stays in the
@@ -222,6 +225,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.oauth.on.oauth_info_removed,
             self.on[LXD_RELATION].relation_changed,
             self.on[LXD_RELATION].relation_joined,
+            self.on[RECEIVE_CA_RELATION].relation_changed,
+            self.on[RECEIVE_CA_RELATION].relation_broken,
             self.vault.requires.on.ready,
             self.vault.requires.on.gone_away,
         ):
@@ -1005,12 +1010,32 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         bundle = pristine
         if bundle and not bundle.endswith("\n"):
             bundle += "\n"
-        if ca_pem not in pristine:
-            bundle += ca_pem
-            if not bundle.endswith("\n"):
-                bundle += "\n"
+
+        # The charm's own issuer, plus anything transferred over
+        # receive-ca-cert. Sorted so the bundle is byte-identical across
+        # reconciles and the workload is not restarted for a reordering.
+        for extra in [ca_pem, *sorted(self._received_ca_certificates())]:
+            if extra and extra not in bundle:
+                bundle += extra
+                if not bundle.endswith("\n"):
+                    bundle += "\n"
 
         container.push(SYSTEM_CA_BUNDLE_PATH, bundle, make_dirs=True, permissions=0o644)
+
+    def _received_ca_certificates(self) -> set[str]:
+        """Return CA certificates transferred over ``receive-ca-cert``.
+
+        Used for issuers the workload image does not already trust: the
+        Canonical Identity Platform signs its issuer certificate with its own
+        CA, and the gateway's OIDC discovery fails to verify it otherwise.
+        """
+        if self.model.get_relation(RECEIVE_CA_RELATION) is None:
+            return set()
+        try:
+            return set(self.ca_receiver.get_all_certificates())
+        except Exception:
+            logger.warning("receive-ca-cert: could not read transferred CAs", exc_info=True)
+            return set()
 
     def _reconcile(self, event: ops.EventBase) -> None:
         """Re-derive desired state from scratch and converge."""
