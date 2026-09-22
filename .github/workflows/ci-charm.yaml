@@ -91,7 +91,7 @@ jobs:
   integration-suite:
     name: Integration test suite (${{ matrix.suite }})
     needs: [build-charm]
-    runs-on: ubuntu-26.04
+    runs-on: [self-hosted-linux-amd64-noble-large]
     timeout-minutes: 60
     strategy:
       fail-fast: false
