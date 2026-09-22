@@ -96,11 +96,20 @@ jobs:
           path: charms/openshell-gateway-k8s/*.charm
           if-no-files-found: error
 
-  integration:
-    name: Integration tests
+  integration-suite:
+    name: Integration test suite (${{ matrix.suite }})
     needs: [build-charm]
     runs-on: ubuntu-26.04
-    timeout-minutes: 180
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - test_charm.py
+          - test_lxd_integrator.py
+          - test_lxd_offer.py
+          - test_observability.py
+          - test_vault.py
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -159,9 +168,17 @@ jobs:
           echo "charm=$charm" >> "$GITHUB_OUTPUT"
 
       - name: Run integration tests
-        run: just integration-test-charm
+        run: just integration-test-charm tests/integration/${{ matrix.suite }}
         env:
           CHARM_FILE: ${{ steps.artifacts.outputs.charm }}
+
+  integration:
+    name: Integration tests
+    needs: [integration-suite]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Confirm test success
+        run: echo "All integration test suites passed successfully."
 
   release:
     name: Release charm
