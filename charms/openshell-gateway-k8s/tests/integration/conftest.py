@@ -17,7 +17,7 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import jubilant
 import pytest
@@ -255,45 +255,103 @@ def _deploy_infrastructure(juju: jubilant.Juju) -> None:
     )
 
 
+# Kubernetes restart backoff messages that Juju surfaces as an application
+# error. They read as failures but clear on their own once the pod restarts.
+_TRANSIENT_CONTAINER_PATTERNS = (
+    "crash loop backoff",
+    "restarting failed container",
+    "crashloopbackoff",
+)
+
+
+def _is_transient_container_error(message: str) -> bool:
+    """Return True for Kubernetes container restart backoff messages.
+
+    During a rolling update Kubernetes terminates and recreates the pod, and
+    the init container can sit in a short restart backoff that Juju reports
+    as an application error. Such a state resolves itself if given time.
+    """
+    lowered = message.lower()
+    return any(pattern in lowered for pattern in _TRANSIENT_CONTAINER_PATTERNS)
+
+
 def _fail_on_app_error(
     juju: jubilant.Juju,
     *app_names: str,
     hook_retry_limit: int = 0,
+    transient_grace_seconds: float = 120.0,
 ) -> Callable[[jubilant.Status], bool]:
-    """Retry hook failures up to a limit, then fail with Juju logs."""
+    """Retry hook failures up to a limit, then fail with Juju logs.
+
+    Errors that report a container restart backoff (for example
+    ``crash loop backoff: back-off 10s restarting failed
+    container=charm-init``) are transient: Kubernetes restarts the container
+    itself, so the wait keeps polling for *transient_grace_seconds* before
+    giving up, instead of aborting on the first poll.
+    """
     hook_retries: dict[str, int] = {}
     retry_grace_deadlines: dict[str, float] = {}
+    transient_grace_deadlines: dict[str, float] = {}
+
+    def _capture_and_fail(app_name: str, message: str) -> NoReturn:
+        try:
+            log_output = juju.debug_log(limit=500)
+        except (jubilant.CLIError, jubilant.TaskError):
+            logger.exception("Failed to capture Juju debug logs")
+        else:
+            logger.error("Juju debug-log after %s entered error:\n%s", app_name, log_output)
+        pytest.fail(f"{app_name} entered error: {message}")
 
     def _error(status: jubilant.Status) -> bool:
         for app_name in app_names:
             app = status.apps.get(app_name)
             if app is None or app.app_status.current != "error":
+                # Recovered or not yet deployed: forget the grace window so a
+                # later transient restart gets a fresh one.
+                transient_grace_deadlines.pop(app_name, None)
                 continue
-            failed_hook = (app.app_status.message or "").startswith("hook failed:")
-            for unit_name, unit in app.units.items():
-                if unit.workload_status.current != "error" or not failed_hook:
-                    continue
-                retries = hook_retries.get(unit_name, 0)
-                if retries < hook_retry_limit:
-                    logger.warning(
-                        "%s entered error; retrying failed hook (%d/%d)",
-                        unit_name,
-                        retries + 1,
-                        hook_retry_limit,
+            message = app.app_status.message or ""
+            if message.startswith("hook failed:"):
+                for unit_name, unit in app.units.items():
+                    if unit.workload_status.current != "error":
+                        continue
+                    retries = hook_retries.get(unit_name, 0)
+                    if retries < hook_retry_limit:
+                        logger.warning(
+                            "%s entered error; retrying failed hook (%d/%d)",
+                            unit_name,
+                            retries + 1,
+                            hook_retry_limit,
+                        )
+                        juju.cli("resolved", unit_name)
+                        hook_retries[unit_name] = retries + 1
+                        retry_grace_deadlines[unit_name] = time.monotonic() + 30
+                        return False
+                    if time.monotonic() < retry_grace_deadlines.get(unit_name, 0):
+                        return False
+                _capture_and_fail(app_name, message)
+            if _is_transient_container_error(message):
+                deadline = transient_grace_deadlines.get(app_name)
+                if deadline is None:
+                    transient_grace_deadlines[app_name] = (
+                        time.monotonic() + transient_grace_seconds
                     )
-                    juju.cli("resolved", unit_name)
-                    hook_retries[unit_name] = retries + 1
-                    retry_grace_deadlines[unit_name] = time.monotonic() + 30
+                    logger.warning(
+                        "%s reports a transient container restart; waiting up to "
+                        "%.0fs for it to clear: %s",
+                        app_name,
+                        transient_grace_seconds,
+                        message,
+                    )
                     return False
-                if time.monotonic() < retry_grace_deadlines.get(unit_name, 0):
+                if time.monotonic() < deadline:
                     return False
-            try:
-                log_output = juju.debug_log(limit=500)
-            except (jubilant.CLIError, jubilant.TaskError):
-                logger.exception("Failed to capture Juju debug logs")
-            else:
-                logger.error("Juju debug-log after %s entered error:\n%s", app_name, log_output)
-            pytest.fail(f"{app_name} entered error: {app.app_status.message}")
+                _capture_and_fail(
+                    app_name,
+                    f"transient container restart did not clear within "
+                    f"{transient_grace_seconds:.0f}s: {message}",
+                )
+            _capture_and_fail(app_name, message)
         return False
 
     return _error

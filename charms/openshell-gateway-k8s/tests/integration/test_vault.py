@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import NoReturn
 
 import jubilant
 import pytest
@@ -36,6 +37,10 @@ pytestmark = [pytest.mark.vault]
 
 VAULT_APP = "vault-k8s"
 VAULT_RELATION = "vault-kv"
+
+# A pod the kube-scheduler cannot place never recovers by waiting, so the
+# API wait stops early once the pod has gone without a node this long.
+_SCHEDULING_GRACE_SECONDS = 180
 
 
 def _vault_address_or_none(juju: jubilant.Juju) -> str | None:
@@ -105,22 +110,97 @@ def _vault_status(juju: jubilant.Juju) -> str:
     return _vault_run(juju, ["status", "-format=json"], allowed_returncodes=(0, 1, 2))
 
 
+def _vault_pod_unscheduled_reason(juju: jubilant.Juju) -> str | None:
+    """Return why the vault pod has no node assigned, or None when scheduled.
+
+    A pod that does not exist yet — the StatefulSet has not created it — also
+    counts as scheduled: that is a normal early state the probe tolerates.
+    """
+    model = juju.model.split(":")[-1]
+    pod = f"{VAULT_APP}-0"
+    result = kubectl_try("-n", model, "get", "pod", pod, "-o", "jsonpath={.spec.nodeName}")
+    if result.returncode != 0 or result.stdout.strip():
+        return None
+    condition = kubectl_try(
+        "-n",
+        model,
+        "get",
+        "pod",
+        pod,
+        "-o",
+        "jsonpath={.status.conditions[?(@.type=='PodScheduled')].reason}",
+    )
+    return condition.stdout.strip() or "no node assigned"
+
+
+def _fail_unscheduled(juju: jubilant.Juju, reason: str) -> NoReturn:
+    """Capture scheduler diagnostics for the vault pod and fail the wait."""
+    model = juju.model.split(":")[-1]
+    pod = f"{VAULT_APP}-0"
+    describe = kubectl_try("-n", model, "describe", "pod", pod)
+    events = kubectl_try(
+        "-n",
+        model,
+        "get",
+        "events",
+        "--field-selector",
+        f"involvedObject.name={pod}",
+        "--sort-by",
+        ".lastTimestamp",
+    )
+    logger.error(
+        "kubectl describe pod %s:\n%s\nkubectl get events for %s:\n%s",
+        pod,
+        describe.stdout,
+        pod,
+        events.stdout,
+    )
+    pytest.fail(
+        f"{pod} stayed unscheduled for {_SCHEDULING_GRACE_SECONDS}s ({reason}); the "
+        "vault API cannot answer on a pod with no node, and waiting the full "
+        "timeout would not change that"
+    )
+
+
 def _wait_for_vault_api(juju: jubilant.Juju, timeout: int = 900) -> None:
     """Wait until ``vault status`` answers inside the workload container.
 
     The unit can be up well before the application has an address and the
     workload is accepting API calls, so this polls with a tolerant probe: a
     command that has not succeeded yet must not end the test.
+
+    An unscheduled pod is different: no amount of waiting puts a node
+    assignment on a pod the scheduler has declined. The poll therefore also
+    watches ``spec.nodeName``; once the pod has gone without a node longer
+    than the scheduling grace, it captures ``kubectl describe pod`` and the
+    pod's events and fails immediately with the scheduler's reason, rather
+    than looping blind until the timeout.
     """
-    model = juju.model.split(":")[-1]
     deadline = time.monotonic() + timeout
+    unscheduled_since: float | None = None
     last = ""
     while True:
+        reason = _vault_pod_unscheduled_reason(juju)
+        if reason is None:
+            unscheduled_since = None
+        else:
+            now = time.monotonic()
+            if unscheduled_since is None:
+                unscheduled_since = now
+                logger.warning(
+                    "%s pod is unscheduled (%s); allowing %ss for the scheduler",
+                    VAULT_APP,
+                    reason,
+                    _SCHEDULING_GRACE_SECONDS,
+                )
+            elif now - unscheduled_since >= _SCHEDULING_GRACE_SECONDS:
+                _fail_unscheduled(juju, reason)
+
         address = _vault_address_or_none(juju)
         if address is not None:
             result = kubectl_try(
                 "-n",
-                model,
+                juju.model.split(":")[-1],
                 "exec",
                 f"{VAULT_APP}-0",
                 "-c",
