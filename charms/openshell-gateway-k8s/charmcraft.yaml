@@ -46,6 +46,12 @@ charm-libs:
     version: "1"
   - lib: traefik_k8s.traefik_route
     version: "0"
+  - lib: prometheus_k8s.prometheus_scrape
+    version: "0"
+  - lib: vault_k8s.vault_kv
+    version: "0"
+  - lib: grafana_k8s.grafana_dashboard
+    version: "0"
 
 containers:
   gateway:
@@ -73,10 +79,36 @@ requires:
   lxd:
     interface: lxd-https
     limit: 1
+    # The provider also names the LXD project sandboxes are created in. That
+    # is the LXD administrator's decision, so it arrives over this relation
+    # rather than through this charm's config.
+  receive-ca-cert:
+    interface: certificate_transfer
+    optional: true
+    limit: 1
+    # Trust anchors for issuers the workload image does not already trust —
+    # the Canonical Identity Platform signs its issuer certificate with its own
+    # CA, and OIDC discovery fails without it. Limited to one provider: every
+    # certificate transferred here becomes a trust anchor in the workload, and
+    # an unbounded number of applications able to add one is an unbounded trust
+    # decision. get-gateway-status reports how many arrived.
+  vault-kv:
+    interface: vault-kv
+    limit: 1
+    optional: true
+    # Optional by design. With no vault-kv relation the gateway's JWT signing
+    # keypair stays in the Juju application secret it has always lived in.
 
 provides:
   send-ca-cert:
     interface: certificate_transfer
+  metrics-endpoint:
+    interface: prometheus_scrape
+  grafana-dashboard:
+    interface: grafana_dashboard
+    # The dashboard is built on the metrics the gateway exports, so it is only
+    # useful alongside a metrics-endpoint relation; relating it on its own
+    # gives Grafana a dashboard with no data behind it.
 
 actions:
   get-oidc-client-config:
@@ -84,13 +116,28 @@ actions:
   get-lxd-client-cert:
     description: Return this application's LXD client certificate and the provider's fingerprint.
   get-gateway-status:
-    description: Report the current readiness and configuration state of the gateway.
+    description: >
+      Report the current readiness, health and configuration state of the
+      gateway: the LXD project sandboxes are created in, the endpoint sandbox
+      supervisors are told to dial back on, whether each workload service and
+      Pebble check is up, and the settings that govern what a sandbox can
+      reach and which registries are trusted.
   restart:
     description: Request a rolling restart of the gateway workload across units.
   rotate-jwt-signing-key:
     description: >
       Generate a new Ed25519 JWT signing keypair and publish it as a new
       revision of the gateway's shared signing-key secret. Leader unit only.
+  rotate-sandbox-client-identity:
+    description: >
+      Generate a new sandbox client CA and a new certificate signed by it,
+      replacing the pair every sandbox is given and the gateway verifies
+      against. The CA is rotated too, deliberately: the gateway trusts the
+      issuer rather than the certificate, so replacing the certificate alone
+      would leave a leaked one valid. Certificates held by running sandboxes
+      stop being accepted once the workload restarts, so their supervisors
+      cannot reconnect and those sandboxes have to be recreated. Leader unit
+      only.
 
 resources:
   gateway-image:
@@ -123,6 +170,18 @@ config:
       description: >
         OIDC role value that grants regular user access. Must be set together
         with oidc-admin-role (RBAC required by default).
+    metrics-port:
+      type: int
+      default: 9090
+      description: >
+        Port for the gateway's Prometheus metrics endpoint. Set to 0 to disable
+        the listener entirely. The endpoint is plain HTTP and unauthenticated:
+        the workload offers no TLS and no authentication for it. It is
+        therefore reachable only inside the pod network and is deliberately
+        never routed through ingress. This is a bounded exception to the
+        charm's "TLS is always enabled" posture, and it applies to this
+        endpoint alone. Use the collector's OTLP path instead if an
+        unauthenticated plain-HTTP listener at the pod level is unacceptable.
     log-level:
       type: string
       default: info
@@ -140,15 +199,51 @@ config:
       description: >
         Lifetime, in seconds, of tokens minted by the gateway for sandbox
         supervisor authentication. Must be a positive integer.
-    lxd-projects:
+    insecure-registries:
       type: string
       description: >
-        Comma-separated list of LXD projects to restrict the gateway to.
-        Leave unset to allow all projects.
-    lxd-sandbox-image:
+        Comma-separated list of registry hosts ("host" or "host:port") the
+        workload pulls images from without verifying TLS. This does not only
+        permit plain HTTP: for a host named here, skopeo also accepts any
+        certificate over HTTPS, so anything on the path can substitute the
+        image. That matters most for supervisor-image, whose contents become
+        the process that enforces the sandbox boundary inside every sandbox.
+        Prefer relating the registry's CA over receive-ca-cert, which makes
+        the workload trust it without turning verification off. Use this only
+        where that is impossible and the network between the workload and the
+        registry is trusted. get-gateway-status reports the effective list.
+    supervisor-image:
       type: string
-      default: openshell-sandbox
-      description: Default image alias passed to the LXD driver as --default-image.
+      default: ghcr.io/nvidia/openshell/supervisor:latest
+      description: >
+        OCI image reference the LXD driver extracts the sandbox boundary binary
+        from, passed as --supervisor-image. Despite the flag's name, what the
+        driver pulls out of it is /openshell-sandbox. It must come from the
+        same OpenShell release as the gateway image: a mismatched pair fails to
+        sync policy and the supervisor exits. Point this at the
+        openshell-supervisor rock built alongside the gateway rock, or at a
+        version-pinned upstream tag; the floating default is a convenience for
+        trying things out, not a supported pairing.
+    sandbox-image:
+      type: string
+      default: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      description: >
+        OCI image reference every sandbox is created from unless the request
+        names another one. Passed to the LXD driver as --default-image; the
+        driver pulls it and converts it into an LXD image on first use, so it
+        must be a registry reference and not an LXD image alias. The Kubernetes
+        node running the gateway needs to reach the registry it names.
+    restrict-sandbox-egress:
+      type: boolean
+      default: true
+      description: >
+        Confine every sandbox to the gateway endpoint and public internet
+        addresses with an LXD network ACL. Without it a sandbox reaches
+        whatever its network reaches: the LAN it sits on, the LXD host, the
+        LXD API itself and other instances. Sandboxes run untrusted agent
+        workloads, so this is on by default. LXD applies network ACLs to
+        individual NICs only on OVN networks; set it to false when sandboxes
+        run on a bridge, where the driver cannot enforce it.
     lxd-operation-timeout-secs:
       type: int
       default: 60

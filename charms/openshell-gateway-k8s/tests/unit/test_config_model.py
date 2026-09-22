@@ -7,19 +7,30 @@ from pydantic import ValidationError
 
 from config_model import (
     BIND_ADDRESS,
+    DEFAULT_METRICS_PORT,
+    DEFAULT_SANDBOX_IMAGE,
+    DEFAULT_SUPERVISOR_IMAGE,
     DRIVER_SOCKET,
     GATEWAY_ID,
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CA_PATH,
+    LXD_SERVER_CERT_PATH,
+    METRICS_DISABLED,
+    SANDBOX_TLS_CA_PATH,
+    SANDBOX_TLS_CERT_PATH,
+    SANDBOX_TLS_KEY_PATH,
     GatewayConfig,
     _parse_lxd_address,
+    _parse_lxd_fingerprint,
+    _parse_lxd_project,
     append_sslmode,
     load_config,
+    parse_insecure_registries,
     render_config_toml,
     render_driver_command,
     render_env,
+    render_registries_conf,
 )
 
 # ---------------------------------------------------------------------------
@@ -60,15 +71,19 @@ class TestConfigSurface:
 
     def test_lxd_config_defaults(self):
         cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
-        assert cfg.lxd_projects is None
-        assert cfg.lxd_sandbox_image == "openshell-sandbox"
+        assert cfg.sandbox_image == DEFAULT_SANDBOX_IMAGE
+        # The driver resolves this as an OCI reference, so a bare LXD
+        # image alias would fail on the first sandbox created.
+        assert "/" in cfg.sandbox_image
         assert cfg.lxd_operation_timeout_secs == 60
 
-    def test_lxd_projects_empty_string_normalised(self):
-        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "lxd-projects": ""})
-        assert cfg.lxd_projects is None
+    def test_no_lxd_projects_field(self):
+        # Which LXD projects the gateway may reach is the integrator's
+        # decision and arrives over the lxd-https relation. This charm must
+        # never grow a config option for it again.
+        assert "lxd_projects" not in GatewayConfig.model_fields
 
-    @pytest.mark.parametrize("field", ["lxd-projects", "lxd-sandbox-image"])
+    @pytest.mark.parametrize("field", ["sandbox-image"])
     def test_lxd_string_fields_reject_control_chars(self, field):
         base = {**BOTH_ROLES_MINIMAL}
         base[field] = "bad\nvalue"
@@ -248,6 +263,7 @@ CONFIG_DERIVED_KEYS = {
     "OPENSHELL_OIDC_ADMIN_ROLE",
     "OPENSHELL_OIDC_USER_ROLE",
     "OPENSHELL_LOG_LEVEL",
+    "OPENSHELL_METRICS_PORT",
 }
 DEFERRED_KEYS = {"OPENSHELL_DB_URL", "OPENSHELL_TLS_CERT", "OPENSHELL_OIDC_ISSUER"}
 
@@ -471,10 +487,11 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert cmd == (
             "/usr/bin/openshell-driver-lxd"
@@ -482,17 +499,64 @@ class TestRenderDriverCommand:
             " --lxd-url https://10.0.0.1:8443"
             f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
             f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
-            f" --lxd-server-ca {LXD_SERVER_CA_PATH}"
-            " --default-image openshell-sandbox"
+            f" --lxd-server-cert {LXD_SERVER_CERT_PATH}"
+            " --restrict-sandbox-egress --default-image openshell-sandbox"
+            " --supervisor-image ghcr.io/nvidia/openshell/supervisor:0.0.116"
             " --operation-timeout-secs 60"
             " --log-level info"
             " --gateway-endpoint https://openshell-gateway.my-model.svc.cluster.local:8443"
+            f" --guest-tls-ca {SANDBOX_TLS_CA_PATH}"
+            f" --guest-tls-cert {SANDBOX_TLS_CERT_PATH}"
+            f" --guest-tls-key {SANDBOX_TLS_KEY_PATH}"
         )
+
+    def test_project_is_rendered_when_the_provider_names_one(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
+            60,
+            "info",
+            "https://gw:8443",
+            server_cert=LXD_SERVER_CERT_PATH,
+            project="openshell",
+        )
+        assert " --project openshell" in cmd
+
+    def test_project_is_absent_when_the_provider_names_none(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
+            60,
+            "info",
+            "https://gw:8443",
+            server_cert=LXD_SERVER_CERT_PATH,
+        )
+        assert "--project" not in cmd
+
+    def test_sandbox_tls_material_is_always_passed(self):
+        # The driver refuses to start without it unless plaintext is allowed,
+        # and this charm never allows plaintext.
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
+            60,
+            "info",
+            "https://gw:8443",
+            server_fingerprint="abcdef",
+        )
+        assert f"--guest-tls-ca {SANDBOX_TLS_CA_PATH}" in cmd
+        assert f"--guest-tls-cert {SANDBOX_TLS_CERT_PATH}" in cmd
+        assert f"--guest-tls-key {SANDBOX_TLS_KEY_PATH}" in cmd
+        assert "--allow-plaintext-gateway" not in cmd
 
     def test_command_with_fingerprint(self):
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
@@ -506,10 +570,11 @@ class TestRenderDriverCommand:
             render_driver_command(
                 "https://10.0.0.1:8443",
                 "openshell-sandbox",
+                "ghcr.io/nvidia/openshell/supervisor:0.0.116",
                 60,
                 "info",
                 "https://openshell-gateway.my-model.svc.cluster.local:8443",
-                server_ca=LXD_SERVER_CA_PATH,
+                server_cert=LXD_SERVER_CERT_PATH,
                 server_fingerprint="ab:cd",
             )
 
@@ -517,10 +582,11 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert "--lxd-socket" not in cmd
         assert "LXD_HOST_SOCKET" not in cmd
@@ -532,10 +598,11 @@ class TestRenderDriverCommand:
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
+            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
             60,
             "info",
             endpoint,
-            server_ca=LXD_SERVER_CA_PATH,
+            server_cert=LXD_SERVER_CERT_PATH,
         )
         assert f"--gateway-endpoint {endpoint}" in cmd
 
@@ -581,3 +648,209 @@ class TestParseLxdAddress:
     )
     def test_rejects_injection(self, raw):
         assert _parse_lxd_address(raw) is None
+
+
+class TestParseLxdProject:
+    @pytest.mark.parametrize("name", ["openshell", "a", "a" * 63, "proj-1_2.3", " padded "])
+    def test_accepts_lxd_project_names(self, name):
+        assert _parse_lxd_project(name) == name.strip()
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            "   ",
+            "a" * 64,
+            "bad/project",
+            "has space",
+            "semi;colon",
+            "dollar$sign",
+            "back`tick`",
+            "new\nline",
+            "nul\x00byte",
+            "del\x7f",
+            "uni\u00e7ode",
+        ],
+    )
+    def test_rejects_unusable_names(self, name):
+        assert _parse_lxd_project(name) is None
+
+
+class TestMetricsPort:
+    def test_default_is_enabled(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.metrics_port == DEFAULT_METRICS_PORT
+
+    def test_zero_disables(self):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 0})
+        assert cfg.metrics_port == METRICS_DISABLED
+
+    @pytest.mark.parametrize("port", [1024, 9090, 65535])
+    def test_accepts_unprivileged_ports(self, port):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": port})
+        assert cfg.metrics_port == port
+
+    @pytest.mark.parametrize("port", [-1, 1, 80, 1023, 65536, 70000])
+    def test_rejects_unusable_ports(self, port):
+        model, error = load_config({**BOTH_ROLES_MINIMAL, "metrics-port": port})
+        assert model is None
+        assert error is not None
+        assert "metrics-port" in error
+
+    def test_rejects_the_gateway_port(self):
+        # The workload refuses to start when --port and --metrics-port match.
+        model, error = load_config({**BOTH_ROLES_MINIMAL, "metrics-port": int(GATEWAY_PORT)})
+        assert model is None
+        assert error is not None
+        assert "gateway port" in error
+
+    def test_env_carries_the_port(self):
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 9464})
+        assert render_env(cfg)["OPENSHELL_METRICS_PORT"] == "9464"
+
+    def test_env_carries_the_disabling_zero(self):
+        # Emitted rather than omitted so turning metrics off changes the layer
+        # and actually restarts the workload.
+        cfg = GatewayConfig.model_validate({**BOTH_ROLES_MINIMAL, "metrics-port": 0})
+        assert render_env(cfg)["OPENSHELL_METRICS_PORT"] == "0"
+
+
+class TestSupervisorImage:
+    def test_default_is_the_upstream_supervisor(self):
+        cfg = GatewayConfig.model_validate(BOTH_ROLES_MINIMAL)
+        assert cfg.supervisor_image == DEFAULT_SUPERVISOR_IMAGE
+
+    def test_rendered_into_the_driver_command(self):
+        cmd = render_driver_command(
+            "https://10.0.0.1:8443",
+            "img",
+            "192.168.1.166:5000/openshell-supervisor:v0.0.116",
+            60,
+            "info",
+            "https://gw:8443",
+            server_fingerprint="abcdef",
+        )
+        assert " --supervisor-image 192.168.1.166:5000/openshell-supervisor:v0.0.116" in cmd
+
+    def test_rejects_control_characters(self):
+        model, error = load_config({**BOTH_ROLES_MINIMAL, "supervisor-image": "bad\nvalue"})
+        assert model is None
+        assert error is not None
+
+
+class TestInsecureRegistries:
+    def test_unset_yields_no_entries(self):
+        assert parse_insecure_registries(None) == []
+        assert parse_insecure_registries("") == []
+
+    def test_hosts_are_parsed_in_order_without_duplicates(self):
+        parsed = parse_insecure_registries("a:5000, b.example, a:5000 , c")
+        assert parsed == ["a:5000", "b.example", "c"]
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "http://reg:5000",
+            "reg:5000/path",
+            "reg 5000",
+            "reg;rm -rf /",
+            "reg\nother",
+        ],
+    )
+    def test_unusable_entries_are_dropped(self, raw):
+        # These would land in a config file the workload parses; dropping beats
+        # writing something skopeo may read in a way we did not intend.
+        assert parse_insecure_registries(raw) == []
+
+    def test_rendered_conf_is_empty_of_registries_when_unset(self):
+        rendered = render_registries_conf([])
+        assert "[[registry]]" not in rendered
+        assert rendered.endswith("\n")
+
+    def test_rendered_conf_marks_each_host_insecure(self):
+        rendered = render_registries_conf(["192.168.1.166:5000", "reg.example"])
+        assert rendered.count("[[registry]]") == 2
+        assert 'location = "192.168.1.166:5000"' in rendered
+        assert 'location = "reg.example"' in rendered
+        assert rendered.count("insecure = true") == 2
+
+
+class TestParseLxdFingerprint:
+    """The value lands on a command line Pebble splits on whitespace."""
+
+    def test_accepts_a_bare_digest(self):
+        assert _parse_lxd_fingerprint("AB" * 32) == "ab" * 32
+
+    def test_accepts_colon_separated_and_surrounding_space(self):
+        colons = ":".join("ab" for _ in range(32))
+        assert _parse_lxd_fingerprint(f"  {colons}  ") == "ab" * 32
+
+    def test_rejects_anything_that_could_add_an_argument(self):
+        for bad in (
+            "",
+            "ab",
+            "z" * 64,
+            "ab" * 32 + "x",
+            "ab" * 32 + " --sandbox-nesting",
+            "--sandbox-nesting",
+        ):
+            assert _parse_lxd_fingerprint(bad) is None, bad
+
+
+class TestSandboxEgressOption:
+    """A sandbox reaches only the gateway and the public internet by default."""
+
+    def test_it_is_on_by_default(self):
+        cfg, err = load_config({"oidc-admin-role": "a", "oidc-user-role": "u"})
+        assert err is None
+        assert cfg is not None
+        assert cfg.restrict_sandbox_egress is True
+
+    def test_the_flag_follows_the_option(self):
+        common = {
+            "url": "https://10.0.0.1:8443",
+            "default_image": "img",
+            "supervisor_image": "sup",
+            "operation_timeout_secs": 60,
+            "log_level": "info",
+            "gateway_endpoint": "https://gw:8443",
+            "server_fingerprint": "ab" * 32,
+        }
+        assert "--restrict-sandbox-egress" in render_driver_command(**common)
+        assert "--restrict-sandbox-egress" not in render_driver_command(
+            **common, restrict_sandbox_egress=False
+        )
+
+
+class TestSandboxImageOptionName:
+    def test_the_option_is_not_prefixed_lxd(self):
+        # It is an OCI reference the driver pulls and converts, not an LXD
+        # image alias, and the old name read as though it were one.
+        cfg, err = load_config(
+            {
+                "oidc-admin-role": "a",
+                "oidc-user-role": "u",
+                "sandbox-image": "reg.example/base:1",
+            }
+        )
+        assert err is None
+        assert cfg is not None
+        assert cfg.sandbox_image == "reg.example/base:1"
+
+
+class TestServerCertificateIsPinnedNotTrustedAsACa:
+    def test_the_published_certificate_is_pinned(self):
+        # --lxd-server-ca loads the file as a trust anchor and then verifies
+        # chain and hostname, which LXD's self-signed certificate cannot
+        # satisfy for the routable address this pod dials.
+        cmd = render_driver_command(
+            url="https://10.0.0.1:8443",
+            default_image="img",
+            supervisor_image="sup",
+            operation_timeout_secs=60,
+            log_level="info",
+            gateway_endpoint="https://gw:8443",
+            server_cert=LXD_SERVER_CERT_PATH,
+        )
+        assert f"--lxd-server-cert {LXD_SERVER_CERT_PATH}" in cmd
+        assert "--lxd-server-ca" not in cmd

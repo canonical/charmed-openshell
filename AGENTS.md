@@ -22,7 +22,7 @@ Keep the guidance concise, accurate, and actionable.
 | Path | Purpose |
 |------|---------|
 | `charms/openshell-gateway-k8s/` | Sidecar Kubernetes charm (ops framework) that operates the workload |
-| `docs/adrs/` | Architecture Decision Records (MADR-style) |
+| `docs/spec/` | Feature specifications |
 | `Justfile` | High-level build/test recipes |
 | `concierge.yaml` | Local integration-test environment setup (Juju + K8s) |
 | `.github/workflows/` | CI definitions for charm lint/unit/static/integration |
@@ -34,6 +34,7 @@ Keep the guidance concise, accurate, and actionable.
 | `charms/openshell-gateway-k8s/src/charm.py` | Main charm object, holistic `_reconcile()` implementation |
 | `charms/openshell-gateway-k8s/src/config_model.py` | Pydantic v2 config model and TOML/env rendering (no ops imports) |
 | `charms/openshell-gateway-k8s/src/ingress.py` | Traefik route / ingress helpers |
+| `charms/openshell-gateway-k8s/src/vault_store.py` | Optional Vault-backed store for the JWT signing keypair |
 | `charms/openshell-gateway-k8s/charmcraft.yaml` | Charm metadata, relations, resources, and build config |
 | `charms/openshell-gateway-k8s/pyproject.toml` | Python tooling configuration (pytest, ruff, pyright, coverage) |
 | `charms/openshell-gateway-k8s/tox.ini` | Local test environments |
@@ -102,12 +103,12 @@ from ops import CharmBase, ActiveStatus
 
 ### Holistic Reconcile
 
-The charm follows the **holistic reconcile** pattern (ADR-0006):
+The charm follows the **holistic reconcile** pattern:
 
 - A single idempotent `_reconcile()` method handles all events.
 - It re-derives desired state from scratch on every hook and converges the workload.
 - Do **not** set status inside `_reconcile()`; status is declared separately in `collect-unit-status` handlers.
-- `collect-unit-status` helpers must re-read live model state rather than relying on in-memory fields set by reconcile (ADR-0011).
+- `collect-unit-status` helpers must re-read live model state rather than relying on in-memory fields set by reconcile.
 
 ### Security-First Defaults
 
@@ -155,6 +156,12 @@ Known patch:
 
 Document any such patch in the commit message and add a regression test that fails if the patch is removed.
 
+`lib/charms/vault_k8s/v0/vault_kv.py` imports `interface_tester.schema_base` at module
+scope, so `pytest-interface-tester` is a runtime dependency of the charm despite the
+package's name. It is declared in the library's own `PYDEPS` and listed in
+`requirements.txt` for that reason. `lib/charms/prometheus_k8s/v0/prometheus_scrape.py`
+needs `cosl` the same way.
+
 ## Charm packaging compatibility
 
 Charmcraft installs Python dependencies directly under `venv/`, while
@@ -166,9 +173,11 @@ layouts. Keep it until rollingops supports Charmcraft's flattened virtualenv.
 ## Documentation
 
 - Feature specifications go in `docs/spec/`.
-- Architecture decisions are recorded as ADRs in `docs/adrs/` using the MADR-style template (`docs/adrs/0000-template.md`).
-- ADR file names use zero-padded, monotonically increasing numbers: `NNNN-short-title.md`.
-- Once an ADR is `Accepted`, it is immutable; supersede it with a new ADR rather than editing history.
+- There is no ADR convention in this repository. The `docs/adrs/` directory was
+  removed in `48bb753` and the toctree entry in `37f3a83`; earlier ADR numbers
+  survive only as references in code comments. Record a decision in the commit
+  message that makes it and, when it is user-facing, in `docs/spec/` or the
+  README — do not reintroduce `docs/adrs/` without agreeing the convention first.
 
 When writing prose documentation:
 
@@ -176,6 +185,105 @@ When writing prose documentation:
 - Be objective: avoid "simply", "easily", and "just".
 - Use sentence case for headings.
 - Spell out abbreviations and avoid Latin (for example, use "for example" not "e.g.").
+
+## Gotchas Worth Knowing
+
+### The LXD project is not charm config
+
+Which LXD project sandboxes are created in is the LXD administrator's decision and
+lives on `lxd-integrator-k8s` (`project`), arriving over the `lxd-https` relation as a
+`project` key. The gateway charm renders it as the driver's `--project`. Do not add a
+charm config option for it: `lxd-projects` existed once, only ever restricted the
+integrator's trust entry, and was removed for this reason.
+
+### The driver refuses to start without sandbox TLS material
+
+`openshell-driver-lxd` validates at startup that sandboxes are either given
+`--guest-tls-ca/-cert/-key` or that `--allow-plaintext-gateway` is set. This charm
+never allows plaintext, so the three flags are always rendered. The client identity is
+a dedicated self-signed keypair in a peer secret — never the LXD client identity,
+which is an administrative credential for the LXD API.
+
+### Never run `update-ca-certificates` in the workload container
+
+The gateway rock ships the public roots as a prebuilt bundle but has no
+`/etc/ca-certificates.conf` before `openshell-driver-lxd` commit `301529a`, which the
+gateway rock is built from. Without that file `update-ca-certificates` rebuilds the
+bundle from an empty list and replaces all 121 public roots with whatever the charm put
+in `/usr/local/share/ca-certificates`; with it, the rebuild keeps the public roots but
+still drops the charm's own CA, which lives outside that directory. Either way the
+driver then cannot pull a sandbox or supervisor image from any registry, and the
+failure surfaces much later as an opaque x509 error from skopeo. The charm appends its
+CA to the image's bundle instead, keeping an untouched copy at
+`/etc/openshell/tls/system-ca.crt` so the rewrite is idempotent.
+
+### The dial-back endpoint must be reachable from the sandbox network
+
+`--gateway-endpoint` becomes each sandbox's `OPENSHELL_ENDPOINT`. Sandboxes run on
+LXD, not in Kubernetes, so a ClusterIP is useless to them. The charm derives the value
+from `external-hostname` plus the ingress relation; that hostname has to be an address
+the sandbox network can route to, such as a load-balancer address. `get-gateway-status`
+reports the computed value.
+
+### The `openshell` CLI must match the gateway build
+
+The integration suite drives the `openshell` snap against the gateway in the
+rock. A newer CLI fails to decode the gateway's responses outright — `latest/edge`
+(0.0.117-dev) against a v0.0.116 gateway gives `failed to decode Protobuf message:
+NetworkEndpoint.tls ... invalid wire type` from `sandbox list`, and a misleading
+"sandbox not found" from `sandbox create`, on a sandbox that was created fine.
+Track `latest/stable` unless the rock is pinned to something newer.
+
+### `sandbox-image` is an OCI reference, not an LXD alias
+
+The driver resolves `--default-image` as a registry reference and imports it on first
+use. The Kubernetes node needs to reach whatever registry it names. The option was
+called `lxd-sandbox-image` until it was renamed before first publish: the `lxd-`
+prefix read as though the value were an LXD image alias, which is the mistake the
+default value exists to prevent.
+
+### `[openshell.drivers.kubernetes]` is required even with the LXD driver
+
+`render_config_toml` always emits it, and `_read_pod_namespace` reads the downward-API
+namespace file to fill it, although `OPENSHELL_DRIVERS` is `lxd`. That is not left-over
+configuration: issuing sandbox JWTs in-cluster bootstraps from a Kubernetes
+ServiceAccount, and without the section the binary exits with "K8s ServiceAccount
+bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled
+in-cluster".
+
+### The sandbox client certificate gates connections; the JWT identifies sandboxes
+
+Every sandbox gets the same client certificate, and the gateway verifies it —
+`_render_config_toml` sets `client_ca_path` to a CA the charm mints for this one
+purpose. Two things follow that are easy to get wrong:
+
+- **It is not identity.** One certificate is shared by every sandbox, so it proves
+  "a sandbox of this deployment", not *which* sandbox. What identifies a sandbox is
+  its own gateway-minted JWT, pushed into the instance root-only before start.
+- **It never locks out CLI users.** The gateway derives its policy:
+  `require_client_auth: has_client_ca && !has_oidc` (upstream `cli.rs`). This charm
+  always configures OIDC, so certificates are validated when presented and never
+  demanded. Users come through Traefik in TLS passthrough and present none.
+
+Two separate CAs, deliberately:
+
+| File | Who trusts it | For what |
+|---|---|---|
+| `/etc/openshell/sandbox-tls/ca.crt` | the sandbox | verifying the gateway's certificate |
+| `/etc/openshell/tls/sandbox-client-ca.crt` | the gateway | verifying the sandbox's certificate |
+
+The client CA is minted by the charm rather than requested over the `certificates`
+relation, because `TLSCertificatesRequiresV4` keeps **one private key per relation**:
+a second request there would hand every sandbox the gateway's own server private key.
+Its private key stays in the peer secret and never reaches the workload container.
+
+A secret from before this existed holds a self-signed leaf with no `ca-certificate`
+key; the leader re-issues it, and until it does no `client_ca_path` is rendered.
+
+`rotate-sandbox-client-identity` replaces both. Rotating the leaf alone would be
+pointless — the gateway trusts the issuer, so a leaked leaf stays valid until its CA
+goes with it — and rotating both means running sandboxes cannot reconnect after the
+workload restarts. The action says so in its results; there is no overlap window.
 
 ## Pull Request Guidelines
 
@@ -192,7 +300,7 @@ Follow conventional commit style in PR titles:
 ### Before Submitting
 
 1. Add or update unit tests for any changed behaviour.
-2. Update the spec or ADRs if the change affects architecture or user-facing behaviour.
+2. Update `docs/spec/` and the README if the change affects architecture or user-facing behaviour.
 3. Run `tox -e lint`, `tox -e unit`, and `tox -e static` in `charms/openshell-gateway-k8s`.
 4. Run `tox -e fmt` if formatting is needed.
 5. Verify the CI workflows in `.github/workflows/` still apply to the files you changed.

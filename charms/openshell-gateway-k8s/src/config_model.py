@@ -28,6 +28,28 @@ from pydantic_core import PydanticCustomError
 BIND_ADDRESS: str = "0.0.0.0"  # noqa: S104 — intentional; see comment above
 
 GATEWAY_PORT: str = "8443"  # TLS-only listen port
+
+# Default port for the workload's Prometheus endpoint. The gateway defaults
+# it to 0 (disabled); this charm turns it on because an operator who relates
+# a collector expects metrics, and a port nothing scrapes costs nothing.
+# The listener is plain HTTP and unauthenticated, so it is deliberately never
+# routed through ingress; see the metrics-port description in charmcraft.yaml
+# and the observability section of the README.
+DEFAULT_METRICS_PORT: int = 9090
+METRICS_DISABLED: int = 0
+
+# Image every sandbox is created from unless the request names another.
+# openshell-driver-lxd resolves --default-image as an OCI reference and
+# pulls it, so a bare LXD image alias (what this used to default to) fails
+# on the first create. This mirrors the driver's own default.
+DEFAULT_SANDBOX_IMAGE: str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+
+# Image the driver extracts the sandbox boundary binary from. Despite the
+# driver's flag being --supervisor-image, what it pulls out is
+# /openshell-sandbox. It must come from the same OpenShell release as the
+# gateway: a mismatched pair fails to sync policy and the supervisor exits,
+# which is why this is configurable rather than pinned to a floating tag.
+DEFAULT_SUPERVISOR_IMAGE: str = "ghcr.io/nvidia/openshell/supervisor:latest"
 DRIVERS: str = "lxd"
 # Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"
@@ -42,7 +64,42 @@ TLS_DIR: str = "/etc/openshell/tls"
 LXD_DIR: str = "/etc/openshell/lxd"
 LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
 LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
-LXD_SERVER_CA_PATH: str = f"{LXD_DIR}/server.crt"
+# The certificate the LXD server presents, as the provider published it. It is
+# pinned with the driver's --lxd-server-cert, not trusted as a CA: LXD's own
+# certificate is self-signed and names only its hostname and the loopback
+# addresses, so CA verification rejects the routable address this pod dials.
+LXD_SERVER_CERT_PATH: str = f"{LXD_DIR}/server.crt"
+
+# The image's own CA bundle, and the charm's pristine copy of it.
+# The charm adds its CA to the system bundle so the workload trusts the
+# issuer whichever way it resolves roots, and keeps the untouched original
+# beside it so that rewrite is idempotent rather than cumulative.
+SYSTEM_CA_BUNDLE_PATH: str = "/etc/ssl/certs/ca-certificates.crt"
+PRISTINE_CA_BUNDLE_PATH: str = f"{TLS_DIR}/system-ca.crt"
+
+# Material every sandbox receives so its supervisor can reach the gateway
+# over TLS.  The CA is the gateway's own issuer, so a sandbox verifies the
+# certificate the gateway presents; the client certificate is a dedicated
+# identity that is deliberately *not* the LXD client identity, which is an
+# administrative credential and must never be copied into a sandbox.
+SANDBOX_TLS_DIR: str = "/etc/openshell/sandbox-tls"
+SANDBOX_TLS_CA_PATH: str = f"{SANDBOX_TLS_DIR}/ca.crt"
+SANDBOX_TLS_CERT_PATH: str = f"{SANDBOX_TLS_DIR}/client.crt"
+SANDBOX_TLS_KEY_PATH: str = f"{SANDBOX_TLS_DIR}/client.key"
+
+# The issuer of the certificate above, which the gateway verifies presented
+# client certificates against (``client_ca_path``). Deliberately a different
+# CA from the one at SANDBOX_TLS_CA_PATH: that one is the gateway's own issuer,
+# which sandboxes use to verify the gateway, and trusting it for client
+# authentication too would let anything holding a certificate from the
+# deployment's CA present itself as a sandbox. This one is trusted for one
+# thing only. Its private key stays in a Juju secret and never reaches the
+# workload container.
+SANDBOX_CLIENT_CA_PATH: str = f"{TLS_DIR}/sandbox-client-ca.crt"
+
+# skopeo, which the driver shells out to for every image pull, reads its
+# registry policy from this path.
+REGISTRIES_CONF_PATH: str = "/etc/containers/registries.conf"
 
 # Stable workload identity embedded in every minted JWT.  Must match the
 # openshell-server binary's expected default; cross-reference when
@@ -79,8 +136,11 @@ class GatewayConfig(pydantic.BaseModel):
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info", alias="log-level")
     gateway_id: str = Field(default=GATEWAY_ID, alias="gateway-id", min_length=1)
     jwt_ttl_secs: int = Field(default=JWT_TTL_SECS, alias="jwt-ttl-secs", gt=0)
-    lxd_projects: str | None = Field(default=None, alias="lxd-projects")
-    lxd_sandbox_image: str = Field(default="openshell-sandbox", alias="lxd-sandbox-image")
+    metrics_port: int = Field(default=DEFAULT_METRICS_PORT, alias="metrics-port")
+    sandbox_image: str = Field(default=DEFAULT_SANDBOX_IMAGE, alias="sandbox-image")
+    supervisor_image: str = Field(default=DEFAULT_SUPERVISOR_IMAGE, alias="supervisor-image")
+    insecure_registries: str | None = Field(default=None, alias="insecure-registries")
+    restrict_sandbox_egress: bool = Field(default=True, alias="restrict-sandbox-egress")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
 
     # ------------------------------------------------------------------
@@ -88,7 +148,11 @@ class GatewayConfig(pydantic.BaseModel):
     # ------------------------------------------------------------------
 
     @field_validator(
-        "external_hostname", "oidc_admin_role", "oidc_user_role", "lxd_projects", mode="before"
+        "external_hostname",
+        "oidc_admin_role",
+        "oidc_user_role",
+        "insecure_registries",
+        mode="before",
     )
     @classmethod
     def _empty_string_to_none(cls, v: Any) -> Any:
@@ -109,8 +173,9 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_admin_role",
         "oidc_user_role",
         "gateway_id",
-        "lxd_projects",
-        "lxd_sandbox_image",
+        "sandbox_image",
+        "supervisor_image",
+        "insecure_registries",
         mode="after",
     )
     @classmethod
@@ -128,6 +193,31 @@ class GatewayConfig(pydantic.BaseModel):
             raise PydanticCustomError(
                 "control_characters",
                 "config value must not contain C0 control characters or DEL",
+            )
+        return v
+
+    @field_validator("metrics_port", mode="after")
+    @classmethod
+    def _metrics_port_usable(cls, v: int) -> int:
+        """Reject a metrics port the workload would refuse or that clashes.
+
+        ``0`` disables the listener, which the workload supports. Anything else
+        must be a real port, must not collide with the gateway's own TLS
+        listener, and must be unprivileged: the workload runs as a non-root
+        user and cannot bind below 1024.
+        """
+        if v == METRICS_DISABLED:
+            return v
+        if not 1024 <= v <= 65535:
+            raise PydanticCustomError(
+                "metrics_port_range",
+                "metrics-port must be 0 (disabled) or between 1024 and 65535",
+            )
+        if v == int(GATEWAY_PORT):
+            raise PydanticCustomError(
+                "metrics_port_conflict",
+                "metrics-port must differ from the gateway port ({port})",
+                {"port": GATEWAY_PORT},
             )
         return v
 
@@ -209,6 +299,7 @@ def render_config_toml(
     redirect_uri: str,
     k8s_namespace: str = "openshell",
     k8s_service_account_name: str = "default",
+    client_ca_path: str | None = None,
 ) -> str:
     """Return the workload ``config.toml`` as a string.
 
@@ -221,6 +312,14 @@ def render_config_toml(
     var (handled by the Pebble layer), not here.  ``redirect_uri`` is kept as
     an argument for backwards compatibility but is not rendered in this
     version.
+
+    ``client_ca_path`` names the CA that presented client certificates are
+    verified against.  The gateway derives its client-auth policy from it:
+    ``require_client_auth`` is ``has_client_ca && !has_oidc``, and this charm
+    always configures OIDC, so certificates are validated when presented and
+    never demanded.  CLI users, who present none and authenticate with OIDC,
+    are unaffected; a sandbox presenting one signed by another CA is refused
+    at the handshake.
     """
     assert cfg.oidc_admin_role is not None
     assert cfg.oidc_user_role is not None
@@ -236,6 +335,7 @@ def render_config_toml(
         "[openshell.gateway.tls]",
         f"cert_path = {q(tls_cert_path)}",
         f"key_path = {q(tls_key_path)}",
+        *([f"client_ca_path = {q(client_ca_path)}"] if client_ca_path else []),
         "",
         "[openshell.gateway.oidc]",
         f"issuer = {q(issuer_url)}",
@@ -293,6 +393,10 @@ def render_env(cfg: GatewayConfig) -> dict[str, str]:
         "OPENSHELL_OIDC_ADMIN_ROLE": cfg.oidc_admin_role,
         "OPENSHELL_OIDC_USER_ROLE": cfg.oidc_user_role,
         "OPENSHELL_LOG_LEVEL": cfg.log_level,
+        # Always emitted, including the disabling "0", so turning metrics
+        # off changes the layer and actually restarts the workload rather
+        # than leaving the previous listener up.
+        "OPENSHELL_METRICS_PORT": str(cfg.metrics_port),
     }
     # Optional: only emitted when set
     if cfg.external_hostname is not None:
@@ -336,11 +440,14 @@ def load_config(raw: Mapping[str, Any]) -> tuple[GatewayConfig | None, str | Non
 def render_driver_command(
     url: str,
     default_image: str,
+    supervisor_image: str,
     operation_timeout_secs: int,
     log_level: str,
     gateway_endpoint: str,
-    server_ca: str | None = None,
+    server_cert: str | None = None,
     server_fingerprint: str | None = None,
+    project: str | None = None,
+    restrict_sandbox_egress: bool = True,
 ) -> str:
     """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
 
@@ -348,20 +455,50 @@ def render_driver_command(
     a remote LXD over HTTPS using the provider's address and pinned CA or
     certificate fingerprint.
 
-    Exactly one of ``server_ca`` or ``server_fingerprint`` must be supplied.
+    Exactly one of ``server_cert`` or ``server_fingerprint`` must be supplied.
+    ``server_cert`` is a path to the certificate the LXD server presents, which
+    the driver pins with ``--lxd-server-cert`` — trusted for whatever names it
+    carries, as ``lxc remote add`` does. It is deliberately not passed as
+    ``--lxd-server-ca``: that loads the file as a trust anchor and then does
+    ordinary chain and hostname verification, which LXD's self-signed
+    certificate — naming only its hostname and the loopback addresses — cannot
+    satisfy for the routable address this pod dials.
 
     ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
     flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
     (scheme + host + port) reachable by sandbox supervisors.
+
+    ``supervisor_image`` is where the driver gets the sandbox boundary binary.
+    It has to match the gateway's own OpenShell release; the driver's README
+    warns that a mismatched pair fails to sync policy and exits.
+
+    ``project`` is the LXD project the driver places every sandbox, image and
+    operation in.  It comes from the provider over the ``lxd-https`` relation,
+    never from charm config: which project a requirer may use is the LXD
+    administrator's decision, and the integrator holds it.  Left unset, the
+    driver falls back to its own default (the LXD ``default`` project).
+
+    The sandbox TLS material is always passed.  The driver refuses to start
+    without it unless plaintext is explicitly allowed, and this charm never
+    allows plaintext: a sandbox supervisor reaches the gateway over TLS or not
+    at all.
+
+    ``restrict_sandbox_egress`` puts every sandbox NIC behind an LXD network
+    ACL that permits the gateway endpoint and public addresses and nothing
+    else.  Without it a sandbox reaches the LAN it happens to sit on, the LXD
+    host and the LXD API itself.  It needs sandboxes on an OVN network, which
+    is the only place LXD applies ACLs to individual NICs.
     """
-    if (server_ca is None) == (server_fingerprint is None):
-        raise ValueError("exactly one of server_ca or server_fingerprint must be set")
+    if (server_cert is None) == (server_fingerprint is None):
+        raise ValueError("exactly one of server_cert or server_fingerprint must be set")
 
     trust_arg = (
-        f" --lxd-server-ca {server_ca}"
-        if server_ca is not None
+        f" --lxd-server-cert {server_cert}"
+        if server_cert is not None
         else f" --lxd-server-fingerprint {server_fingerprint}"
     )
+    project_arg = f" --project {project}" if project is not None else ""
+    egress_arg = " --restrict-sandbox-egress" if restrict_sandbox_egress else ""
 
     return (
         f"/usr/bin/openshell-driver-lxd"
@@ -370,10 +507,16 @@ def render_driver_command(
         f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
         f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
         f"{trust_arg}"
+        f"{project_arg}"
+        f"{egress_arg}"
         f" --default-image {default_image}"
+        f" --supervisor-image {supervisor_image}"
         f" --operation-timeout-secs {operation_timeout_secs}"
         f" --log-level {log_level}"
         f" --gateway-endpoint {gateway_endpoint}"
+        f" --guest-tls-ca {SANDBOX_TLS_CA_PATH}"
+        f" --guest-tls-cert {SANDBOX_TLS_CERT_PATH}"
+        f" --guest-tls-key {SANDBOX_TLS_KEY_PATH}"
     )
 
 
@@ -434,3 +577,101 @@ def _parse_lxd_address(raw: str) -> str | None:
         return None
 
     return f"{host_part}:{port}"
+
+
+# ---------------------------------------------------------------------------
+# LXD project sanitizer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def _parse_lxd_project(raw: str) -> str | None:
+    """Validate and return an LXD project name, or None.
+
+    The value arrives over the ``lxd-https`` relation from the integrator and
+    is interpolated into the driver's command line, so the accepted charset is
+    deliberately narrow: letters, digits, dot, hyphen and underscore, up to the
+    63 characters LXD allows. Anything else — whitespace, control characters,
+    shell or path metacharacters, an over-long name — is rejected rather than
+    sanitised, so a malformed value fails visibly instead of silently landing
+    the driver in the wrong project.
+    """
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in raw):
+        return None
+
+    value = raw.strip()
+    if not 1 <= len(value) <= 63:
+        return None
+
+    if not all(c.isascii() and (c.isalnum() or c in "._-") for c in value):
+        return None
+
+    return value
+
+
+# ---------------------------------------------------------------------------
+# LXD server fingerprint sanitizer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def _parse_lxd_fingerprint(raw: str) -> str | None:
+    """Validate and return a lowercase SHA-256 hex fingerprint, or None.
+
+    The value arrives over the ``lxd-https`` relation and is interpolated into
+    the driver's command line, which Pebble splits on whitespace. A value
+    carrying a space therefore becomes extra arguments to the driver, so the
+    accepted form is exactly what a digest can be: 64 hex characters, with the
+    colons LXD's own output uses optionally present.
+    """
+    value = raw.strip().replace(":", "").lower()
+    if len(value) != 64:
+        return None
+    if not all(c in "0123456789abcdef" for c in value):
+        return None
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Registry policy renderer — pure, no ops imports
+# ---------------------------------------------------------------------------
+
+
+def parse_insecure_registries(raw: str | None) -> list[str]:
+    """Return the configured registry hosts, in order, without duplicates.
+
+    Each entry is a ``host`` or ``host:port`` that skopeo will be told to reach
+    over plain HTTP. Entries that could not be a registry location — whitespace,
+    a scheme, a path, shell metacharacters — are dropped rather than written
+    into a config file the workload parses.
+    """
+    if not raw:
+        return []
+
+    hosts: list[str] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value or "://" in value or "/" in value:
+            continue
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            continue
+        if not all(c.isascii() and (c.isalnum() or c in ".:_-[]") for c in value):
+            continue
+        if value not in hosts:
+            hosts.append(value)
+    return hosts
+
+
+def render_registries_conf(insecure_registries: list[str]) -> str:
+    """Return the contents of ``registries.conf`` for *insecure_registries*.
+
+    skopeo verifies TLS against every registry by default, which is right. This
+    exists for the deployments that pull the gateway's own companion images from
+    a local registry serving plain HTTP, where the alternative is no images at
+    all.
+    """
+    lines = [
+        "# Managed by openshell-gateway-k8s. Written from the",
+        "# insecure-registries config option; edits here are overwritten.",
+    ]
+    for host in insecure_registries:
+        lines += ["", "[[registry]]", f'location = "{host}"', "insecure = true"]
+    return "\n".join(lines) + "\n"

@@ -6,17 +6,21 @@ output "app_name" {
 output "provides" {
   description = "Map of relation names provided by the gateway."
   value = {
-    send_ca_cert = "send-ca-cert"
+    send_ca_cert      = "send-ca-cert"
+    metrics_endpoint  = "metrics-endpoint"
+    grafana_dashboard = "grafana-dashboard"
   }
 }
 
 output "requires" {
   description = "Map of relation names required by the gateway."
   value = {
-    database     = "database"
-    certificates = "certificates"
-    oauth        = "oauth"
-    ingress      = "ingress"
-    lxd          = "lxd"
+    database        = "database"
+    certificates    = "certificates"
+    oauth           = "oauth"
+    ingress         = "ingress"
+    lxd             = "lxd"
+    vault_kv        = "vault-kv"
+    receive_ca_cert = "receive-ca-cert"
   }
 }

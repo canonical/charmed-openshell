@@ -28,7 +28,11 @@ variable "base" {
 }
 
 variable "units" {
-  description = "Number of gateway units to deploy."
+  description = <<-EOT
+    Number of gateway units to deploy. The charm coordinates restarts across
+    units and shares its JWT signing key through a peer secret, so units beyond
+    the first are genuine replicas rather than independent gateways.
+  EOT
   type        = number
   default     = 1
 }
@@ -36,7 +40,9 @@ variable "units" {
 variable "constraints" {
   description = "Juju constraints to apply to each gateway unit."
   type        = string
-  default     = null
+  # Not null: the Juju Terraform provider currently fails on an empty
+  # constraints value (juju/terraform-provider-juju#344).
+  default = "arch=amd64"
 }
 
 variable "config" {
