@@ -89,7 +89,7 @@ jobs:
           if-no-files-found: error
 
   integration-suite:
-    name: Integration test suite (${{ matrix.suite }})
+    name: Integration test suite (${{ matrix.suite.name }})
     needs: [build-charm]
     runs-on: [self-hosted-linux-amd64-noble-large]
     timeout-minutes: 60
@@ -97,11 +97,10 @@ jobs:
       fail-fast: false
       matrix:
         suite:
-          - test_charm.py
-          - test_lxd_integrator.py
-          - test_lxd_offer.py
-          - test_observability.py
-          - test_vault.py
+          - name: integrator
+            args: -m integrator
+          - name: offer
+            args: -m offer
     permissions:
       contents: read
       packages: read
@@ -168,9 +167,18 @@ jobs:
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Run integration tests
-        run: just integration-test-charm tests/integration/${{ matrix.suite }}
+        run: just integration-test-charm ${{ matrix.suite.args }}
         env:
           CHARM_FILE: ${{ steps.artifacts.outputs.charm }}
+          OPENSHELL_ENABLE_SANDBOX_E2E: "true"
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-${{ matrix.suite.name }}
+          path: artifacts/diagnostics/
+          if-no-files-found: ignore
 
   integration:
     name: Integration tests

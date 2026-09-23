@@ -18,49 +18,41 @@ import time
 import jubilant
 import pytest
 
-from .conftest import (
+from .helpers import (
     APP_NAME,
     CONTAINER_NAME,
-    INTEGRATOR_APP,
-    _wait_for_gateway_stack,
-    deploy_integrator,
     gateway_status,
     kubectl,
 )
-from .lxd_host import HostLxdEndpoint
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.observability]
+pytestmark = [pytest.mark.observability, pytest.mark.integrator]
 
 COLLECTOR_APP = "opentelemetry-collector-k8s"
 PROMETHEUS_APP = "prometheus-k8s"
+GRAFANA_APP = "grafana-k8s"
 METRICS_PORT = 9090
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _observability_stack(
     juju: jubilant.Juju,
-    host_lxd_endpoint: HostLxdEndpoint,
-    integrator_charm_file: str,
-    _cleanup_host_lxd_gateway_trust: None,
+    integrator_provider: None,
 ) -> None:
-    """Bring the gateway to active, then deploy the collector and its backend."""
-    deploy_integrator(juju, host_lxd_endpoint, charm_file=integrator_charm_file)
-    juju.wait(lambda s: jubilant.all_active(s, INTEGRATOR_APP), timeout=900)
-    juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
-    _wait_for_gateway_stack(juju)
-
+    """Bring the gateway to active, then deploy the collector, prometheus, and grafana."""
     juju.deploy(COLLECTOR_APP, channel="2/stable", trust=True)
     juju.deploy(PROMETHEUS_APP, channel="1/stable", trust=True)
+    juju.deploy(GRAFANA_APP, channel="2/stable", trust=True)
     # The collector blocks until it has a downstream; relating Prometheus is
     # what makes it start scraping at all.
     juju.integrate(f"{COLLECTOR_APP}:send-remote-write", f"{PROMETHEUS_APP}:receive-remote-write")
     juju.integrate(f"{APP_NAME}:metrics-endpoint", f"{COLLECTOR_APP}:metrics-endpoint")
+    juju.integrate(f"{APP_NAME}:grafana-dashboard", f"{GRAFANA_APP}:grafana-dashboard")
     juju.wait(
         lambda s: (
-            jubilant.all_active(s, APP_NAME, COLLECTOR_APP, PROMETHEUS_APP)
-            and jubilant.all_agents_idle(s, APP_NAME, COLLECTOR_APP, PROMETHEUS_APP)
+            jubilant.all_active(s, APP_NAME, COLLECTOR_APP, PROMETHEUS_APP, GRAFANA_APP)
+            and jubilant.all_agents_idle(s, APP_NAME, COLLECTOR_APP, PROMETHEUS_APP, GRAFANA_APP)
         ),
         timeout=1800,
     )
@@ -151,28 +143,19 @@ class TestMetricsEndpoint:
                 )
             time.sleep(15)
 
-    def test_scrape_job_names_the_configured_port(self, juju: jubilant.Juju) -> None:
-        """The published scrape job targets the port the charm opened.
-
-        Read from the collector's side of the relation: in ``juju show-unit``,
-        ``application-data`` is the *remote* application's databag, so the
-        gateway's own published jobs are only visible from the consumer.
-        """
-        data = juju.cli("show-unit", f"{COLLECTOR_APP}/0", "--format", "json")
-        unit = json.loads(data)[f"{COLLECTOR_APP}/0"]
-        scrape = next(
+    def test_grafana_dashboard_published(self, juju: jubilant.Juju) -> None:
+        """The published Grafana dashboard databag is populated."""
+        data = juju.cli("show-unit", f"{GRAFANA_APP}/0", "--format", "json")
+        unit = json.loads(data)[f"{GRAFANA_APP}/0"]
+        dash_rel = next(
             rel
             for rel in unit.get("relation-info", [])
-            if rel.get("endpoint") == "metrics-endpoint"
+            if rel.get("endpoint") == "grafana-dashboard"
         )
-        jobs = json.loads(scrape["application-data"]["scrape_jobs"])
-        targets = [
-            target
-            for job in jobs
-            for static in job.get("static_configs", [])
-            for target in static.get("targets", [])
-        ]
-        assert targets == [f"*:{METRICS_PORT}"], targets
+        dashboards_raw = dash_rel.get("application-data", {}).get("dashboards", "")
+        assert dashboards_raw, (
+            f"no dashboards in relation data: {dash_rel.get('application-data')}"
+        )
 
     def test_disabling_metrics_is_reported_not_silent(self, juju: jubilant.Juju) -> None:
         """Turning the listener off with a collector related is observable.

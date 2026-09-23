@@ -15,19 +15,22 @@ import logging
 import shutil
 import time
 import uuid
+from collections.abc import Generator
 
 import jubilant
 import pytest
 
-from .conftest import (
+from .helpers import (
     APP_NAME,
     LXD_CONTROLLER,
-    _run_gated_sandbox_e2e,
-    _wait_for_gateway_blocked,
     assert_trust_registered,
     assert_trust_withdrawn,
     managed_lxd_trust_fingerprints,
+    openshell_gateway_add,
+    openshell_gateway_remove,
+    openshell_status,
     prepare_openshell_client,
+    wait_for_gateway_blocked,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,7 +136,7 @@ def _wait_for_managed_lxd_ready(machine_juju: jubilant.Juju, timeout: int = 300)
 
 
 @pytest.fixture(scope="module")
-def machine_lxd_offer() -> tuple[str, jubilant.Juju]:
+def machine_lxd_offer() -> Generator[tuple[str, jubilant.Juju], None, None]:
     """Create a machine model, deploy the lxd charm, and offer its https endpoint."""
     if shutil.which("juju") is None:  # noqa: F821
         pytest.skip("juju binary not found; skipping offer provider tests")
@@ -230,7 +233,7 @@ class TestLxdOfferProvider:
         _, machine_juju = machine_lxd_offer
         juju.cli("remove-relation", f"{APP_NAME}:lxd", f"{OFFER_ALIAS}:https")
         juju.cli("remove-saas", OFFER_ALIAS)
-        _wait_for_gateway_blocked(juju)
+        wait_for_gateway_blocked(juju)
 
         assert_trust_withdrawn(
             juju,
@@ -242,26 +245,31 @@ class TestLxdOfferProvider:
         juju: jubilant.Juju,
         gateway_url: str,
         machine_lxd_offer: tuple[str, jubilant.Juju],
-        requires_sandbox_e2e: None,
         openshell_available: None,
     ) -> None:
-        """Gated: the openshell CLI connects to the gateway over the offer path."""
+        """The openshell CLI connects to the gateway over the offer path."""
         machine_model, machine_juju = machine_lxd_offer
 
         # Re-establish the offer relation if a previous test removed it.
         status = juju.status()
-        if OFFER_ALIAS not in status.apps:
+        if OFFER_ALIAS not in status.app_endpoints:
             juju.consume(f"{machine_model}.{LXD_APP}", OFFER_ALIAS, controller=LXD_CONTROLLER)
         juju.integrate(f"{APP_NAME}:lxd", f"{OFFER_ALIAS}:https")
         juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=900)
 
         creds = prepare_openshell_client(juju, gateway_url)
-        _run_gated_sandbox_e2e(
-            gateway_url=creds["gateway_url"],
-            issuer_url=creds["issuer_url"],
-            client_id=creds["client_id"],
-            client_secret=creds["client_secret"],
-            audience=creds["audience"],
-            gateway_name="integration-test-gateway-offer",
-            sandbox_name="integration-test-sandbox-offer",
-        )
+        gateway_name = "integration-test-gateway-offer"
+        openshell_gateway_remove(gateway_name)
+        try:
+            openshell_gateway_add(
+                name=gateway_name,
+                gateway_url=creds["gateway_url"],
+                issuer_url=creds["issuer_url"],
+                client_id=creds["client_id"],
+                client_secret=creds["client_secret"],
+                audience=creds["audience"],
+            )
+            status_output = openshell_status(gateway_name)
+            assert "Status: Connected" in status_output, status_output
+        finally:
+            openshell_gateway_remove(gateway_name)

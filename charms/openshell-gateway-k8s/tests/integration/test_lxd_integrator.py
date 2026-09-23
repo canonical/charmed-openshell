@@ -11,29 +11,28 @@ until the upstream ``--gateway-endpoint`` driver flag lands.
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 
 import jubilant
 import pytest
 
-from .conftest import (
+from .helpers import (
     APP_NAME,
     INTEGRATOR_APP,
     IT_PROJECT,
-    _has_integrator_relation,
-    _run_gated_sandbox_e2e,
-    _wait_for_gateway_blocked,
-    _wait_for_gateway_stack,
     assert_trust_registered,
     assert_trust_withdrawn,
-    deploy_integrator,
-    ensure_integrator_relation,
     gateway_client_cert_fingerprint,
     lxc_instance_projects,
     lxc_trust_entry,
     lxc_trust_fingerprints,
     prepare_openshell_client,
+    run_gated_sandbox_e2e,
+    wait_for_gateway_blocked,
+    wait_for_gateway_stack,
     wait_for_lxd_project,
 )
+from .helpers.stack import ensure_integrator_relation, has_integrator_relation
 from .lxd_host import HostLxdEndpoint
 
 logger = logging.getLogger(__name__)
@@ -44,15 +43,13 @@ pytestmark = [pytest.mark.integrator]
 @pytest.fixture(scope="module", autouse=True)
 def _lxd_integrator_provider(
     juju: jubilant.Juju,
-    host_lxd_endpoint: HostLxdEndpoint,
-    integrator_charm_file: str,
-    _cleanup_host_lxd_gateway_trust: None,
-) -> None:
-    """Deploy the integrator, relate it to the gateway, and wait for the stack."""
-    deploy_integrator(juju, host_lxd_endpoint, charm_file=integrator_charm_file)
-    juju.wait(lambda s: jubilant.all_active(s, INTEGRATOR_APP), timeout=900)
-    juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
-    _wait_for_gateway_stack(juju)
+    integrator_provider: None,
+) -> Generator[None, None, None]:
+    """Ensure the integrator is deployed and related, and restore state at module end."""
+    yield
+    ensure_integrator_relation(juju)
+    juju.config(INTEGRATOR_APP, reset="project")
+    wait_for_gateway_stack(juju)
 
 
 class TestLxdIntegratorProvider:
@@ -64,9 +61,9 @@ class TestLxdIntegratorProvider:
         host_lxd_endpoint: HostLxdEndpoint,
     ) -> None:
         """Relating the integrator registers the gateway's client cert on the host LXD."""
-        if _has_integrator_relation(juju):
+        if has_integrator_relation(juju):
             juju.cli("remove-relation", f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
-            _wait_for_gateway_blocked(juju)
+            wait_for_gateway_blocked(juju)
 
         juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
         juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=900)
@@ -83,7 +80,7 @@ class TestLxdIntegratorProvider:
     ) -> None:
         """Removing the integrator relation withdraws the gateway's client cert."""
         juju.cli("remove-relation", f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
-        _wait_for_gateway_blocked(juju)
+        wait_for_gateway_blocked(juju)
 
         assert_trust_withdrawn(
             juju,
@@ -102,14 +99,14 @@ class TestLxdIntegratorProvider:
         ensure_integrator_relation(juju)
 
         creds = prepare_openshell_client(juju, gateway_url)
-        _run_gated_sandbox_e2e(
+        run_gated_sandbox_e2e(
             gateway_url=creds["gateway_url"],
             issuer_url=creds["issuer_url"],
             client_id=creds["client_id"],
             client_secret=creds["client_secret"],
             audience=creds["audience"],
             gateway_name="integration-test-gateway-integrator",
-            sandbox_name="integration-test-sandbox-integrator",
+            sandbox_name="it-sbx-integ",
         )
 
 
@@ -132,7 +129,7 @@ class TestLxdProjectPlacement:
         already-converged stack the fixture is a fast no-op.
         """
         ensure_integrator_relation(juju)
-        _wait_for_gateway_stack(juju)
+        wait_for_gateway_stack(juju)
 
     def test_default_project_when_the_integrator_names_none(
         self,
@@ -185,13 +182,13 @@ class TestLxdProjectPlacement:
         wait_for_lxd_project(juju, IT_PROJECT)
 
         creds = prepare_openshell_client(juju, gateway_url)
-        sandbox_name = "integration-test-sandbox-project"
+        sandbox_name = "it-sbx-proj"
         observed: dict[str, str] = {}
 
         def _capture() -> None:
             observed.update(lxc_instance_projects(host_lxd_endpoint.host_runner, sandbox_name))
 
-        _run_gated_sandbox_e2e(
+        run_gated_sandbox_e2e(
             gateway_url=creds["gateway_url"],
             issuer_url=creds["issuer_url"],
             client_id=creds["client_id"],
