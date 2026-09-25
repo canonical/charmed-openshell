@@ -114,7 +114,7 @@ html_context = {
 # Project slug
 # TODO: If your documentation is hosted on https://documentation.ubuntu.com/,
 #       uncomment and set to the RTD slug.
-slug = "ubuntu.com/docs/charmed-openshell"
+slug = "docs/charmed-openshell"
 
 #######################
 # Sitemap configuration: https://sphinx-sitemap.readthedocs.io/
