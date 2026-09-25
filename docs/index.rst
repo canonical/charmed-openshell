@@ -22,6 +22,11 @@ Project and community
 Charmed OpenShell is a member of the `Canonical <https://canonical.com>`_ family.
 It’s an open source project that warmly welcomes community contributions, suggestions, fixes, and constructive feedback.
 
+Get involved
+~~~~~~~~~~~~
+
+* :ref:`Contribute <contribute>`
+
 Governance and policies
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -40,3 +45,4 @@ Governance and policies
     :maxdepth: 1
 
     release-notes/index
+    contribute/index
