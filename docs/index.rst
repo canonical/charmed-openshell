@@ -1,30 +1,31 @@
-Project
-=======
+.. meta::
+   :description: Charmed OpenShell documentation home page
 
+.. _charmed-openshell-homepage:
 
-In this documentation
----------------------
+Charmed OpenShell
+=================
 
 
 How this documentation is organized
 -----------------------------------
 
+This documentation uses the `Diátaxis documentation structure <https://diataxis.fr/>`_.
+
+* :ref:`How-to guides <how-to-guides>` walk you through specific tasks.
+* :ref:`Reference <reference>` provides technical specifications.
+* :ref:`Explanation <explanation>` includes topic overviews, background and context, and detailed discussion of key concepts.
 
 Project and community
 ---------------------
 
-
-Get involved
-~~~~~~~~~~~~
-
-
-Releases and support
-~~~~~~~~~~~~~~~~~~~~
-
+Charmed OpenShell is a member of the `Canonical <https://canonical.com>`_ family.
+It’s an open source project that warmly welcomes community contributions, suggestions, fixes, and constructive feedback.
 
 Governance and policies
 ~~~~~~~~~~~~~~~~~~~~~~~
 
+* `Code of conduct <https://ubuntu.com/community/docs/ethos/code-of-conduct>`_
 
 .. toctree::
     :hidden:
