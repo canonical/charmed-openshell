@@ -87,6 +87,9 @@ class TestLxdIntegratorProvider:
             lambda: lxc_trust_fingerprints(host_lxd_endpoint.host_runner),
         )
 
+    @pytest.mark.skip(
+        reason="Sandboxes require OVN, so disabled until workflows deploy MicroCloud"
+    )
     def test_sandbox_ops_via_integrator(
         self,
         juju: jubilant.Juju,
@@ -168,6 +171,9 @@ class TestLxdProjectPlacement:
         assert result.status == "completed", result.status
         assert IT_PROJECT in str(result.results), result.results
 
+    @pytest.mark.skip(
+        reason="Sandboxes require OVN, so disabled until workflows deploy MicroCloud"
+    )
     def test_sandbox_lands_in_the_project_the_integrator_named(
         self,
         juju: jubilant.Juju,
