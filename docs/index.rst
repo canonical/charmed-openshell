@@ -31,7 +31,6 @@ Governance and policies
     :hidden:
     :maxdepth: 1
 
-    tutorials/index
     how-to/index
     reference/index
     explanation/index
@@ -41,4 +40,3 @@ Governance and policies
     :maxdepth: 1
 
     release-notes/index
-    contribute/index
