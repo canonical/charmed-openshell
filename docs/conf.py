@@ -114,7 +114,7 @@ html_context = {
 # Project slug
 # TODO: If your documentation is hosted on https://documentation.ubuntu.com/,
 #       uncomment and set to the RTD slug.
-slug = "ubuntu.com/docs/charmed-openshell"
+slug = "docs/charmed-openshell"
 
 #######################
 # Sitemap configuration: https://sphinx-sitemap.readthedocs.io/
@@ -295,3 +295,14 @@ rst_prolog = """
 # intersphinx_mapping = {
 #     "snap": ("https://snapcraft.io/docs/", None),
 # }
+
+############################################################
+### Misc custom configuration for Charmed OpenShell
+############################################################
+
+# Use custom 404 page text
+notfound_context = {
+    'title': 'Page not found',
+    'body': '<p><strong>Sorry, but the documentation page that you are looking for was not found.</strong></p>\n\n<p>Documentation changes over time, and pages are moved around. We try to redirect you to the updated content where possible, but unfortunately, that didn\'t work this time (maybe because the content you were looking for does not exist in this version of the documentation).</p>\n<p>You can try to use the navigation to locate the content you\'re looking for, or search for a similar page.</p>\n',
+}
+
