@@ -4,8 +4,8 @@ description: >-
   on the runner, following the single-member tutorial: Docker disabled, LXD
   reset to uninitialized, the MicroCloud snaps installed, one loopback volume
   as the local ZFS disk, and the cluster initialized from a preseed written
-  for the runner's networks. Leaves MICROCLOUD_DISK, MICROCLOUD_INTERNAL_ADDR
-  and MICROCLOUD_UPLINK_SET in the environment for later steps.
+  for the runner's networks. Leaves MICROCLOUD_DISK and
+  MICROCLOUD_INTERNAL_ADDR in the environment for later steps.
 
 inputs:
   disk-size:
@@ -143,10 +143,7 @@ runs:
           fi
         } | sudo tee /tmp/microcloud-preseed.yaml
 
-        {
-          echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}"
-          echo "MICROCLOUD_UPLINK_SET=$([ -n "$uplink_if" ] && echo true || echo false)"
-        } >> "$GITHUB_ENV"
+        echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
 
     - name: Initialize MicroCloud
       shell: bash
