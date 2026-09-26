@@ -118,7 +118,14 @@ runs:
         )
         PY
         )
-        passphrase="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+        passphrase="$(python3 - <<'PY'
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits
+        print("".join(secrets.choice(alphabet) for _ in range(32)))
+        PY
+        )"
 
         {
           echo "initiator_address: ${internal_addr}"
