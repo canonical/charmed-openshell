@@ -3131,3 +3131,26 @@ class TestSandboxClientCa:
         assert content is not None
         assert content["ca-certificate"].startswith("-----BEGIN CERTIFICATE-----")
         assert content["certificate"] != _LEGACY_SANDBOX_IDENTITY["certificate"]
+
+
+class TestMetricsScrapeConfiguration:
+    def test_metrics_endpoint_targets_configured_port(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        rel = Relation("metrics-endpoint")
+        state = State(
+            config={**BOTH_ROLES, "metrics-port": 9090},
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=_all_relations() + [rel, PeerRelation(PEER_RELATION)],
+        )
+        with _all_ready(), ctx(ctx.on.relation_created(rel), state) as manager:
+            charm = manager.charm
+            assert charm.metrics_endpoint is not None
+            jobs = charm.metrics_endpoint._jobs
+            targets = [
+                target
+                for job in jobs
+                for static in job.get("static_configs", [])
+                for target in static.get("targets", [])
+            ]
+            assert targets == ["*:9090"]

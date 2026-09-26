@@ -7,6 +7,7 @@ markers = [
     "offer: tests for the cross-model lxd charm offer provider path",
     "observability: tests for the opentelemetry-collector-k8s metrics path",
     "vault: tests for the vault-k8s credentials store",
+    "scale: tests for multi-unit scale and rolling operations",
 ]
 
 [tool.coverage.run]

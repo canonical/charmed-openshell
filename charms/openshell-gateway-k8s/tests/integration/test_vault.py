@@ -20,20 +20,16 @@ from typing import NoReturn
 import jubilant
 import pytest
 
-from .conftest import (
+from .helpers import (
     APP_NAME,
-    INTEGRATOR_APP,
-    _wait_for_gateway_stack,
-    deploy_integrator,
     gateway_status,
     kubectl,
     kubectl_try,
 )
-from .lxd_host import HostLxdEndpoint
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.vault]
+pytestmark = [pytest.mark.vault, pytest.mark.integrator]
 
 VAULT_APP = "vault-k8s"
 VAULT_RELATION = "vault-kv"
@@ -271,16 +267,9 @@ def _authorize_charm(juju: jubilant.Juju, root_token: str) -> None:
 @pytest.fixture(scope="module", autouse=True)
 def _vault_backed_gateway(
     juju: jubilant.Juju,
-    host_lxd_endpoint: HostLxdEndpoint,
-    integrator_charm_file: str,
-    _cleanup_host_lxd_gateway_trust: None,
+    integrator_provider: None,
 ) -> None:
     """Bring the gateway up on Juju secrets, then stand Vault up beside it."""
-    deploy_integrator(juju, host_lxd_endpoint, charm_file=integrator_charm_file)
-    juju.wait(lambda s: jubilant.all_active(s, INTEGRATOR_APP), timeout=900)
-    juju.integrate(f"{APP_NAME}:lxd", f"{INTEGRATOR_APP}:https")
-    _wait_for_gateway_stack(juju)
-
     juju.deploy(VAULT_APP, channel="1.16/stable", trust=True)
     # Vault reports blocked until it is initialised; waiting for "active" here
     # would time out before the test ever got to initialise it.
@@ -311,14 +300,10 @@ def _wait_for_jwt_store(juju: jubilant.Juju, expected: str, timeout: int = 900) 
 
 
 class TestVaultStore:
-    def test_gateway_uses_juju_secrets_without_vault(self, juju: jubilant.Juju) -> None:
-        """Before any relation the keypair lives where it always has."""
-        status = _wait_for_jwt_store(juju, "juju-secret")
-        assert status["workload-running"] == "True", status
-
     def test_relating_vault_migrates_the_existing_key(self, juju: jubilant.Juju) -> None:
         """The key in use survives the move, so live sandbox tokens stay valid."""
         before = _wait_for_jwt_store(juju, "juju-secret")
+        assert before["workload-running"] == "True", before
 
         juju.integrate(f"{APP_NAME}:{VAULT_RELATION}", f"{VAULT_APP}:{VAULT_RELATION}")
         juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=1800)
@@ -343,12 +328,24 @@ class TestVaultStore:
         juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=900)
         after = _wait_for_jwt_store(juju, "vault")
         assert after["jwt-kid"] == result.results["kid"], after
-
-    def test_the_gateway_still_serves_from_vault(self, juju: jubilant.Juju) -> None:
-        """The workload runs on the Vault-held key, not merely reports it."""
-        status = _wait_for_jwt_store(juju, "vault")
-        assert status["workload-running"] == "True", status
+        assert after["workload-running"] == "True", after
         juju.wait(
             lambda s: jubilant.all_active(s, APP_NAME) and jubilant.all_agents_idle(s, APP_NAME),
             timeout=900,
+        )
+
+    def test_removing_vault_falls_back_to_juju_secret(self, juju: jubilant.Juju) -> None:
+        """Removing the vault-kv relation reverts the gateway to juju-secret store."""
+        _wait_for_jwt_store(juju, "vault")
+
+        juju.cli(
+            "remove-relation", f"{APP_NAME}:{VAULT_RELATION}", f"{VAULT_APP}:{VAULT_RELATION}"
+        )
+        juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=1800)
+
+        after = _wait_for_jwt_store(juju, "juju-secret")
+        assert after["workload-running"] == "True", after
+        assert after["readiness-gaps"] == "none", after
+        assert after.get("jwt-kid"), (
+            "gateway has no signing key after reverting to juju-secret store"
         )
