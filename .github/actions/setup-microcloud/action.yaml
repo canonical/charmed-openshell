@@ -109,15 +109,20 @@ runs:
             start_index = 0
             end_index = usable_count - 1
 
-        usable = []
+        start_address = None
+        end_address = None
+        usable_index = -1
         for value in range(first_host, last_host + 1):
             if value in reserved:
                 continue
-            usable.append(ipaddress.ip_address(value))
-            if len(usable) > end_index:
+            usable_index += 1
+            if usable_index == start_index:
+                start_address = ipaddress.ip_address(value)
+            if usable_index == end_index:
+                end_address = ipaddress.ip_address(value)
                 break
 
-        print(f"{gateway}/{network.prefixlen} {usable[start_index]}-{usable[end_index]}")
+        print(f"{gateway}/{network.prefixlen} {start_address}-{end_address}")
         PY
         )
         passphrase="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
