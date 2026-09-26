@@ -334,7 +334,7 @@ jobs:
           set -euo pipefail
           token="$(sudo lxc config trust add --name "$VM_NAME" --quiet)"
           sudo lxc exec "$VM_NAME" -- sudo -iu ubuntu \
-            lxc remote add microcloud "$token"
+            lxc remote add microcloud "https://${MICROCLOUD_INTERNAL_ADDR}:8443" --token "$token"
           sudo lxc exec "$VM_NAME" -- sudo -iu ubuntu lxc remote switch microcloud
           sudo lxc exec "$VM_NAME" -- sudo -iu ubuntu lxc query /1.0 >/dev/null
 

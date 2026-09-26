@@ -78,24 +78,22 @@ runs:
           break
         done
 
-        gateway="$(ip route show default | awk '{print $3; exit}')"
-        read -r ovn_gateway ovn_range < <(python3 - <<'PY' "$internal_prefix" "$gateway"
+        upstream_gateway="$(ip route show default | awk '{print $3; exit}')"
+        read -r ovn_gateway ovn_range < <(python3 - <<'PY' "$internal_prefix" "$upstream_gateway"
         import ipaddress
         import sys
 
         interface = ipaddress.ip_interface(sys.argv[1])
-        gateway = ipaddress.ip_address(sys.argv[2])
+        upstream_gateway = ipaddress.ip_address(sys.argv[2])
         network = interface.network
         first_host = int(network.network_address) + 1
         last_host = int(network.broadcast_address) - 1
         reserved = {
             value
-            for value in (int(interface.ip), int(gateway))
+            for value in (int(interface.ip), int(upstream_gateway))
             if first_host <= value <= last_host
         }
         usable_count = max(0, last_host - first_host + 1 - len(reserved))
-        if gateway not in network:
-            raise SystemExit(f"default gateway {gateway} is not in {network}")
         if usable_count < 2:
             raise SystemExit(f"{network} does not leave enough OVN addresses")
 
@@ -109,10 +107,13 @@ runs:
             segments.append((segment_start, last_host))
 
         best_start, best_end = max(segments, key=lambda segment: (segment[1] - segment[0], segment[1]))
-        range_start = max(best_start, best_end - 99)
+        if best_end - best_start < 1:
+            raise SystemExit(f"{network} does not leave a contiguous OVN pool once reserved hosts are excluded")
+        range_start = max(best_start + 1, best_end - 99)
+        ovn_gateway = range_start - 1
 
         print(
-            f"{gateway}/{network.prefixlen} "
+            f"{ipaddress.ip_address(ovn_gateway)}/{network.prefixlen} "
             f"{ipaddress.ip_address(range_start)}-{ipaddress.ip_address(best_end)}"
         )
         PY
