@@ -1,0 +1,124 @@
+name: "Set up MicroCloud"
+description: >-
+  Prepare a single-member MicroCloud (clusterized LXD, MicroCeph and MicroOVN)
+  on the runner, following the single-member tutorial: Docker disabled, LXD
+  reset to uninitialized, the MicroCloud snaps installed, one loopback volume
+  as the local ZFS disk, and the cluster initialized from a preseed written
+  for the runner's networks. Leaves MICROCLOUD_DISK, MICROCLOUD_INTERNAL_ADDR
+  and MICROCLOUD_UPLINK_SET in the environment for later steps.
+
+inputs:
+  disk-size:
+    description: >-
+      Size of the loopback volume backing the MicroCloud's local ZFS pool,
+      sized to hold the Kubernetes VM's root disk with room to spare.
+    required: false
+    default: "100G"
+
+runs:
+  using: composite
+  steps:
+    # Docker's bridge rules interfere with LXD networking; the single-member
+    # tutorial asks for Docker to be disabled.
+    - name: Disable Docker
+      shell: bash
+      run: |
+        if command -v docker >/dev/null; then
+          sudo systemctl stop docker docker.socket containerd || true
+          sudo systemctl disable docker docker.socket containerd || true
+        fi
+
+    # MicroCloud refuses to initialize over an initialized LXD, and the
+    # charm suite's concierge-based jobs on this runner pool expect the
+    # snap present but uninitialized, so reset it unconditionally.
+    - name: Reset LXD for MicroCloud
+      shell: bash
+      run: |
+        sudo snap remove --purge lxd || true
+        sudo snap install lxd --channel=6/stable --cohort="+"
+        sudo lxd waitready --timeout=120 || true
+
+    - name: Install MicroCloud snaps
+      shell: bash
+      run: |
+        sudo snap install microceph --channel=squid/stable --cohort="+"
+        sudo snap install microovn --channel=24.03/stable --cohort="+"
+        sudo snap install microcloud --channel=3/stable --cohort="+"
+        sudo snap refresh lxd microceph microovn microcloud --hold
+        sudo lxd waitready --timeout=120
+
+    # The single-member tutorial's one-spare-disk path: a loopback volume as
+    # the local ZFS disk and no distributed storage.
+    - name: Create the MicroCloud storage disk
+      shell: bash
+      run: |
+        sudo install -d -m 0755 /var/microcloud
+        sudo truncate -s "${{ inputs.disk-size }}" /var/microcloud/local.img
+        disk="$(sudo losetup --find --show /var/microcloud/local.img)"
+        echo "MICROCLOUD_DISK=${disk}" >> "$GITHUB_ENV"
+
+    # One cluster member. The internal network is the default-route
+    # interface; when the runner has an address-free interface it becomes
+    # the OVN uplink, and without one the preseed skips distributed
+    # networking and the cluster falls back to a plain LXD bridge, which
+    # changes addressing but not the assertions.
+    - name: Write the MicroCloud preseed
+      shell: bash
+      run: |
+        set -euo pipefail
+        internal_if="$(ip route show default | awk '{print $5; exit}')"
+        internal_addr="$(ip -4 -o addr show dev "$internal_if" | awk '{split($4,a,"/"); print a[1]; exit}')"
+        internal_prefix="$(ip -4 -o addr show dev "$internal_if" | awk '{print $4; exit}')"
+        internal_subnet="$(python3 -c "import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network.network_address)" "$internal_prefix")"
+
+        uplink_if=""
+        for iface in $(ls /sys/class/net); do
+          case "$iface" in lo|docker*|br-*|veth*|virbr*|"$internal_if") continue ;; esac
+          if [ -z "$(ip -4 -o addr show dev "$iface" 2>/dev/null)" ] \
+             && [ -z "$(ip -6 -o addr show dev "$iface" scope global 2>/dev/null)" ]; then
+            uplink_if="$iface"
+            break
+          fi
+        done
+
+        gateway="$(ip route show default | awk '{print $3; exit}')"
+        passphrase="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+
+        {
+          echo "initiator_address: ${internal_addr}"
+          echo "lookup_subnet: ${internal_subnet}"
+          echo "session_passphrase: ${passphrase}"
+          echo "session_timeout: 600"
+          echo "systems:"
+          echo "- name: $(hostname)"
+          echo "  address: ${internal_addr}"
+          if [ -n "$uplink_if" ]; then
+            echo "  ovn_uplink_interface: ${uplink_if}"
+          fi
+          echo "  storage:"
+          echo "    local:"
+          echo "      path: ${MICROCLOUD_DISK}"
+          echo "      wipe: true"
+          if [ -n "$uplink_if" ]; then
+            echo "ovn:"
+            echo "  ipv4_gateway: ${gateway}/24"
+            echo "  ipv4_range: ${gateway%.*}.100-${gateway%.*}.200"
+            echo "  dns_servers: 1.1.1.1"
+          fi
+        } | sudo tee /tmp/microcloud-preseed.yaml
+
+        {
+          echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}"
+          echo "MICROCLOUD_UPLINK_SET=$([ -n "$uplink_if" ] && echo true || echo false)"
+        } >> "$GITHUB_ENV"
+
+    - name: Initialize MicroCloud
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo microcloud preseed < /tmp/microcloud-preseed.yaml
+        members="$(sudo lxc cluster list --format=json | jq length)"
+        online="$(sudo lxc cluster list --format=json | jq '[.[] | select(.state == "ONLINE")] | length')"
+        echo "MicroCloud cluster members: ${members}, online: ${online}"
+        test "$members" -eq 1
+        test "$online" -eq 1

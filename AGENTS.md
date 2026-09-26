@@ -234,6 +234,15 @@ NetworkEndpoint.tls ... invalid wire type` from `sandbox list`, and a misleading
 "sandbox not found" from `sandbox create`, on a sandbox that was created fine.
 Track `latest/stable` unless the rock is pinned to something newer.
 
+### MicroCloud CI needs explicit snap tracks
+
+The self-hosted runner pool is not a stable source of the right MicroCloud
+defaults. The `Integration test suite (integrator, MicroCloud)` workflow pins
+its snaps to the MicroCloud 3 stack (`lxd` `6/stable`, `microceph`
+`squid/stable`, `microovn` `24.03/stable`, `microcloud` `3/stable`) and uses
+`microcloud preseed < file`; `microcloud init --preseed ...` is not accepted
+there.
+
 ### `sandbox-image` is an OCI reference, not an LXD alias
 
 The driver resolves `--default-image` as a registry reference and imports it on first
