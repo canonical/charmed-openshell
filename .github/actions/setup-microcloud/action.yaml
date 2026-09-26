@@ -135,19 +135,15 @@ runs:
           echo "systems:"
           echo "- name: $(hostname)"
           echo "  address: ${internal_addr}"
-          if [ -n "$uplink_if" ]; then
-            echo "  ovn_uplink_interface: ${uplink_if}"
-          fi
+          echo "  ovn_uplink_interface: ${uplink_if}"
           echo "  storage:"
           echo "    local:"
           echo "      path: ${MICROCLOUD_DISK}"
           echo "      wipe: true"
-          if [ -n "$uplink_if" ]; then
-            echo "ovn:"
-            echo "  ipv4_gateway: ${ovn_gateway}"
-            echo "  ipv4_range: ${ovn_range}"
-            echo "  dns_servers: 1.1.1.1"
-          fi
+          echo "ovn:"
+          echo "  ipv4_gateway: ${ovn_gateway}"
+          echo "  ipv4_range: ${ovn_range}"
+          echo "  dns_servers: 1.1.1.1"
         } | sudo tee /tmp/microcloud-preseed.yaml
 
         echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
