@@ -82,6 +82,47 @@ runs:
         done
 
         gateway="$(ip route show default | awk '{print $3; exit}')"
+        read -r ovn_gateway ovn_range < <(python3 - <<'PY' "$internal_prefix" "$gateway"
+        import ipaddress
+        import sys
+
+        interface = ipaddress.ip_interface(sys.argv[1])
+        gateway = ipaddress.ip_address(sys.argv[2])
+        network = interface.network
+        first_host = int(network.network_address) + 1
+        last_host = int(network.broadcast_address) - 1
+        reserved = {
+            value
+            for value in (int(interface.ip), int(gateway))
+            if first_host <= value <= last_host
+        }
+        usable_count = max(0, last_host - first_host + 1 - len(reserved))
+        if gateway not in network:
+            raise SystemExit(f"default gateway {gateway} is not in {network}")
+        if usable_count < 2:
+            raise SystemExit(f"{network} does not leave enough OVN addresses")
+
+        if usable_count > 199:
+            start_index = 99
+            end_index = 198
+        elif usable_count > 100:
+            start_index = usable_count - 100
+            end_index = usable_count - 1
+        else:
+            start_index = 0
+            end_index = usable_count - 1
+
+        usable = []
+        for value in range(first_host, last_host + 1):
+            if value in reserved:
+                continue
+            usable.append(ipaddress.ip_address(value))
+            if len(usable) > end_index:
+                break
+
+        print(f"{gateway}/{network.prefixlen} {usable[start_index]}-{usable[end_index]}")
+        PY
+        )
         passphrase="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
 
         {
@@ -101,8 +142,8 @@ runs:
           echo "      wipe: true"
           if [ -n "$uplink_if" ]; then
             echo "ovn:"
-            echo "  ipv4_gateway: ${gateway}/24"
-            echo "  ipv4_range: ${gateway%.*}.100-${gateway%.*}.200"
+            echo "  ipv4_gateway: ${ovn_gateway}"
+            echo "  ipv4_range: ${ovn_range}"
             echo "  dns_servers: 1.1.1.1"
           fi
         } | sudo tee /tmp/microcloud-preseed.yaml
