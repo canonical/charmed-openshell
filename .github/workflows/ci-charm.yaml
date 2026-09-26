@@ -363,7 +363,7 @@ jobs:
           sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
           sudo snap remove --purge microcloud microceph microovn || true
           sudo snap remove --purge lxd || true
-          sudo snap install lxd
+          sudo snap install lxd --channel=6/stable --cohort="+"
 
   integration:
     name: Integration tests

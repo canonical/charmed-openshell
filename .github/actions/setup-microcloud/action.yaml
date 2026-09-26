@@ -102,10 +102,7 @@ runs:
         if usable_count < 2:
             raise SystemExit(f"{network} does not leave enough OVN addresses")
 
-        if usable_count > 199:
-            start_index = 99
-            end_index = 198
-        elif usable_count > 100:
+        if usable_count > 100:
             start_index = usable_count - 100
             end_index = usable_count - 1
         else:
