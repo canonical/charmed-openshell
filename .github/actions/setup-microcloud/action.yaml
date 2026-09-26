@@ -83,7 +83,6 @@ runs:
 
         gateway="$(ip route show default | awk '{print $3; exit}')"
         read -r ovn_gateway ovn_range < <(python3 - <<'PY' "$internal_prefix" "$gateway"
-        import collections
         import ipaddress
         import sys
 
@@ -103,13 +102,22 @@ runs:
         if usable_count < 2:
             raise SystemExit(f"{network} does not leave enough OVN addresses")
 
-        usable_tail = collections.deque(maxlen=100)
-        for value in range(first_host, last_host + 1):
-            if value in reserved:
-                continue
-            usable_tail.append(ipaddress.ip_address(value))
+        segments = []
+        segment_start = first_host
+        for blocked in sorted(reserved):
+            if segment_start <= blocked - 1:
+                segments.append((segment_start, blocked - 1))
+            segment_start = blocked + 1
+        if segment_start <= last_host:
+            segments.append((segment_start, last_host))
 
-        print(f"{gateway}/{network.prefixlen} {usable_tail[0]}-{usable_tail[-1]}")
+        best_start, best_end = max(segments, key=lambda segment: (segment[1] - segment[0], segment[1]))
+        range_start = max(best_start, best_end - 99)
+
+        print(
+            f"{gateway}/{network.prefixlen} "
+            f"{ipaddress.ip_address(range_start)}-{ipaddress.ip_address(best_end)}"
+        )
         PY
         )
         passphrase="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
