@@ -110,7 +110,7 @@ runs:
         if best_end - best_start < 1:
             raise SystemExit(f"{network} does not leave a contiguous OVN pool once reserved hosts are excluded")
         range_start = max(best_start + 1, best_end - 99)
-        ovn_gateway = range_start - 1
+        ovn_gateway = best_start
 
         print(
             f"{ipaddress.ip_address(ovn_gateway)}/{network.prefixlen} "
