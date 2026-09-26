@@ -58,10 +58,10 @@ runs:
         echo "MICROCLOUD_DISK=${disk}" >> "$GITHUB_ENV"
 
     # One cluster member. The internal network is the default-route
-    # interface; when the runner has an address-free interface it becomes
-    # the OVN uplink, and without one the preseed skips distributed
-    # networking and the cluster falls back to a plain LXD bridge, which
-    # changes addressing but not the assertions.
+    # interface. Prefer a second physical interface as the OVN uplink when
+    # there is one, but fall back to the default-route interface so the
+    # integrator suite always gets OVN rather than silently degrading to a
+    # plain LXD bridge.
     - name: Write the MicroCloud preseed
       shell: bash
       run: |
@@ -71,14 +71,11 @@ runs:
         internal_prefix="$(ip -4 -o addr show dev "$internal_if" | awk '{print $4; exit}')"
         internal_subnet="$(python3 -c "import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network.network_address)" "$internal_prefix")"
 
-        uplink_if=""
+        uplink_if="$internal_if"
         for iface in $(ls /sys/class/net); do
           case "$iface" in lo|docker*|br-*|veth*|virbr*|"$internal_if") continue ;; esac
-          if [ -z "$(ip -4 -o addr show dev "$iface" 2>/dev/null)" ] \
-             && [ -z "$(ip -6 -o addr show dev "$iface" scope global 2>/dev/null)" ]; then
-            uplink_if="$iface"
-            break
-          fi
+          uplink_if="$iface"
+          break
         done
 
         gateway="$(ip route show default | awk '{print $3; exit}')"

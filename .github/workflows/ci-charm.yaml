@@ -264,10 +264,10 @@ jobs:
           done
           sudo lxc exec "$VM_NAME" -- cloud-init status --wait
 
-      # The load-balancer pool is the top /28 of the VM's own subnet, so the
-      # sandboxes, on the same network, reach every announced address. OVN
-      # port security drops traffic for addresses a NIC does not own, so the
-      # pool is routed to the VM's NIC.
+      # The load-balancer pool is a strict top slice of the VM's own subnet,
+      # so the sandboxes, on the same network, reach every announced address.
+      # OVN port security drops traffic for addresses a NIC does not own, so
+      # the pool is routed to the VM's NIC.
       - name: Route the load-balancer pool to the VM
         run: |
           set -euo pipefail
@@ -276,12 +276,24 @@ jobs:
             | select(.family == "inet" and .scope == "global")
             | "\(.address)/\(.netmask)"' | head -1)"
           test -n "$vm_cidr"
-          lb_cidr="$(python3 -c "
-          import ipaddress, sys
+          lb_cidr="$(python3 - <<'PY' "$vm_cidr"
+          import ipaddress
+          import sys
+
           net = ipaddress.ip_interface(sys.argv[1]).network
-          base = int(net.network_address) + (net.num_addresses // 16) * 15
-          print(f'{ipaddress.ip_address(base)}/28')
-          " "$vm_cidr")"
+          lb_prefix = 28 if net.prefixlen < 28 else net.prefixlen + 1
+          if lb_prefix > 30:
+              raise SystemExit(f"{net} is too small for a distinct load-balancer pool")
+
+          subnet_size = 1 << (32 - lb_prefix)
+          base = int(net.broadcast_address) - subnet_size + 1
+          lb_net = ipaddress.ip_network((base, lb_prefix))
+          if lb_net == net or not lb_net.subnet_of(net):
+              raise SystemExit(f"{lb_net} is not a strict subrange of {net}")
+
+          print(lb_net.with_prefixlen)
+          PY
+          )"
           sudo lxc config device override "$VM_NAME" eth0 ipv4.routes="$lb_cidr"
           echo "LB_CIDR=${lb_cidr}" >> "$GITHUB_ENV"
 
@@ -320,7 +332,7 @@ jobs:
       - name: Point the VM's lxc client at the MicroCloud
         run: |
           set -euo pipefail
-          token="$(sudo lxc config trust add --name "$VM_NAME" | tail -n1)"
+          token="$(sudo lxc config trust add --name "$VM_NAME" --quiet)"
           sudo lxc exec "$VM_NAME" -- sudo -iu ubuntu \
             lxc remote add microcloud "$token"
           sudo lxc exec "$VM_NAME" -- sudo -iu ubuntu lxc remote switch microcloud
