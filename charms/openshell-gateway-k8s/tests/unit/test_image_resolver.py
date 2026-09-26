@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.integration.image_resolver import (
     DEFAULT_GATEWAY_IMAGE,
@@ -21,7 +22,12 @@ def test_resolve_gateway_image_env_override(monkeypatch: pytest.MonkeyPatch) -> 
 def test_resolve_gateway_image_from_charmcraft(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unset GATEWAY_IMAGE resolves upstream-source from charmcraft.yaml."""
     monkeypatch.delenv("GATEWAY_IMAGE", raising=False)
-    assert resolve_gateway_image() == "ghcr.io/canonical/openshell-gateway:latest"
+    charmcraft = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "charmcraft.yaml").read_text(encoding="utf-8")
+    )
+    upstream = charmcraft["resources"]["gateway-image"]["upstream-source"]
+    assert upstream.startswith("ghcr.io/canonical/openshell-gateway:")
+    assert resolve_gateway_image() == upstream
 
 
 def test_resolve_gateway_image_custom_path(

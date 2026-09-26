@@ -143,7 +143,7 @@ resources:
   gateway-image:
     type: oci-image
     description: OCI image for the OpenShell gateway workload
-    upstream-source: ghcr.io/canonical/openshell-gateway:latest
+    upstream-source: ghcr.io/canonical/openshell-gateway:6861f7e0b5f6e05c72478ada33486d536a834d6a
 
 config:
   options:
@@ -214,7 +214,7 @@ config:
         registry is trusted. get-gateway-status reports the effective list.
     supervisor-image:
       type: string
-      default: ghcr.io/nvidia/openshell/supervisor:latest
+      default: ghcr.io/canonical/openshell-supervisor:6861f7e0b5f6e05c72478ada33486d536a834d6a
       description: >
         OCI image reference the LXD driver extracts the sandbox boundary binary
         from, passed as --supervisor-image. Despite the flag's name, what the
@@ -222,8 +222,8 @@ config:
         same OpenShell release as the gateway image: a mismatched pair fails to
         sync policy and the supervisor exits. Point this at the
         openshell-supervisor rock built alongside the gateway rock, or at a
-        version-pinned upstream tag; the floating default is a convenience for
-        trying things out, not a supported pairing.
+        version-pinned upstream tag. The default is the openshell-supervisor
+        rock from the same build as the gateway-image upstream source.
     sandbox-image:
       type: string
       default: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
