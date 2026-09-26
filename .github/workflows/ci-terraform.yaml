@@ -1,0 +1,269 @@
+name: CI (terraform)
+
+on:
+  pull_request:
+    paths:
+      - terraform/**
+      - concierge.yaml
+      - .github/workflows/ci-terraform.yaml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # The snap's stable channel tracks the current Terraform release,
+      # which is what the stack module's const-variables requirement needs.
+      - name: Install Terraform
+        run: sudo snap install terraform --classic
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive terraform
+
+      # The init step resolves the composed modules at their pinned default
+      # revisions, which is where the juju provider constraints of every
+      # transitive module are checked against each other.
+      - name: Resolve and validate the stack module
+        run: |
+          terraform -chdir=terraform/openshell-stack init -backend=false
+          terraform -chdir=terraform/openshell-stack validate
+
+  integration:
+    name: Stack integration (single-member MicroCloud)
+    needs: [validate]
+    runs-on: [self-hosted-linux-amd64-noble-large]
+    timeout-minutes: 240
+    env:
+      VM_NAME: openshell-stack-k8s
+      VM_CPU: "8"
+      VM_MEMORY: 16GiB
+      VM_DISK: 80GiB
+      # Hostnames of the two load-balanced services, carved from the
+      # Kubernetes VM's own subnet. Traefik and the gateway pick the first
+      # free addresses of the CIDR, so the pair is announced one apart.
+      # The suffixes assume a /24 or larger VM subnet (the self-hosted
+      # pool's size) so .240/.241 fall inside it; LB_CIDR derives its /28
+      # from the actual subnet instead.
+      LB_IDENTITY_HOSTNAME_SUFFIX: "240"
+      LB_EXTERNAL_HOSTNAME_SUFFIX: "241"
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Free up disk space
+        timeout-minutes: 10
+        run: |
+          sudo rm -rf \
+            /opt/google \
+            /opt/hostedtoolcache \
+            /opt/microsoft/powershell \
+            /opt/microsoft/msedge \
+            "$AGENT_TOOLSDIRECTORY" \
+            /usr/lib/firefox \
+            /usr/lib/mono \
+            /usr/local/julia* \
+            /usr/local/lib/android \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/dotnet \
+            /usr/share/gradle* \
+            /usr/share/miniconda \
+            /usr/share/sbt \
+            /usr/share/swift \
+            /home/linuxbrew
+          printf '\nDisk usage\n'
+          df --human-readable
+
+      # The runner only manages MicroCloud and the VM, through lxc exec; no
+      # host-to-VM routing is configured. The deployment itself and its
+      # assertions are the pytest module the charm suite ships
+      # (tests/integration/test_stack.py), run inside the VM below.
+      - name: Set up MicroCloud
+        uses: ./.github/actions/setup-microcloud
+        with:
+          disk-size: 100G
+
+      - name: Launch the Kubernetes VM
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          sudo lxc launch ubuntu:24.04 "$VM_NAME" --vm \
+            -c limits.cpu="$VM_CPU" \
+            -c limits.memory="$VM_MEMORY" \
+            -d root,size="$VM_DISK"
+          for _ in $(seq 60); do
+            [ "$(sudo lxc list "$VM_NAME" --format=csv -c s)" = "RUNNING" ] && break
+            sleep 5
+          done
+          # lxc exec fails until the guest agent answers; retry through it.
+          for _ in $(seq 30); do
+            sudo lxc exec "$VM_NAME" -- cloud-init status --wait --timeout=60 && break || sleep 10
+          done
+          sudo lxc exec "$VM_NAME" -- cloud-init status --wait --timeout=600
+
+      - name: Resolve the VM addresses and route the load-balancer pool
+        run: |
+          set -euo pipefail
+          vm_cidr="$(sudo lxc query "/1.0/instances/${VM_NAME}/state" | jq -r '
+            .network | to_entries[] | select(.key != "lo") | .value.addresses[]
+            | select(.family == "inet" and .scope == "global")
+            | "\(.address)/\(.netmask)"' | head -1)"
+          test -n "$vm_cidr"
+          vm_addr="${vm_cidr%/*}"
+          # The load-balancer CIDR is the top /28 of the VM's own subnet: the
+          # same logical network as the sandboxes, so every announced address
+          # is reachable from the sandbox network and from inside the VM.
+          lb_cidr="$(python3 -c "
+          import ipaddress, sys
+          net = ipaddress.ip_interface(sys.argv[1]).network
+          base = int(net.network_address) + (net.num_addresses // 16) * 15
+          print(f'{ipaddress.ip_address(base)}/28')
+          " "$vm_cidr")"
+          # OVN port security drops traffic for addresses a NIC does not
+          # own, so route the pool to the VM's NIC; without it nothing on the
+          # network, sandboxes included, reaches the load balancers.
+          sudo lxc config device override "$VM_NAME" eth0 ipv4.routes="$lb_cidr"
+          identity_hostname="${vm_addr%.*}.${LB_IDENTITY_HOSTNAME_SUFFIX}"
+          external_hostname="${vm_addr%.*}.${LB_EXTERNAL_HOSTNAME_SUFFIX}"
+          {
+            echo "VM_ADDR=${vm_addr}"
+            echo "LB_CIDR=${lb_cidr}"
+            echo "IDENTITY_HOSTNAME=${identity_hostname}"
+            echo "EXTERNAL_HOSTNAME=${external_hostname}"
+          } >> "$GITHUB_ENV"
+
+      - name: Push the checkout and MicroCloud certificates into the VM
+        run: |
+          set -euo pipefail
+          sudo lxc exec "$VM_NAME" -- install -d /root/charmed-openshell
+          sudo tar -C "$GITHUB_WORKSPACE" -cf - . \
+            | sudo lxc exec "$VM_NAME" -- tar -xf - -C /root/charmed-openshell
+
+          # The MicroCloud LXD's client identity, trusted here, and the
+          # server certificate the integrator will verify the endpoint
+          # against — both minted and read on the host. The pytest module
+          # provisions the LXD project with them over the REST API, because
+          # the VM has no lxc client.
+          sudo openssl req -x509 -newkey rsa:3072 -keyout /tmp/lxd-client.key \
+            -out /tmp/lxd-client.crt -days 2 -nodes -subj "/CN=openshell-stack-ci"
+          sudo lxc config trust add /tmp/lxd-client.crt
+          sudo cp /var/snap/lxd/common/lxd/server.crt /tmp/lxd-server.crt
+          for f in /tmp/lxd-client.crt /tmp/lxd-client.key /tmp/lxd-server.crt; do
+            sudo lxc file push "$f" "$VM_NAME/root/$(basename "$f")"
+          done
+
+      - name: Install terraform and tox inside the VM
+        timeout-minutes: 15
+        run: |
+          sudo lxc exec "$VM_NAME" -- bash -s <<'SCRIPT'
+          set -euo pipefail
+          for _ in $(seq 5); do
+            if sudo snap install terraform --classic; then break; fi
+            sleep 10
+          done
+          terraform version
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tox
+          SCRIPT
+
+      - name: Prepare the VM with concierge
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          sudo lxc exec "$VM_NAME" --env LB_CIDR="$LB_CIDR" -- bash -s <<'SCRIPT'
+          set -euo pipefail
+          if ! command -v concierge >/dev/null; then
+            sudo snap install --classic concierge
+          fi
+          # The in-repo config, with the load-balancer CIDR drawn from this
+          # VM's own network, so every service address is routable here.
+          cd /root/charmed-openshell
+          sed "s|cidrs: \"[^\"]*\"|cidrs: \"${LB_CIDR}\"|" concierge.yaml > /tmp/concierge-vm.yaml
+          sudo concierge prepare -c /tmp/concierge-vm.yaml
+          # concierge installs the openshell snap from latest/stable, which
+          # has moved past the gateway rock's release; pin the matching CLI
+          # (0.0.116, revision 1041) and hold it.
+          sudo snap refresh openshell --revision=1041
+          sudo snap refresh --hold openshell
+          SCRIPT
+
+      # The stack's deployment and assertions, as pytest: the module
+      # provisions the documented manual steps (the LXD credentials secret
+      # and project), applies the stack module, grants the secret, waits
+      # for the four models to converge, and proves SSO, telemetry and a
+      # sandbox round-trip end to end.
+      - name: Run the stack integration tests
+        timeout-minutes: 120
+        run: |
+          # JUJU_CONTROLLER must match the controller concierge bootstraps
+          # from concierge.yaml; renaming it there silently breaks this
+          # pass-through (constants.py defaults to the same name).
+          sudo lxc exec "$VM_NAME" \
+            --env STACK_IDENTITY_HOSTNAME="$IDENTITY_HOSTNAME" \
+            --env STACK_EXTERNAL_HOSTNAME="$EXTERNAL_HOSTNAME" \
+            --env STACK_LXD_ENDPOINT="https://${MICROCLOUD_INTERNAL_ADDR}:8443" \
+            --env STACK_LXD_CLIENT_CERT=/root/lxd-client.crt \
+            --env STACK_LXD_CLIENT_KEY=/root/lxd-client.key \
+            --env STACK_LXD_SERVER_CERT=/root/lxd-server.crt \
+            --env JUJU_CONTROLLER=concierge-k8s \
+            -- bash -s <<'SCRIPT'
+          set -euo pipefail
+          cd /root/charmed-openshell/charms/openshell-gateway-k8s
+          tox -e integration -- -m stack
+          SCRIPT
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          sudo install -d -m 0755 "$GITHUB_WORKSPACE/artifacts/diagnostics"
+          sudo lxc exec "$VM_NAME" -- bash -s <<'SCRIPT' || true
+          set -euo pipefail
+          install -d /tmp/diagnostics
+          for model in openshell iam core cos-lite; do
+            juju status -m "$model" --format=yaml > "/tmp/diagnostics/${model}-status.yaml" || true
+            juju debug-log -m "$model" --replay --no-tail \
+              > "/tmp/diagnostics/${model}-debug-log.txt" 2>&1 || true
+          done
+          cd /root/charmed-openshell
+          terraform -chdir=terraform/openshell-stack output -json \
+            > /tmp/diagnostics/terraform-outputs.json 2>&1 || true
+          SCRIPT
+          sudo lxc file pull -r "$VM_NAME/tmp/diagnostics" \
+            "$GITHUB_WORKSPACE/artifacts/" || true
+          # The pytest module writes its own per-test diagnostics into the
+          # checkout's artifacts directory; pull those too.
+          if sudo lxc exec "$VM_NAME" -- test -d /root/charmed-openshell/artifacts/diagnostics; then
+            sudo lxc file pull -r "$VM_NAME/root/charmed-openshell/artifacts/diagnostics" \
+              "$GITHUB_WORKSPACE/artifacts/" || true
+          fi
+
+      # Leave the runner the way the charm suite's concierge-based jobs need
+      # it: no MicroCloud, LXD installed but uninitialized. Runs on failure
+      # paths too; repeats the stack destroy when the pytest module did not
+      # get to it.
+      - name: Tear down
+        if: always()
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          sudo lxc exec "$VM_NAME" -- bash -c '
+            cd /root/charmed-openshell && \
+            terraform -chdir=terraform/openshell-stack destroy -auto-approve \
+              -var-file=/root/stack-vars.tfvars.json' || true
+          sudo lxc delete --force "$VM_NAME" || true
+          sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
+          sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
+          sudo snap remove --purge microcloud microceph microovn || true
+          sudo snap remove --purge lxd || true
+          sudo snap install lxd
