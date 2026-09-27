@@ -85,3 +85,13 @@ Diátaxis
 preconfigured
 venv
 rtd
+dotfile
+integrator('s)?
+kubeconfig
+NICs?
+passthrough
+routable
+sandboxed
+untrusted
+uplink('s)?
+VM's
