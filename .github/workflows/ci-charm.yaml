@@ -352,19 +352,6 @@ jobs:
           path: artifacts/diagnostics/
           if-no-files-found: ignore
 
-      # Leave the runner the way the concierge-based jobs need it: no
-      # MicroCloud, LXD installed but uninitialized.
-      - name: Tear down
-        if: always()
-        timeout-minutes: 25
-        run: |
-          sudo lxc delete --force "$VM_NAME" || true
-          sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
-          sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
-          sudo snap remove --purge microcloud microceph microovn || true
-          sudo snap remove --purge lxd || true
-          sudo snap install lxd
-
   integration:
     name: Integration tests
     needs: [integration-suite, integration-integrator]
