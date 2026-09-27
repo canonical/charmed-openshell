@@ -232,7 +232,8 @@ rock. A newer CLI fails to decode the gateway's responses outright — `latest/e
 (0.0.117-dev) against a v0.0.116 gateway gives `failed to decode Protobuf message:
 NetworkEndpoint.tls ... invalid wire type` from `sandbox list`, and a misleading
 "sandbox not found" from `sandbox create`, on a sandbox that was created fine.
-Track `latest/stable` unless the rock is pinned to something newer.
+No channel carries 0.0.116 any more (`latest/stable` is 0.1.x), so pin the snap by
+revision, as `docs/reference/requirements.rst` lists, and move it together with the rock.
 
 ### `sandbox-image` is an OCI reference, not an LXD alias
 
