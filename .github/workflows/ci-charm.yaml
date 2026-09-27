@@ -139,6 +139,13 @@ jobs:
       - name: Install concierge
         run: sudo snap install --classic concierge
 
+      - name: Reset LXD for concierge
+        run: |
+          sudo snap refresh --unhold lxd || true
+          sudo snap remove --purge lxd || true
+          sudo snap install lxd --channel=6/stable --cohort="+"
+          sudo lxd waitready --timeout=120
+
       - name: Bootstrap Juju/K8s environment
         run: sudo concierge prepare -c concierge.yaml
 
@@ -367,8 +374,8 @@ jobs:
           path: artifacts/diagnostics/
           if-no-files-found: ignore
 
-      # Leave the runner the way the concierge-based jobs need it: no
-      # MicroCloud, LXD installed but uninitialized.
+      # Self-hosted jobs reset their own LXD state at startup. Cleanup here
+      # only tears MicroCloud back down.
       - name: Tear down
         if: always()
         timeout-minutes: 25
@@ -378,9 +385,6 @@ jobs:
           sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
           sudo snap refresh --unhold lxd microceph microovn microcloud || true
           sudo snap remove --purge microcloud microceph microovn || true
-          sudo snap remove --purge lxd || true
-          sudo snap install lxd --channel=6/stable --cohort="+"
-          sudo lxd waitready --timeout=120
 
   integration:
     name: Integration tests

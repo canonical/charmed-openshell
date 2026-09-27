@@ -247,6 +247,9 @@ The pool is also reused across jobs. Reset any pre-existing MicroCloud snaps,
 snap holds, loop devices, and preseed files at the start of the setup action;
 teardown alone is not enough after a cancelled or failed run.
 
+For the same reason, concierge-based jobs on the self-hosted pool reset LXD at
+startup instead of relying on the MicroCloud job's teardown to reinstall it.
+
 MicroCloud 3's preseed also rejects `initiator_address` and `lookup_subnet`
 when both are set. For this single-member CI setup, keep `initiator_address`
 and omit `lookup_subnet`.

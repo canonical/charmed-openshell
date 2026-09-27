@@ -178,6 +178,7 @@ runs:
         print("".join(secrets.choice(alphabet) for _ in range(32)))
         PY
         )"
+        sudo install -m 0600 /dev/null /tmp/microcloud-preseed.yaml
 
         {
           echo "initiator_address: ${internal_addr}"
@@ -195,7 +196,7 @@ runs:
           echo "  ipv4_gateway: ${ovn_gateway}"
           echo "  ipv4_range: ${ovn_range}"
           echo "  dns_servers: 1.1.1.1"
-        } | sudo tee /tmp/microcloud-preseed.yaml
+        } | sudo tee /tmp/microcloud-preseed.yaml >/dev/null
 
         echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
 
