@@ -146,8 +146,15 @@ which answers ``404 Not Found``, and ``openshell status`` reports
 
 Replace ``<external-hostname>``, ``<issuer-url>`` and ``<client-id>`` with
 the values from the previous steps, and ``openshell-admin`` with the scope
-you granted. Keep ``OPENSHELL_OIDC_CLIENT_SECRET`` set in the environment of
-later ``openshell`` commands, which use it to request fresh tokens.
+you granted.
+
+The CLI does not renew the token on its own. When a command fails with
+``invalid token: ExpiredSignature``, request a new one with
+``OPENSHELL_OIDC_CLIENT_SECRET`` still set:
+
+.. code-block:: bash
+
+    openshell gateway login production
 
 Verify the connection
 ---------------------
