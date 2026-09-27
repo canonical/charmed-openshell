@@ -71,7 +71,8 @@ runs:
         internal_prefix="$(ip -4 -o addr show dev "$internal_if" | awk '{print $4; exit}')"
 
         uplink_if="$internal_if"
-        for iface in $(ls /sys/class/net); do
+        for iface_path in /sys/class/net/*; do
+          iface="$(basename "$iface_path")"
           case "$iface" in lo|docker*|br-*|veth*|virbr*|"$internal_if") continue ;; esac
           uplink_if="$iface"
           break
