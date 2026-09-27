@@ -157,10 +157,10 @@ jobs:
       - name: Install just and tox
         run: sudo apt install -y just tox
 
-      # The CLI has to match the gateway rock's OpenShell release (0.0.116,
-      # snap revision 1041); latest/stable has moved on to 0.1.x, which
-      # cannot decode this gateway's responses. concierge installs the snap
-      # from its channel first, so move it to the revision and hold it.
+      # The CLI has to match the gateway rock's OpenShell release; latest/stable
+      # has moved on to 0.1.x, which cannot decode this gateway's responses.
+      # concierge installs the snap from its channel first, so move it to the
+      # pinned revision above and hold it.
       - name: Install OpenShell client
         run: |
           if snap list openshell >/dev/null 2>&1; then
@@ -331,7 +331,7 @@ jobs:
           sudo concierge prepare -c /tmp/concierge-vm.yaml
           # concierge installs the openshell snap from latest/stable, which
           # has moved past the gateway rock's release; pin the matching CLI
-          # (0.0.116, revision 1041) and hold it.
+          # revision from the workflow env and hold it.
           sudo snap refresh openshell --revision="$OPENSHELL_SNAP_REVISION"
           sudo snap refresh --hold openshell
           SCRIPT
