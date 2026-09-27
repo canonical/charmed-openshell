@@ -314,7 +314,7 @@ jobs:
         timeout-minutes: 45
         run: |
           sudo lxc exec "$VM_NAME" -- sudo -iu ubuntu \
-            env LB_CIDR="$LB_CIDR" bash -s <<'SCRIPT'
+            env LB_CIDR="$LB_CIDR" OPENSHELL_SNAP_REVISION="$OPENSHELL_SNAP_REVISION" bash -s <<'SCRIPT'
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq just tox
