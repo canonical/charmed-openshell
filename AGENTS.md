@@ -251,6 +251,15 @@ ServiceAccount, and without the section the binary exits with "K8s ServiceAccoun
 bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled
 in-cluster".
 
+### A slow Pebble raises a bare `TimeoutError`
+
+ops turns a refused Pebble connection into `ops.pebble.ConnectionError` but lets a
+read timeout through as the socket's `TimeoutError`, from `can_connect()` too. Use
+`_can_connect()` and `_PEBBLE_UNREACHABLE` in `charm.py`: `_reconcile()` and the
+rolling-restart callback catch it and let the next event converge. Do not reintroduce
+a hook failure for it: the integration models run with `automatically-retry-hooks`
+off, so one slow call leaves the unit in error for good.
+
 ### The sandbox client certificate gates connections; the JWT identifies sandboxes
 
 Every sandbox gets the same client certificate, and the gateway verifies it —

@@ -47,9 +47,15 @@ DEFAULT_SANDBOX_IMAGE: str = "ghcr.io/nvidia/openshell-community/sandboxes/base:
 # Image the driver extracts the sandbox boundary binary from. Despite the
 # driver's flag being --supervisor-image, what it pulls out is
 # /openshell-sandbox. It must come from the same OpenShell release as the
-# gateway: a mismatched pair fails to sync policy and the supervisor exits,
-# which is why this is configurable rather than pinned to a floating tag.
-DEFAULT_SUPERVISOR_IMAGE: str = "ghcr.io/nvidia/openshell/supervisor:latest"
+# gateway: a mismatched pair fails to sync policy and the supervisor exits.
+# The default is the openshell-supervisor rock from the same build as the
+# gateway rock charmcraft.yaml names, pinned to that build's commit tag;
+# bump the two together. NVIDIA's floating `supervisor:latest` moved on to
+# a 0.1.x layout without /openshell-sandbox, so every create failed with
+# "does not contain /openshell-sandbox".
+DEFAULT_SUPERVISOR_IMAGE: str = (
+    "ghcr.io/canonical/openshell-supervisor:6861f7e0b5f6e05c72478ada33486d536a834d6a"
+)
 DRIVERS: str = "lxd"
 # Socket the driver gRPC server listens on (gateway connects here).
 DRIVER_SOCKET: str = "/var/run/openshell/lxd.sock"

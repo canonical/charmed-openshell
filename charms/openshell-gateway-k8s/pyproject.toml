@@ -8,6 +8,7 @@ markers = [
     "observability: tests for the opentelemetry-collector-k8s metrics path",
     "vault: tests for the vault-k8s credentials store",
     "scale: tests for multi-unit scale and rolling operations",
+    "stack: tests for the composed terraform/openshell-stack deployment",
 ]
 
 [tool.coverage.run]

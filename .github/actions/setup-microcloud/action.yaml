@@ -1,0 +1,171 @@
+name: "Set up MicroCloud"
+description: >-
+  Turn the runner into a single-member MicroCloud (clusterized LXD and
+  MicroOVN, no MicroCeph) initialized from a preseed: one loopback volume as
+  the local ZFS disk and a NAT'd Linux bridge on the runner as the OVN
+  uplink, so the cluster always gets an OVN network regardless of how many
+  NICs the runner has. Leaves MICROCLOUD_DISK and MICROCLOUD_INTERNAL_ADDR in
+  the environment for later steps.
+
+inputs:
+  disk-size:
+    description: >-
+      Size of the sparse loopback volume backing the MicroCloud's local ZFS
+      pool. Only what the instances write is allocated on the runner's disk.
+    required: false
+    default: "100G"
+  uplink-cidr:
+    description: >-
+      Gateway address and prefix of the bridge that serves as the OVN uplink.
+      Its subnet must not overlap any network the runner is attached to.
+    required: false
+    default: "10.254.254.1/24"
+  zfs-arc-max:
+    description: >-
+      Upper bound in bytes for the ZFS ARC. By default ZFS may take half of
+      the runner's memory for its cache, which competes with the VM the job
+      launches.
+    required: false
+    default: "2147483648"
+  microcloud-channel:
+    required: false
+    default: "3/stable"
+  lxd-channel:
+    required: false
+    default: "6/stable"
+  microovn-channel:
+    required: false
+    default: "24.03/stable"
+
+runs:
+  using: composite
+  steps:
+    # Docker's firewall rules interfere with LXD networking: stopping the
+    # daemon leaves its FORWARD policy at DROP, which would drop everything
+    # routed between the uplink bridge and the runner's own network.
+    - name: Disable Docker
+      shell: bash
+      run: |
+        if command -v docker >/dev/null; then
+          sudo systemctl disable --now docker.socket docker.service containerd.service || true
+        fi
+        if command -v iptables >/dev/null; then
+          sudo iptables -P FORWARD ACCEPT
+        fi
+
+    # MicroCloud refuses to initialize over an initialized LXD, and the
+    # runner image's LXD is on another track; replace it in one install.
+    # MicroCeph is not installed: nothing in the jobs uses Ceph, and the
+    # preseed skips services that are absent.
+    - name: Install MicroCloud snaps
+      shell: bash
+      run: |
+        set -euo pipefail
+        if snap list lxd >/dev/null 2>&1; then
+          sudo snap remove --purge lxd
+        fi
+        sudo snap install lxd --channel="${{ inputs.lxd-channel }}"
+        sudo snap install microovn --channel="${{ inputs.microovn-channel }}"
+        sudo snap install microcloud --channel="${{ inputs.microcloud-channel }}"
+        sudo snap refresh --hold lxd microovn microcloud
+        sudo lxd waitready --timeout=120
+        snap list lxd microovn microcloud
+
+    - name: Create the MicroCloud storage disk
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo install -d -m 0755 /var/microcloud
+        sudo truncate -s "${{ inputs.disk-size }}" /var/microcloud/local.img
+        disk="$(sudo losetup --find --show /var/microcloud/local.img)"
+        echo "MICROCLOUD_DISK=${disk}" >> "$GITHUB_ENV"
+        df --human-readable /var/microcloud
+
+    # MicroCloud accepts an unmanaged bridge with an address as the OVN
+    # uplink (LXD plugs OVN into it with a veth pair). The runner routes and
+    # masquerades the bridge subnet out of its default interface, so the OVN
+    # network reaches whatever the runner reaches.
+    - name: Create the OVN uplink bridge
+      shell: bash
+      env:
+        UPLINK_CIDR: ${{ inputs.uplink-cidr }}
+      run: |
+        set -euo pipefail
+        subnet="$(python3 -c "import ipaddress,sys; print(ipaddress.ip_interface(sys.argv[1]).network)" "$UPLINK_CIDR")"
+        if ip -4 route show | awk '{print $1}' | python3 -c "
+        import ipaddress, sys
+        mine = ipaddress.ip_network(sys.argv[1])
+        for line in sys.stdin:
+            try:
+                other = ipaddress.ip_network(line.strip(), strict=False)
+            except ValueError:
+                continue
+            if other.prefixlen > 0 and other.overlaps(mine):
+                sys.exit(0)
+        sys.exit(1)
+        " "$subnet"; then
+          echo "::error::uplink-cidr ${subnet} overlaps a network on the runner"
+          ip -4 route show
+          exit 1
+        fi
+        sudo ip link add mcuplink0 type bridge
+        sudo ip address add "$UPLINK_CIDR" dev mcuplink0
+        sudo ip link set mcuplink0 up
+        sudo sysctl -qw net.ipv4.ip_forward=1
+        sudo iptables -t nat -A POSTROUTING -s "$subnet" ! -d "$subnet" -j MASQUERADE
+
+    - name: Write the MicroCloud preseed
+      shell: bash
+      env:
+        UPLINK_CIDR: ${{ inputs.uplink-cidr }}
+      run: |
+        set -euo pipefail
+        internal_if="$(ip route show default | awk '{print $5; exit}')"
+        internal_addr="$(ip -4 -o addr show dev "$internal_if" | awk '{split($4,a,"/"); print a[1]; exit}')"
+        test -n "$internal_addr"
+        gateway="${UPLINK_CIDR%/*}"
+        # OVN hands its instances the runner's own upstream resolvers, which
+        # stay reachable through the masquerade even where egress to public
+        # resolvers is filtered.
+        dns="$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ && $2 !~ /^127\./ {print $2}' \
+          /run/systemd/resolve/resolv.conf 2>/dev/null | paste -sd, -)"
+        if [ -z "$dns" ]; then
+          echo "::error::no upstream IPv4 nameserver in /run/systemd/resolve/resolv.conf"
+          exit 1
+        fi
+
+        cat > "$RUNNER_TEMP/microcloud-preseed.yaml" <<EOF
+        initiator_address: ${internal_addr}
+        systems:
+        - name: $(hostname)
+          address: ${internal_addr}
+          ovn_uplink_interface: mcuplink0
+          storage:
+            local:
+              path: ${MICROCLOUD_DISK}
+              wipe: true
+        ovn:
+          ipv4_gateway: ${UPLINK_CIDR}
+          ipv4_range: ${gateway%.*}.100-${gateway%.*}.200
+          dns_servers: ${dns}
+        EOF
+        cat "$RUNNER_TEMP/microcloud-preseed.yaml"
+        echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
+
+    # MicroCloud falls back to a FAN network when it cannot set up OVN; the
+    # integrator suite cannot create sandboxes off OVN, so fail here instead.
+    - name: Initialize MicroCloud
+      shell: bash
+      env:
+        ZFS_ARC_MAX: ${{ inputs.zfs-arc-max }}
+      run: |
+        set -euo pipefail
+        sudo microcloud preseed < "$RUNNER_TEMP/microcloud-preseed.yaml"
+        echo "$ZFS_ARC_MAX" | sudo tee /sys/module/zfs/parameters/zfs_arc_max >/dev/null
+        sudo microcloud cluster list
+        sudo lxc network list
+        sudo lxc storage list
+        online="$(sudo lxc cluster list --format=json | jq '[.[] | select(.status == "Online")] | length')"
+        test "$online" -eq 1
+        test "$(sudo lxc query /1.0/networks/default | jq -r .type)" = ovn
+        test "$(sudo lxc profile device get default root pool)" = local

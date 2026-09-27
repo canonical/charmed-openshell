@@ -1,7 +1,9 @@
 """Host-LXD helpers shared by integration test fixtures.
 
-These helpers enable HTTPS on the concierge host LXD, mint a self-signed client
-identity for ``lxd-integrator-k8s``, and read the server certificate/fingerprint.
+These helpers enable HTTPS on the concierge host LXD (or use an LXD that already
+serves HTTPS, such as a MicroCloud, when ``OPENSHELL_TEST_LXD_ADDRESS`` names
+it), mint a self-signed client identity for ``lxd-integrator-k8s``, and read the
+server certificate/fingerprint.
 They are intentionally free of pytest imports so they can be used from both
 ``conftest.py`` fixtures and the provider-path test modules.
 """
@@ -11,15 +13,12 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
-import io
 import json
 import logging
 import os
 import socket
 import ssl
 import subprocess
-import tarfile
-import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -141,71 +140,6 @@ def _host_reachable_ip() -> str:
     raise RuntimeError("could not determine host reachable IP: no default IPv4 route found")
 
 
-DEFAULT_SANDBOX_IMAGE_ALIAS = "openshell-sandbox"
-
-
-def ensure_sandbox_image(runner: Any = host_lxc_runner) -> None:
-    """Ensure that the default sandbox image alias exists in LXD.
-
-    The OpenShell LXD driver checks on startup that the configured default
-    sandbox image alias exists in the LXD image store. If absent, alias an
-    existing image or import a minimal dummy image so the driver can start.
-    """
-    aliases_res = runner("image", "alias", "list", "--format=json")
-    if aliases_res.returncode == 0 and aliases_res.stdout:
-        try:
-            aliases = json.loads(aliases_res.stdout)
-            if any(a.get("name") == DEFAULT_SANDBOX_IMAGE_ALIAS for a in aliases):
-                return
-        except json.JSONDecodeError:
-            pass
-
-    # Find an existing image to alias
-    img_res = runner("image", "list", "--format=json")
-    if img_res.returncode == 0 and img_res.stdout:
-        try:
-            images = json.loads(img_res.stdout)
-            if images and "fingerprint" in images[0]:
-                alias_res = runner(
-                    "image",
-                    "alias",
-                    "create",
-                    DEFAULT_SANDBOX_IMAGE_ALIAS,
-                    images[0]["fingerprint"],
-                )
-                if alias_res.returncode == 0:
-                    return
-        except json.JSONDecodeError:
-            pass
-
-    # Fallback: import a minimal dummy container image
-    meta = (
-        b"architecture: x86_64\n"
-        b"creation_date: 1600000000\n"
-        b"properties:\n"
-        b"  description: openshell sandbox dummy image\n"
-        b"  os: ubuntu\n"
-        b"  release: noble\n"
-    )
-    with tempfile.TemporaryDirectory() as tmpdir:
-        meta_tar = Path(tmpdir) / "meta.tar.gz"
-        rootfs_tar = Path(tmpdir) / "rootfs.tar.gz"
-        with tarfile.open(meta_tar, "w:gz") as tar:
-            info = tarfile.TarInfo("metadata.yaml")
-            info.size = len(meta)
-            tar.addfile(info, io.BytesIO(meta))
-        with tarfile.open(rootfs_tar, "w:gz") as tar:
-            pass
-        runner(
-            "image",
-            "import",
-            str(meta_tar),
-            str(rootfs_tar),
-            "--alias",
-            DEFAULT_SANDBOX_IMAGE_ALIAS,
-        )
-
-
 def _query_profile(runner: Any, project: str) -> dict[str, Any]:
     """Return the ``default`` profile of *project* as JSON, or ``{}`` when absent.
 
@@ -231,129 +165,29 @@ def _profile_devices(runner: Any, project: str) -> dict[str, Any]:
     }
 
 
-def _alias_exists(runner: Any, project: str) -> bool:
-    """Return True when the sandbox image alias already exists in *project*."""
-    result = runner("image", "alias", "list", "--format=json", "--project", project)
-    if result.returncode != 0 or not result.stdout:
-        return False
-    try:
-        aliases = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return False
-    return any(a.get("name") == DEFAULT_SANDBOX_IMAGE_ALIAS for a in aliases)
-
-
-def _image_exists_in_project(runner: Any, project: str, fingerprint: str) -> bool:
-    """Return True when *fingerprint* is present in *project*'s image store."""
-    result = runner("query", f"/1.0/images/{fingerprint}?project={project}")
-    return result.returncode == 0
-
-
-def _copy_image_to_project(runner: Any, fingerprint: str, project: str) -> None:
-    """Copy an image from the default project into *project* by fingerprint."""
-    result = runner("image", "copy", f"local:{fingerprint}", "local:", "--target-project", project)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"could not copy sandbox image {fingerprint} into project {project}: {result.stderr}"
-        )
-
-
-def _ensure_project_sandbox_image_alias(runner: Any, project: str) -> None:
-    """Ensure the sandbox image alias exists inside *project*.
-
-    The project's image store is separate from the default project's, so the
-    alias the driver validates at startup must be created there too. An
-    existing image from the default project is copied in by fingerprint; a
-    missing one falls back to importing a minimal dummy image directly into
-    the project.
-    """
-    if _alias_exists(runner, project):
-        return
-
-    src_img_res = runner("image", "list", "--project", "default", "--format=json")
-    if src_img_res.returncode == 0 and src_img_res.stdout:
-        try:
-            images = json.loads(src_img_res.stdout)
-        except json.JSONDecodeError:
-            images = []
-        for image in images:
-            fingerprint = image.get("fingerprint", "")
-            if not fingerprint:
-                continue
-            if not _image_exists_in_project(runner, project, fingerprint):
-                _copy_image_to_project(runner, fingerprint, project)
-            result = runner(
-                "image",
-                "alias",
-                "create",
-                DEFAULT_SANDBOX_IMAGE_ALIAS,
-                fingerprint,
-                "--project",
-                project,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"could not create sandbox image alias in project {project}: {result.stderr}"
-                )
-            return
-
-    # No image available in the default project: import a minimal dummy image
-    # directly into the project.
-    meta = (
-        b"architecture: x86_64\n"
-        b"creation_date: 1600000000\n"
-        b"properties:\n"
-        b"  description: openshell sandbox dummy image\n"
-        b"  os: ubuntu\n"
-        b"  release: noble\n"
-    )
-    with tempfile.TemporaryDirectory() as tmpdir:
-        meta_tar = Path(tmpdir) / "meta.tar.gz"
-        rootfs_tar = Path(tmpdir) / "rootfs.tar.gz"
-        with tarfile.open(meta_tar, "w:gz") as tar:
-            info = tarfile.TarInfo("metadata.yaml")
-            info.size = len(meta)
-            tar.addfile(info, io.BytesIO(meta))
-        with tarfile.open(rootfs_tar, "w:gz") as tar:
-            pass
-        result = runner(
-            "image",
-            "import",
-            str(meta_tar),
-            str(rootfs_tar),
-            "--alias",
-            DEFAULT_SANDBOX_IMAGE_ALIAS,
-            "--project",
-            project,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"could not import sandbox image into project {project}: {result.stderr}"
-            )
-
-
 def ensure_lxd_project(runner: Any = host_lxc_runner, project: str = "default") -> None:
     """Ensure *project* exists on the host LXD with the devices the driver needs.
 
     The OpenShell LXD driver reads placement from the *project's* ``default``
-    profile and validates the sandbox image alias inside that project at
-    startup, but it never creates any of them. This helper provisions what the
-    driver reads, mirroring what LXD does for a project created with an
-    explicit ``--network`` and ``--storage``:
+    profile but never creates the project or the profile's devices. This
+    helper provisions what the driver reads, mirroring what LXD does for a
+    project created with an explicit ``--network`` and ``--storage``:
 
     - the project itself, if absent, created with the same feature set any
       CLI-created project gets;
     - a ``default`` profile with one NIC on the default project's network
       (``eth0``) and one root disk on its storage pool (``root``), re-read
       from the default project's own profile on every call so the two stay
-      in sync;
-    - the sandbox image alias inside the project's own image store.
+      in sync.
+
+    Sandbox images are OCI references the driver pulls and converts itself,
+    so the project needs no image of its own.
 
     Every level is idempotent: existing entities are left as they are.
     """
     if project == "default":
         # Nothing to provision: LXD ships the default project with a populated
-        # profile, and ensure_sandbox_image() already covers its image store.
+        # profile.
         return
 
     default_devices = _profile_devices(runner, "default")
@@ -389,20 +223,35 @@ def ensure_lxd_project(runner: Any = host_lxc_runner, project: str = "default") 
                 f"{project}: {result.stderr}"
             )
 
-    _ensure_project_sandbox_image_alias(runner, project)
+
+#: ``host:port`` of an LXD that already listens on HTTPS, such as a MicroCloud
+#: the ``lxc`` client reaches as its default remote. When set, the fixtures
+#: use it as it is instead of pointing the local LXD's listener at this host.
+EXTERNAL_LXD_ADDRESS_ENV = "OPENSHELL_TEST_LXD_ADDRESS"
+
+
+def external_lxd_address() -> str | None:
+    """Return the externally managed LXD address from the environment, if any."""
+    address = os.environ.get(EXTERNAL_LXD_ADDRESS_ENV, "").strip()
+    return address or None
 
 
 def setup_host_lxd_endpoint() -> HostLxdEndpoint:
-    """Enable HTTPS on the host LXD, trust an integrator identity, and return details."""
-    host_ip = _host_reachable_ip()
-    result = host_lxc_runner("config", "set", "core.https_address", f"{host_ip}:8443")
-    if result.returncode != 0:
-        raise RuntimeError(f"could not enable host LXD HTTPS listener: {result.stderr}")
+    """Enable HTTPS on the host LXD, trust an integrator identity, and return details.
 
-    # Allow the listener a moment to come up.
-    time.sleep(2)
+    With ``OPENSHELL_TEST_LXD_ADDRESS`` set, the LXD is someone else's, for
+    example a MicroCloud: its listener is left alone, and the given address
+    is the one the integrator is pointed at.
+    """
+    host_address = external_lxd_address()
+    if host_address is None:
+        host_address = f"{_host_reachable_ip()}:8443"
+        result = host_lxc_runner("config", "set", "core.https_address", host_address)
+        if result.returncode != 0:
+            raise RuntimeError(f"could not enable host LXD HTTPS listener: {result.stderr}")
 
-    ensure_sandbox_image(host_lxc_runner)
+        # Allow the listener a moment to come up.
+        time.sleep(2)
 
     client_cert_pem, client_key_pem, integrator_fingerprint = (
         generate_integrator_client_credentials()
@@ -419,7 +268,7 @@ def setup_host_lxd_endpoint() -> HostLxdEndpoint:
     finally:
         cert_file.unlink(missing_ok=True)
 
-    address = f"https://{host_ip}:8443"
+    address = f"https://{host_address}"
     server_cert_pem, server_fingerprint = fetch_server_cert(address)
 
     return HostLxdEndpoint(
@@ -436,6 +285,9 @@ def setup_host_lxd_endpoint() -> HostLxdEndpoint:
 def teardown_host_lxd_endpoint(endpoint: HostLxdEndpoint, prior_address: str | None) -> None:
     """Remove the integrator identity and restore the HTTPS listener setting."""
     host_lxc_runner("config", "trust", "remove", endpoint.integrator_cert_fingerprint)
+    if external_lxd_address() is not None:
+        # The listener was never touched.
+        return
     if prior_address:
         host_lxc_runner("config", "set", "core.https_address", prior_address)
     else:

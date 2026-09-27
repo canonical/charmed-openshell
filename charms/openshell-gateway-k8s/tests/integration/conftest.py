@@ -53,6 +53,7 @@ from .image_resolver import resolve_gateway_image
 from .lxd_host import (
     HostLxdEndpoint,
     ensure_lxd_project,
+    external_lxd_address,
     read_lxd_config,
     setup_host_lxd_endpoint,
     teardown_host_lxd_endpoint,
@@ -120,6 +121,11 @@ def host_lxd_endpoint() -> Generator[HostLxdEndpoint, None, None]:
     try:
         endpoint = setup_host_lxd_endpoint()
     except RuntimeError as exc:
+        # An LXD named in the environment is one the run was set up to use,
+        # so failing to reach it is an error, not a reason to skip every
+        # test that depends on it.
+        if external_lxd_address() is not None:
+            raise
         pytest.skip(str(exc))
 
     assert endpoint is not None
