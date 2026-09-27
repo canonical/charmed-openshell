@@ -91,25 +91,15 @@ runs:
               continue
               ;;
           esac
-          if [ -r "$iface_path/operstate" ]; then
-            read -r operstate < "$iface_path/operstate"
-            if [ "$operstate" != "up" ]; then
-              continue
-            fi
-          fi
-          if [ -r "$iface_path/carrier" ]; then
-            read -r carrier < "$iface_path/carrier"
-            if [ "$carrier" != "1" ]; then
-              continue
-            fi
-          fi
           candidate_addr="$(ip -4 -o addr show dev "$iface" scope global | awk '{split($4,a,"/"); print a[1]; exit}')"
           if [ -z "$candidate_addr" ]; then
             continue
           fi
-          route_dev="$(ip -4 route get "$upstream_gateway" from "$candidate_addr" 2>/dev/null \
-            | awk '{for (i = 1; i <= NF; ++i) if ($i == "dev") {print $(i + 1); exit}}')"
-          if [ "$route_dev" != "$iface" ]; then
+          read -r route_dev route_via < <(
+            ip -4 route get "$upstream_gateway" from "$candidate_addr" 2>/dev/null \
+              | awk '{for (i = 1; i <= NF; ++i) {if ($i == "dev") dev = $(i + 1); else if ($i == "via") via = $(i + 1)} print dev, via; exit}'
+          )
+          if [ "$route_dev" != "$iface" ] || [ "$route_via" != "$upstream_gateway" ]; then
             continue
           fi
           uplink_if="$iface"

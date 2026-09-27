@@ -13,6 +13,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  OPENSHELL_SNAP_REVISION: "1041"
+
 jobs:
   lint:
     name: Lint
@@ -154,9 +157,9 @@ jobs:
       - name: Install OpenShell client
         run: |
           if snap list openshell >/dev/null 2>&1; then
-            sudo snap refresh openshell --revision=1041
+            sudo snap refresh openshell --revision="$OPENSHELL_SNAP_REVISION"
           else
-            sudo snap install openshell --revision=1041
+            sudo snap install openshell --revision="$OPENSHELL_SNAP_REVISION"
           fi
           sudo snap refresh --hold openshell
 
@@ -322,7 +325,7 @@ jobs:
           # concierge installs the openshell snap from latest/stable, which
           # has moved past the gateway rock's release; pin the matching CLI
           # (0.0.116, revision 1041) and hold it.
-          sudo snap refresh openshell --revision=1041
+          sudo snap refresh openshell --revision="$OPENSHELL_SNAP_REVISION"
           sudo snap refresh --hold openshell
           SCRIPT
 
