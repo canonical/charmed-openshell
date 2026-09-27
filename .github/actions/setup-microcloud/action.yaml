@@ -66,14 +66,28 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        internal_if="$(ip route show default | awk '{print $5; exit}')"
+        internal_if="$(ip -4 route show default | awk '{print $5; exit}')"
+        if [ -z "$internal_if" ]; then
+          echo "No IPv4 default-route interface found for MicroCloud preseed" >&2
+          exit 1
+        fi
         internal_addr="$(ip -4 -o addr show dev "$internal_if" | awk '{split($4,a,"/"); print a[1]; exit}')"
         internal_prefix="$(ip -4 -o addr show dev "$internal_if" | awk '{print $4; exit}')"
+        if [ -z "$internal_addr" ] || [ -z "$internal_prefix" ]; then
+          echo "Interface $internal_if does not have a usable IPv4 address for MicroCloud preseed" >&2
+          exit 1
+        fi
 
         uplink_if="$internal_if"
         for iface_path in /sys/class/net/*; do
           iface="$(basename "$iface_path")"
           case "$iface" in lo|docker*|br-*|veth*|virbr*|"$internal_if") continue ;; esac
+          if [ -r "$iface_path/operstate" ] && [ "$(cat "$iface_path/operstate")" != "up" ]; then
+            continue
+          fi
+          if [ -r "$iface_path/carrier" ] && [ "$(cat "$iface_path/carrier")" != "1" ]; then
+            continue
+          fi
           uplink_if="$iface"
           break
         done
