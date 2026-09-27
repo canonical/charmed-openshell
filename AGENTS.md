@@ -243,6 +243,10 @@ its snaps to the MicroCloud 3 stack (`lxd` `6/stable`, `microceph`
 `microcloud preseed < file`; `microcloud init --preseed ...` is not accepted
 there.
 
+MicroCloud 3's preseed also rejects `initiator_address` and `lookup_subnet`
+when both are set. For this single-member CI setup, keep `initiator_address`
+and omit `lookup_subnet`.
+
 ### `sandbox-image` is an OCI reference, not an LXD alias
 
 The driver resolves `--default-image` as a registry reference and imports it on first
