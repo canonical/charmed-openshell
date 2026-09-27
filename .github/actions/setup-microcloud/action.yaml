@@ -28,6 +28,14 @@ runs:
           sudo systemctl disable docker docker.socket containerd || true
         fi
 
+    - name: Set MicroCloud paths
+      shell: bash
+      run: |
+        state_dir="/var/microcloud/${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}"
+        echo "MICROCLOUD_STATE_DIR=${state_dir}" >> "$GITHUB_ENV"
+        echo "MICROCLOUD_IMAGE_PATH=${state_dir}/local.img" >> "$GITHUB_ENV"
+        echo "MICROCLOUD_PRESEED_PATH=/tmp/microcloud-preseed-${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}.yaml" >> "$GITHUB_ENV"
+
     # Self-hosted runners are reused, so a cancelled or failed previous job can
     # leave held snaps or MicroCloud state behind. Clear it before reinstalling
     # the pinned stack.
@@ -47,16 +55,16 @@ runs:
       run: |
         set -euo pipefail
         sudo snap remove --purge lxd || true
-        loop_devices="$(sudo losetup -j /var/microcloud/local.img | cut -d: -f1 || true)"
+        loop_devices="$(sudo losetup -j "$MICROCLOUD_IMAGE_PATH" | cut -d: -f1 || true)"
         if [ -n "$loop_devices" ]; then
           printf '%s\n' "$loop_devices" | xargs -r sudo losetup -d
         fi
-        if sudo losetup -j /var/microcloud/local.img | grep -q .; then
-          echo "/var/microcloud/local.img is still attached after reset" >&2
+        if sudo losetup -j "$MICROCLOUD_IMAGE_PATH" | grep -q .; then
+          echo "$MICROCLOUD_IMAGE_PATH is still attached after reset" >&2
           exit 1
         fi
-        sudo rm -rf /var/microcloud
-        sudo rm -f /tmp/microcloud-preseed.yaml
+        sudo rm -rf "$MICROCLOUD_STATE_DIR"
+        sudo rm -f "$MICROCLOUD_PRESEED_PATH"
         sudo snap install lxd --channel=6/stable --cohort="+"
         sudo lxd waitready --timeout=120
 
@@ -74,9 +82,9 @@ runs:
     - name: Create the MicroCloud storage disk
       shell: bash
       run: |
-        sudo install -d -m 0755 /var/microcloud
-        sudo truncate -s "${{ inputs.disk-size }}" /var/microcloud/local.img
-        disk="$(sudo losetup --find --show /var/microcloud/local.img)"
+        sudo install -d -m 0755 "$MICROCLOUD_STATE_DIR"
+        sudo truncate -s "${{ inputs.disk-size }}" "$MICROCLOUD_IMAGE_PATH"
+        disk="$(sudo losetup --find --show "$MICROCLOUD_IMAGE_PATH")"
         echo "MICROCLOUD_DISK=${disk}" >> "$GITHUB_ENV"
 
     # One cluster member. The internal network is the default-route
@@ -205,7 +213,7 @@ runs:
           echo "  ipv4_gateway: ${ovn_gateway}"
           echo "  ipv4_range: ${ovn_range}"
           echo "  dns_servers: 1.1.1.1"
-        } | sudo sh -c 'umask 077 && cat > /tmp/microcloud-preseed.yaml'
+        } | sudo sh -c 'umask 077 && cat > "$1"' sh "$MICROCLOUD_PRESEED_PATH"
 
         echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
 
@@ -213,7 +221,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo microcloud preseed < /tmp/microcloud-preseed.yaml
+        sudo microcloud preseed < "$MICROCLOUD_PRESEED_PATH"
         members="$(sudo lxc cluster list --format=json | jq length)"
         online="$(sudo lxc cluster list --format=json | jq '[.[] | select(.state == "ONLINE")] | length')"
         echo "MicroCloud cluster members: ${members}, online: ${online}"

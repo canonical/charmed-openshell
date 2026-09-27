@@ -382,7 +382,12 @@ jobs:
         run: |
           sudo lxc delete --force "$VM_NAME" || true
           sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
-          sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
+          if [ -n "${MICROCLOUD_STATE_DIR:-}" ]; then
+            sudo rm -rf "$MICROCLOUD_STATE_DIR"
+          fi
+          if [ -n "${MICROCLOUD_PRESEED_PATH:-}" ]; then
+            sudo rm -f "$MICROCLOUD_PRESEED_PATH"
+          fi
           sudo snap refresh --unhold lxd microceph microovn microcloud || true
           sudo snap remove --purge microcloud microceph microovn || true
 
