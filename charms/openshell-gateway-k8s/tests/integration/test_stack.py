@@ -530,10 +530,11 @@ def test_all_four_models_converged(stack_deployment: StackDeployment, juju: jubi
         "juju", "status", "-m", stack_deployment.models["openshell"]["name"], "--format", "json"
     )
     assert result.returncode == 0, result.stderr
-    # juju reports the model's consumed offers under ``remote-applications``
-    # (juju 3.x has no ``saas`` section); the keys are the SAAS applications
-    # the glue created over the composed offer URLs.
-    saas = sorted((json.loads(result.stdout).get("remote-applications") or {}).keys())
+    # juju 3.x reports the model's consumed offers under
+    # ``application-endpoints`` (``remote-applications`` is juju 2.x); the
+    # keys are the SAAS applications the glue created over the composed
+    # offer URLs.
+    saas = sorted((json.loads(result.stdout).get("application-endpoints") or {}).keys())
     for expected in EXPECTED_SAAS:
         assert any(expected in offer for offer in saas), f"{expected} not among SAAS: {saas}"
 
@@ -605,6 +606,7 @@ def test_unroled_principal_refused(
         client_id=client_id,
         client_secret=client_secret,
         audience=audience,
+        scopes="openshell-nobody",
     )
     try:
         created = run_cmd(

@@ -51,7 +51,11 @@ class StackLxd:
     def request(
         self, method: str, path: str, body: dict[str, Any] | None = None
     ) -> dict[str, Any] | None:
-        """Perform one REST call and return the response JSON, or None on 404."""
+        """Perform one REST call and return the response's ``metadata``, or None on 404.
+
+        LXD wraps every result in an envelope (``type``, ``status``,
+        ``metadata``, …); callers want the object inside it.
+        """
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
             f"{self._base}{path}",
@@ -61,7 +65,8 @@ class StackLxd:
         )
         try:
             with urllib.request.urlopen(request, context=self._context, timeout=120) as response:
-                return json.loads(response.read() or b"null")
+                envelope = json.loads(response.read() or b"null")
+                return envelope.get("metadata") if isinstance(envelope, dict) else None
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
@@ -99,6 +104,7 @@ class StackLxd:
         default_devices = self._bare_devices(default.get("devices") or {})
         network = (default_devices.get("eth0") or {}).get("network", "")
         pool = (default_devices.get("root") or {}).get("pool", "")
+        assert network and pool, f"the default profile has no eth0 network or root pool: {default}"
 
         current = self.request("GET", f"/1.0/profiles/default?project={project}")
         assert current is not None, f"project {project} has no default profile"
@@ -114,6 +120,9 @@ class StackLxd:
 
         for name, device in wanted.items():
             devices[name] = device
-        body = dict(current)
-        body["devices"] = devices
+        body = {
+            "config": current.get("config") or {},
+            "description": current.get("description", ""),
+            "devices": devices,
+        }
         self.request("PUT", f"/1.0/profiles/default?project={project}", body)

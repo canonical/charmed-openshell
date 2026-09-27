@@ -63,8 +63,14 @@ def openshell_gateway_add(
     client_id: str,
     client_secret: str,
     audience: str,
+    scopes: str = OIDC_ADMIN_ROLE,
 ) -> None:
-    """Register a gateway in the openshell CLI using OIDC credentials."""
+    """Register a gateway in the openshell CLI using OIDC credentials.
+
+    *scopes* is what the CLI requests in the token exchange. The client has
+    to be allowed every one of them, or the identity provider refuses the
+    exchange before the gateway sees a token.
+    """
     env = os.environ.copy()
     env["OPENSHELL_OIDC_CLIENT_SECRET"] = client_secret
     env.pop("SSL_CERT_FILE", None)
@@ -83,7 +89,7 @@ def openshell_gateway_add(
         "--oidc-audience",
         audience,
         "--oidc-scopes",
-        OIDC_ADMIN_ROLE,
+        scopes,
         env=env,
     )
     output = result.stdout + result.stderr
