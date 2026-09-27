@@ -36,6 +36,10 @@ runs:
       run: |
         sudo snap refresh --unhold lxd microceph microovn microcloud || true
         sudo snap remove --purge microcloud microceph microovn || true
+        sudo snap stop lxd || true
+        sudo losetup -j /var/microcloud/local.img | cut -d: -f1 | xargs -r sudo losetup -d
+        sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
+        sudo rm -rf /var/microcloud
         sudo rm -f /tmp/microcloud-preseed.yaml
 
     # MicroCloud refuses to initialize over an initialized LXD, and the
@@ -45,9 +49,6 @@ runs:
       shell: bash
       run: |
         sudo snap remove --purge lxd || true
-        sudo losetup -j /var/microcloud/local.img | cut -d: -f1 | xargs -r sudo losetup -d
-        sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
-        sudo rm -rf /var/microcloud
         sudo snap install lxd --channel=6/stable --cohort="+"
         sudo lxd waitready --timeout=120
 
