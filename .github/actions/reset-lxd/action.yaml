@@ -44,7 +44,10 @@ runs:
         fi
 
         if [ -n "$preseed_glob" ]; then
-          sudo sh -c 'rm -f "$@"' sh $preseed_glob
+          mapfile -t preseed_paths < <(compgen -G "$preseed_glob" || true)
+          if [ "${#preseed_paths[@]}" -gt 0 ]; then
+            sudo rm -f -- "${preseed_paths[@]}"
+          fi
         fi
 
         sudo snap install lxd --channel='${{ inputs.channel }}' --cohort="+"
