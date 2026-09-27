@@ -6,6 +6,8 @@ on:
       - terraform/**
       - concierge.yaml
       - .github/workflows/ci-terraform.yaml
+      - .github/actions/setup-microcloud/**
+      - charms/openshell-gateway-k8s/tests/integration/test_stack.py
   workflow_dispatch:
 
 concurrency:
@@ -101,15 +103,13 @@ jobs:
             -c limits.cpu="$VM_CPU" \
             -c limits.memory="$VM_MEMORY" \
             -d root,size="$VM_DISK"
+          # lxc exec fails until the guest agent answers; retry through it.
+          # cloud-init status has no timeout of its own, so bound it here.
           for _ in $(seq 60); do
-            [ "$(sudo lxc list "$VM_NAME" --format=csv -c s)" = "RUNNING" ] && break
+            sudo lxc exec "$VM_NAME" -- true 2>/dev/null && break
             sleep 5
           done
-          # lxc exec fails until the guest agent answers; retry through it.
-          for _ in $(seq 30); do
-            sudo lxc exec "$VM_NAME" -- cloud-init status --wait --timeout=60 && break || sleep 10
-          done
-          sudo lxc exec "$VM_NAME" -- cloud-init status --wait --timeout=600
+          timeout 600 sudo lxc exec "$VM_NAME" -- cloud-init status --wait
 
       - name: Resolve the VM addresses and route the load-balancer pool
         run: |
@@ -153,11 +153,12 @@ jobs:
           # server certificate the integrator will verify the endpoint
           # against — both minted and read on the host. The pytest module
           # provisions the LXD project with them over the REST API, because
-          # the VM has no lxc client.
+          # the VM has no lxc client. MicroCloud's LXD is clustered, so its
+          # API presents the cluster certificate, not the member's server.crt.
           sudo openssl req -x509 -newkey rsa:3072 -keyout /tmp/lxd-client.key \
             -out /tmp/lxd-client.crt -days 2 -nodes -subj "/CN=openshell-stack-ci"
           sudo lxc config trust add /tmp/lxd-client.crt
-          sudo cp /var/snap/lxd/common/lxd/server.crt /tmp/lxd-server.crt
+          sudo cp /var/snap/lxd/common/lxd/cluster.crt /tmp/lxd-server.crt
           for f in /tmp/lxd-client.crt /tmp/lxd-client.key /tmp/lxd-server.crt; do
             sudo lxc file push "$f" "$VM_NAME/root/$(basename "$f")"
           done
@@ -167,6 +168,9 @@ jobs:
         run: |
           sudo lxc exec "$VM_NAME" -- bash -s <<'SCRIPT'
           set -euo pipefail
+          # The first snap on a fresh VM creates /snap/bin, which the lxc exec
+          # session's PATH only includes when it exists at start.
+          export PATH="$PATH:/snap/bin"
           for _ in $(seq 5); do
             if sudo snap install terraform --classic; then break; fi
             sleep 10
@@ -230,9 +234,12 @@ jobs:
           sudo lxc exec "$VM_NAME" -- bash -s <<'SCRIPT' || true
           set -euo pipefail
           install -d /tmp/diagnostics
+          # The stack lives on the Kubernetes controller; concierge leaves
+          # its LXD controller current.
           for model in openshell iam core cos-lite; do
-            juju status -m "$model" --format=yaml > "/tmp/diagnostics/${model}-status.yaml" || true
-            juju debug-log -m "$model" --replay --no-tail \
+            juju status -m "concierge-k8s:$model" --format=yaml \
+              > "/tmp/diagnostics/${model}-status.yaml" || true
+            juju debug-log -m "concierge-k8s:$model" --replay --no-tail \
               > "/tmp/diagnostics/${model}-debug-log.txt" 2>&1 || true
           done
           cd /root/charmed-openshell
@@ -248,22 +255,10 @@ jobs:
               "$GITHUB_WORKSPACE/artifacts/" || true
           fi
 
-      # Leave the runner the way the charm suite's concierge-based jobs need
-      # it: no MicroCloud, LXD installed but uninitialized. Runs on failure
-      # paths too; repeats the stack destroy when the pytest module did not
-      # get to it.
-      - name: Tear down
-        if: always()
-        timeout-minutes: 25
-        run: |
-          set -euo pipefail
-          sudo lxc exec "$VM_NAME" -- bash -c '
-            cd /root/charmed-openshell && \
-            terraform -chdir=terraform/openshell-stack destroy -auto-approve \
-              -var-file=/root/stack-vars.tfvars.json' || true
-          sudo lxc delete --force "$VM_NAME" || true
-          sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
-          sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
-          sudo snap remove --purge microcloud microceph microovn || true
-          sudo snap remove --purge lxd || true
-          sudo snap install lxd
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-stack
+          path: artifacts/
+          if-no-files-found: ignore
