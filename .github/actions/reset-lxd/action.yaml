@@ -1,0 +1,51 @@
+name: "Reset LXD"
+description: "Unhold, reinstall, and wait for the pinned LXD snap, with optional state cleanup"
+
+inputs:
+  cleanup-root:
+    description: "Optional directory tree containing stale local.img files to detach and remove"
+    required: false
+    default: ""
+  preseed-glob:
+    description: "Optional shell glob for stale preseed files to remove"
+    required: false
+    default: ""
+  channel:
+    description: "LXD snap channel"
+    required: false
+    default: "6/stable"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        cleanup_root='${{ inputs.cleanup-root }}'
+        preseed_glob='${{ inputs.preseed-glob }}'
+
+        sudo snap refresh --unhold lxd || true
+        sudo snap stop lxd || true
+        sudo snap remove --purge lxd || true
+
+        if [ -n "$cleanup_root" ] && [ -d "$cleanup_root" ]; then
+          while IFS= read -r -d '' image; do
+            loop_devices="$(sudo losetup -j "$image" | cut -d: -f1 || true)"
+            if [ -n "$loop_devices" ]; then
+              printf '%s\n' "$loop_devices" | xargs -r sudo losetup -d
+            fi
+            if sudo losetup -j "$image" | grep -q .; then
+              echo "$image is still attached after reset" >&2
+              exit 1
+            fi
+          done < <(sudo find "$cleanup_root" -mindepth 2 -maxdepth 2 -type f -name local.img -print0)
+          sudo rm -rf "$cleanup_root"
+        fi
+
+        if [ -n "$preseed_glob" ]; then
+          sudo sh -c 'rm -f "$@"' sh $preseed_glob
+        fi
+
+        sudo snap install lxd --channel='${{ inputs.channel }}' --cohort="+"
+        sudo lxd waitready --timeout=120

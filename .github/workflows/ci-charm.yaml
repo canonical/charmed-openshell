@@ -140,11 +140,7 @@ jobs:
         run: sudo snap install --classic concierge
 
       - name: Reset LXD for concierge
-        run: |
-          sudo snap refresh --unhold lxd || true
-          sudo snap remove --purge lxd || true
-          sudo snap install lxd --channel=6/stable --cohort="+"
-          sudo lxd waitready --timeout=120
+        uses: ./.github/actions/reset-lxd
 
       - name: Bootstrap Juju/K8s environment
         run: sudo concierge prepare -c concierge.yaml

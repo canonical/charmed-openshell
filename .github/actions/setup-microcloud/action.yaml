@@ -45,28 +45,12 @@ runs:
         set -euo pipefail
         sudo snap refresh --unhold lxd microceph microovn microcloud || true
         sudo snap remove --purge microcloud microceph microovn || true
-        sudo snap stop lxd || true
 
-    # MicroCloud refuses to initialize over an initialized LXD, and the
-    # charm suite's concierge-based jobs on this runner pool expect the
-    # snap present but uninitialized, so reset it unconditionally.
     - name: Reset LXD for MicroCloud
-      shell: bash
-      run: |
-        set -euo pipefail
-        sudo snap remove --purge lxd || true
-        loop_devices="$(sudo losetup -j "$MICROCLOUD_IMAGE_PATH" | cut -d: -f1 || true)"
-        if [ -n "$loop_devices" ]; then
-          printf '%s\n' "$loop_devices" | xargs -r sudo losetup -d
-        fi
-        if sudo losetup -j "$MICROCLOUD_IMAGE_PATH" | grep -q .; then
-          echo "$MICROCLOUD_IMAGE_PATH is still attached after reset" >&2
-          exit 1
-        fi
-        sudo rm -rf "$MICROCLOUD_STATE_DIR"
-        sudo rm -f "$MICROCLOUD_PRESEED_PATH"
-        sudo snap install lxd --channel=6/stable --cohort="+"
-        sudo lxd waitready --timeout=120
+      uses: ./.github/actions/reset-lxd
+      with:
+        cleanup-root: /var/microcloud
+        preseed-glob: /tmp/microcloud-preseed-*.yaml
 
     - name: Install MicroCloud snaps
       shell: bash

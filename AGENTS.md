@@ -248,7 +248,8 @@ snap holds, loop devices, and preseed files at the start of the setup action;
 teardown alone is not enough after a cancelled or failed run.
 
 For the same reason, concierge-based jobs on the self-hosted pool reset LXD at
-startup instead of relying on the MicroCloud job's teardown to reinstall it.
+startup via `.github/actions/reset-lxd` instead of relying on the MicroCloud
+job's teardown to reinstall it.
 Keep the loopback image and generated preseed on runner-unique paths derived
 from the GitHub run metadata so one run cannot clean up another run's files.
 
