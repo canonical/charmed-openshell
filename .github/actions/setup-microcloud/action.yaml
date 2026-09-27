@@ -86,11 +86,17 @@ runs:
               continue
               ;;
           esac
-          if [ -r "$iface_path/operstate" ] && [ "$(cat "$iface_path/operstate")" != "up" ]; then
-            continue
+          if [ -r "$iface_path/operstate" ]; then
+            read -r operstate < "$iface_path/operstate"
+            if [ "$operstate" != "up" ]; then
+              continue
+            fi
           fi
-          if [ -r "$iface_path/carrier" ] && [ "$(cat "$iface_path/carrier")" != "1" ]; then
-            continue
+          if [ -r "$iface_path/carrier" ]; then
+            read -r carrier < "$iface_path/carrier"
+            if [ "$carrier" != "1" ]; then
+              continue
+            fi
           fi
           if ! ip -4 -o addr show dev "$iface" scope global | grep -q .; then
             continue
