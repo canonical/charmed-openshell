@@ -11,6 +11,9 @@ Charmed OpenShell runs the `NVIDIA OpenShell
 on Canonical Kubernetes with Juju, and creates its sandboxes as LXD
 instances on a MicroCloud.
 
+Charmed OpenShell is alpha software. Its implementation details are subject
+to change.
+
 OpenShell runs AI agents in sandboxes whose file, network and credential
 access is governed by policy. Charmed OpenShell deploys and operates the
 gateway that manages them: it connects the gateway to PostgreSQL, to the

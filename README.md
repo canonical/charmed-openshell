@@ -1,5 +1,9 @@
 # Charmed OpenShell
 
+> [!WARNING]
+> Charmed OpenShell is alpha software. Its implementation details are subject to
+> change.
+
 Charmed OpenShell runs the [NVIDIA OpenShell](https://docs.nvidia.com/openshell/)
 gateway on Canonical Kubernetes with Juju, and creates its sandboxes as LXD
 instances on a [MicroCloud](https://canonical.com/microcloud).
