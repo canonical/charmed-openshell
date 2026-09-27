@@ -36,6 +36,7 @@ runs:
       run: |
         sudo snap refresh --unhold lxd microceph microovn microcloud || true
         sudo snap remove --purge microcloud microceph microovn || true
+        sudo losetup -j /var/microcloud/local.img | cut -d: -f1 | xargs -r sudo losetup -d
         sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
         sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
 
