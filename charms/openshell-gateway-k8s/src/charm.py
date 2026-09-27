@@ -102,6 +102,20 @@ CHECK_PERIOD = "3s"
 CHECK_TIMEOUT = "3s"
 CHECK_THRESHOLD = 2
 
+# What a Pebble that is down or too slow to answer raises. ops converts a
+# refused connection into pebble.ConnectionError but lets the socket's
+# TimeoutError through unwrapped, from can_connect() as well.
+_PEBBLE_UNREACHABLE = (ops.pebble.ConnectionError, TimeoutError)
+
+
+def _can_connect(container: ops.Container) -> bool:
+    """Return ``container.can_connect()``, counting a Pebble timeout as unreachable."""
+    try:
+        return container.can_connect()
+    except TimeoutError:
+        logger.warning("Pebble in the %s container did not answer in time", container.name)
+        return False
+
 
 @dataclass
 class _LxdConnection:
@@ -909,7 +923,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         so each dispatch sees live model/relation state.
         """
         container = self.unit.get_container(CONTAINER_NAME)
-        if not container.can_connect():
+        if not _can_connect(container):
             return [_Gap("waiting for gateway container", "waiting")]
 
         gaps: list[_Gap] = []
@@ -964,7 +978,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         gaps: list[_Gap] = []
         try:
             services = container.get_services()
-        except (ops.pebble.APIError, ops.pebble.ConnectionError):
+        except (ops.pebble.APIError, *_PEBBLE_UNREACHABLE):
             return []
 
         for name, label in ((DRIVER_SERVICE_NAME, "lxd driver"), (SERVICE_NAME, "gateway")):
@@ -981,11 +995,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
     def _check_status(self) -> dict[str, bool]:
         """Return each Pebble check's name mapped to whether it is passing."""
         container = self.unit.get_container(CONTAINER_NAME)
-        if not container.can_connect():
+        if not _can_connect(container):
             return {}
         try:
             checks = container.get_checks()
-        except (ops.pebble.APIError, ops.pebble.ConnectionError):
+        except (ops.pebble.APIError, *_PEBBLE_UNREACHABLE):
             return {}
         return {
             name: check.status == ops.pebble.CheckStatus.UP
@@ -995,7 +1009,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
     def _stop_workload(self, container: ops.Container) -> None:
         """Disable and stop the gateway and driver services idempotently."""
-        if not container.can_connect():
+        if not _can_connect(container):
             return
         container.add_layer(
             CONTAINER_NAME,
@@ -1154,10 +1168,12 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         Falls back to ``openshell`` when the downward-API namespace file is not
         readable, so the server can still start in non-Kubernetes test
-        environments.
+        environments. A Pebble that does not answer is not such a case: the
+        error propagates, so a slow container never gets a wrong namespace
+        rendered into its configuration.
         """
         container = self.unit.get_container(CONTAINER_NAME)
-        if not container.can_connect():
+        if not _can_connect(container):
             return "openshell"
         try:
             namespace = (
@@ -1165,7 +1181,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 .read()
                 .strip()
             )
-        except (ops.pebble.PathError, ops.pebble.APIError, ops.pebble.ConnectionError):
+        except (ops.pebble.PathError, ops.pebble.APIError):
             return "openshell"
         return namespace if namespace else "openshell"
 
@@ -1191,7 +1207,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         try:
             if container.pull(path).read() == content:
                 return
-        except (ops.pebble.PathError, ops.pebble.APIError, ops.pebble.ConnectionError):
+        except (ops.pebble.PathError, ops.pebble.APIError):
             pass
         container.push(path, content, make_dirs=True, permissions=permissions)
 
@@ -1343,7 +1359,27 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             return set()
 
     def _reconcile(self, event: ops.EventBase) -> None:
-        """Re-derive desired state from scratch and converge."""
+        """Re-derive desired state from scratch and converge.
+
+        A Pebble that stops answering part-way through — a busy node, a
+        workload restarting — is not a charm error. Failing the hook for it
+        leaves the unit in error until someone runs ``juju resolved``, and
+        with ``automatically-retry-hooks`` off that is forever. Every step of
+        the convergence is idempotent and the applied hash is recorded only
+        after a successful replan, so stopping here is safe: the next event,
+        ``update-status`` at the latest, converges from where the model is.
+        """
+        try:
+            self._converge(event)
+        except _PEBBLE_UNREACHABLE:
+            logger.warning(
+                "Pebble in the %s container did not answer; the next event will converge",
+                CONTAINER_NAME,
+                exc_info=True,
+            )
+
+    def _converge(self, event: ops.EventBase) -> None:
+        """Do the work of ``_reconcile``; Pebble errors propagate to it."""
         if self._config_error:
             return
 
@@ -1357,7 +1393,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.vault.request_credentials()
 
         container = self.unit.get_container(CONTAINER_NAME)
-        if not container.can_connect():
+        if not _can_connect(container):
             return
 
         # Re-register cert request when SANs have changed, and re-register the
@@ -1561,9 +1597,25 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.rollingops.request_async_lock(callback_id="restart")
 
     def _restart_workload(self, **kwargs: Any) -> OperationResult:
-        """Rolling-ops lock callback: restart the workload and refresh the hash."""
+        """Rolling-ops lock callback: restart the workload and refresh the hash.
+
+        A Pebble that does not answer releases the lock for a retry rather
+        than failing the hook; see ``_reconcile``.
+        """
+        try:
+            return self._restart_workload_now()
+        except _PEBBLE_UNREACHABLE:
+            logger.warning(
+                "Pebble in the %s container did not answer; retrying the restart later",
+                CONTAINER_NAME,
+                exc_info=True,
+            )
+            return OperationResult.RETRY_RELEASE
+
+    def _restart_workload_now(self) -> OperationResult:
+        """Do the work of ``_restart_workload``; Pebble errors propagate to it."""
         container = self.unit.get_container(CONTAINER_NAME)
-        if not container.can_connect():
+        if not _can_connect(container):
             return OperationResult.RETRY_RELEASE
 
         # Re-derive the desired hash from live state so this callback is safe
@@ -1684,14 +1736,14 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
     def _on_get_gateway_status(self, event: ops.ActionEvent) -> None:
         gaps = self._readiness_gaps()
         container = self.unit.get_container(CONTAINER_NAME)
-        running = False
-        driver_running = False
-        if container.can_connect():
-            services = container.get_services()
-            running = SERVICE_NAME in services and services[SERVICE_NAME].is_running()
-            driver_running = (
-                DRIVER_SERVICE_NAME in services and services[DRIVER_SERVICE_NAME].is_running()
-            )
+        services: dict[str, ops.pebble.ServiceInfo] = {}
+        if _can_connect(container):
+            with contextlib.suppress(*_PEBBLE_UNREACHABLE):
+                services = dict(container.get_services())
+        running = SERVICE_NAME in services and services[SERVICE_NAME].is_running()
+        driver_running = (
+            DRIVER_SERVICE_NAME in services and services[DRIVER_SERVICE_NAME].is_running()
+        )
         jwt = self._read_jwt_keypair()
         lxd_conn = self._lxd_connection()
         cfg = self._model_cfg

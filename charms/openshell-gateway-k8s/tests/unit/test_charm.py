@@ -15,7 +15,9 @@ from unittest.mock import MagicMock, patch
 
 import ops
 import ops.pebble
+import pytest
 import yaml
+from charmlibs.rollingops import OperationResult
 from charms.data_platform_libs.v0.data_interfaces import CachedSecret
 from charms.tls_certificates_interface.v4.tls_certificates import TLSCertificatesRequiresV4
 from ops import ActiveStatus, BlockedStatus, ModelError, SecretNotFoundError, WaitingStatus
@@ -2449,6 +2451,82 @@ class TestReplanResilience:
         plan = out2.get_container(CONTAINER_NAME).plan
         assert SERVICE_NAME in plan.services
         assert DRIVER_SERVICE_NAME in plan.services
+
+
+class TestPebbleUnreachable:
+    """A Pebble that is down or too slow to answer must not fail the hook.
+
+    Seen in integration: a pull timed out in update-status right after
+    receive-ca-cert changed the trust store, and with automatically-retry-hooks
+    off the unit stayed in error until the test gave up waiting for it.
+    """
+
+    _TIMEOUT = TimeoutError("timed out")
+
+    def _state(self, restart_rel: PeerRelation) -> State:
+        return State(
+            config=BOTH_ROLES,
+            leader=True,
+            containers=[_CONN_CONTAINER],
+            relations=[*_all_relations(), PeerRelation(PEER_RELATION), restart_rel],
+        )
+
+    @pytest.mark.parametrize(
+        "error", [TimeoutError("timed out"), ops.pebble.ConnectionError("socket closed")]
+    )
+    def test_a_failure_mid_reconcile_converges_on_the_next_event(self, error):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        restart_rel = _restart_relation()
+        with _all_ready(), patch("ops.model.Container.pull", side_effect=error):
+            out1 = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), self._state(restart_rel))
+        assert APPLIED_HASH_KEY not in out1.get_relation(restart_rel.id).local_unit_data
+
+        with _all_ready():
+            out2 = ctx.run(ctx.on.update_status(), out1)
+        assert APPLIED_HASH_KEY in out2.get_relation(restart_rel.id).local_unit_data
+        assert SERVICE_NAME in out2.get_container(CONTAINER_NAME).plan.services
+
+    def test_a_timeout_probing_the_container_reports_waiting(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with (
+            _all_ready(),
+            patch("ops.model.Container.can_connect", side_effect=self._TIMEOUT),
+        ):
+            out = ctx.run(ctx.on.update_status(), _all_ready_state())
+        assert out.unit_status == WaitingStatus("waiting for gateway container")
+
+    def test_the_restart_callback_retries_instead_of_failing(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with (
+            _all_ready(),
+            ctx(ctx.on.update_status(), self._state(_restart_relation())) as manager,
+            patch("ops.model.Container.restart", side_effect=self._TIMEOUT),
+        ):
+            assert manager.charm._restart_workload() == OperationResult.RETRY_RELEASE
+
+    @pytest.mark.parametrize(
+        "error", [TimeoutError("timed out"), ops.pebble.ConnectionError("socket closed")]
+    )
+    def test_the_namespace_is_not_guessed_when_pebble_does_not_answer(self, error):
+        # Falling back to the default here would render a wrong namespace into
+        # the configuration and restart the workload with it.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with (
+            ctx(ctx.on.update_status(), _all_ready_state()) as manager,
+            patch("ops.model.Container.pull", side_effect=error),
+            pytest.raises(type(error)),
+        ):
+            manager.charm._read_pod_namespace()
+
+    def test_get_gateway_status_reports_the_workload_down(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with (
+            _all_ready(),
+            patch("ops.model.Container.get_services", side_effect=self._TIMEOUT),
+        ):
+            ctx.run(ctx.on.action("get-gateway-status"), _all_ready_state())
+        assert ctx.action_results is not None
+        assert ctx.action_results["workload-running"] == "False"
 
 
 class TestLxdAction:
