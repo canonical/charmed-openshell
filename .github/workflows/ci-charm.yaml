@@ -376,10 +376,10 @@ jobs:
           sudo lxc delete --force "$VM_NAME" || true
           sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
           sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
+          sudo snap refresh --unhold lxd microceph microovn microcloud || true
           sudo snap remove --purge microcloud microceph microovn || true
           sudo snap remove --purge lxd || true
           sudo snap install lxd --channel=6/stable --cohort="+"
-          sudo snap refresh --unhold lxd
           sudo lxd waitready --timeout=120
 
   integration:

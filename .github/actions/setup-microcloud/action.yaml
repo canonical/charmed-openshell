@@ -36,7 +36,7 @@ runs:
       run: |
         sudo snap remove --purge lxd || true
         sudo snap install lxd --channel=6/stable --cohort="+"
-        sudo lxd waitready --timeout=120 || true
+        sudo lxd waitready --timeout=120
 
     - name: Install MicroCloud snaps
       shell: bash
