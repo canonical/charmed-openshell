@@ -28,6 +28,17 @@ runs:
           sudo systemctl disable docker docker.socket containerd || true
         fi
 
+    # Self-hosted runners are reused, so a cancelled or failed previous job can
+    # leave held snaps or MicroCloud state behind. Clear it before reinstalling
+    # the pinned stack.
+    - name: Reset existing MicroCloud state
+      shell: bash
+      run: |
+        sudo snap refresh --unhold lxd microceph microovn microcloud || true
+        sudo snap remove --purge microcloud microceph microovn || true
+        sudo losetup -d "${MICROCLOUD_DISK:-}" 2>/dev/null || true
+        sudo rm -rf /var/microcloud /tmp/microcloud-preseed.yaml
+
     # MicroCloud refuses to initialize over an initialized LXD, and the
     # charm suite's concierge-based jobs on this runner pool expect the
     # snap present but uninitialized, so reset it unconditionally.
