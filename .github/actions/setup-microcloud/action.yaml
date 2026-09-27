@@ -197,6 +197,7 @@ runs:
           echo "  ipv4_range: ${ovn_range}"
           echo "  dns_servers: 1.1.1.1"
         } | sudo tee /tmp/microcloud-preseed.yaml >/dev/null
+        sudo chmod 0600 /tmp/microcloud-preseed.yaml
 
         echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
 
