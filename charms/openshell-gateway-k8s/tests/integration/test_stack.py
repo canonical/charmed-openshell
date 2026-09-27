@@ -93,6 +93,9 @@ NOBODY_NAME = "stack-nobody"
 
 CONVERGENCE_TIMEOUT = 40 * 60
 TELEMETRY_TIMEOUT = 10 * 60
+# Traefik creates its LoadBalancer service from its own hooks, well after
+# terraform apply has returned.
+LOAD_BALANCER_TIMEOUT = 20 * 60
 POLL_INTERVAL = 15
 
 #: The pillar keys of the stack module's ``models`` output, in the order the
@@ -228,17 +231,24 @@ def _model_lb_ip(model: str) -> str:
 
     Every pillar model runs exactly one Traefik, whose k8s service is the
     only LoadBalancer service in the model's namespace, so the announced
-    address is the one the model's hostnames must resolve to.
+    address is the one the model's hostnames must resolve to. The charm
+    creates that service itself once it is installed, so wait for it.
     """
-    services = json.loads(kubectl("-n", model, "get", "svc", "-o", "json"))
-    addresses = [
-        str(item["status"]["loadBalancer"]["ingress"][0]["ip"])
-        for item in services.get("items", [])
-        if item.get("spec", {}).get("type") == "LoadBalancer"
-        and item.get("status", {}).get("loadBalancer", {}).get("ingress")
-    ]
-    assert len(addresses) == 1, f"expected one load balancer in {model}, got: {addresses}"
-    return addresses[0]
+    deadline = time.monotonic() + LOAD_BALANCER_TIMEOUT
+    while True:
+        services = json.loads(kubectl("-n", model, "get", "svc", "-o", "json"))
+        addresses = [
+            str(item["status"]["loadBalancer"]["ingress"][0]["ip"])
+            for item in services.get("items", [])
+            if item.get("spec", {}).get("type") == "LoadBalancer"
+            and item.get("status", {}).get("loadBalancer", {}).get("ingress")
+        ]
+        assert len(addresses) <= 1, f"expected one load balancer in {model}, got: {addresses}"
+        if addresses:
+            return addresses[0]
+        if time.monotonic() > deadline:
+            pytest.fail(f"no load balancer announced in {model} within {LOAD_BALANCER_TIMEOUT}s")
+        time.sleep(POLL_INTERVAL)
 
 
 def _pod_ip(model: str, pod: str) -> str:
