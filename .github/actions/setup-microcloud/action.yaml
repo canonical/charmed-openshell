@@ -81,7 +81,11 @@ runs:
         uplink_if="$internal_if"
         for iface_path in /sys/class/net/*; do
           iface="$(basename "$iface_path")"
-          case "$iface" in lo|docker*|br-*|veth*|virbr*|"$internal_if") continue ;; esac
+          case "$iface" in
+            lo|docker*|br-*|veth*|virbr*|lxdbr*|zt*|tailscale*|wg*|tun*|"$internal_if")
+              continue
+              ;;
+          esac
           if [ -r "$iface_path/operstate" ] && [ "$(cat "$iface_path/operstate")" != "up" ]; then
             continue
           fi
@@ -93,6 +97,10 @@ runs:
         done
 
         upstream_gateway="$(ip -4 route show default | awk '{print $3; exit}')"
+        if [ -z "$upstream_gateway" ]; then
+          echo "No IPv4 default gateway found for MicroCloud OVN preseed" >&2
+          exit 1
+        fi
         read -r ovn_gateway ovn_range < <(python3 - <<'PY' "$internal_prefix" "$upstream_gateway"
         import ipaddress
         import sys
