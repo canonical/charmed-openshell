@@ -122,14 +122,18 @@ runs:
         interface = ipaddress.ip_interface(sys.argv[1])
         upstream_gateway = ipaddress.ip_address(sys.argv[2])
         network = interface.network
-        first_host = int(network.network_address) + 1
-        last_host = int(network.broadcast_address) - 1
+        hosts = [int(address) for address in network.hosts()]
+        if len(hosts) < 2:
+            raise SystemExit(f"{network} does not leave enough OVN addresses")
+        first_host = hosts[0]
+        last_host = hosts[-1]
+        host_set = set(hosts)
         reserved = {
             value
             for value in (int(interface.ip), int(upstream_gateway))
-            if first_host <= value <= last_host
+            if value in host_set
         }
-        usable_count = max(0, last_host - first_host + 1 - len(reserved))
+        usable_count = len(hosts) - len(reserved)
         if usable_count < 2:
             raise SystemExit(f"{network} does not leave enough OVN addresses")
 
