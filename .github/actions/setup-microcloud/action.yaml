@@ -77,6 +77,11 @@ runs:
           echo "Interface $internal_if does not have a usable IPv4 address for MicroCloud preseed" >&2
           exit 1
         fi
+        upstream_gateway="$(ip -4 route show default | awk '{print $3; exit}')"
+        if [ -z "$upstream_gateway" ]; then
+          echo "No IPv4 default gateway found for MicroCloud OVN preseed" >&2
+          exit 1
+        fi
 
         uplink_if="$internal_if"
         for iface_path in /sys/class/net/*; do
@@ -98,18 +103,18 @@ runs:
               continue
             fi
           fi
-          if ! ip -4 -o addr show dev "$iface" scope global | grep -q .; then
+          candidate_addr="$(ip -4 -o addr show dev "$iface" scope global | awk '{split($4,a,"/"); print a[1]; exit}')"
+          if [ -z "$candidate_addr" ]; then
+            continue
+          fi
+          route_dev="$(ip -4 route get "$upstream_gateway" from "$candidate_addr" 2>/dev/null \
+            | awk '{for (i = 1; i <= NF; ++i) if ($i == "dev") {print $(i + 1); exit}}')"
+          if [ "$route_dev" != "$iface" ]; then
             continue
           fi
           uplink_if="$iface"
           break
         done
-
-        upstream_gateway="$(ip -4 route show default | awk '{print $3; exit}')"
-        if [ -z "$upstream_gateway" ]; then
-          echo "No IPv4 default gateway found for MicroCloud OVN preseed" >&2
-          exit 1
-        fi
         read -r ovn_gateway ovn_range < <(python3 - <<'PY' "$internal_prefix" "$upstream_gateway"
         import ipaddress
         import sys
