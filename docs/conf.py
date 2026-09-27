@@ -111,6 +111,11 @@ html_context = {
 # 'source_edit_link': 'https://github.com/canonical/sphinx-stack',
 # }
 
+# A banner on every page: Charmed OpenShell is alpha.
+html_theme_options = {
+    "announcement": "Charmed OpenShell is alpha software. Its implementation details are subject to change.",
+}
+
 # Project slug
 # TODO: If your documentation is hosted on https://documentation.ubuntu.com/,
 #       uncomment and set to the RTD slug.

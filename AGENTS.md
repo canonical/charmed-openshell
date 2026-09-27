@@ -146,6 +146,20 @@ Integration tests live in `charms/openshell-gateway-k8s/tests/integration/` and 
 just integration-test-charm
 ```
 
+Select modules with pytest markers, for example `just integration-test-charm -m integrator`:
+
+| Marker | Module | Covers |
+|---|---|---|
+| `integrator` | `test_lxd_integrator.py` | `lxd-integrator-k8s` in the same model, trust registration and withdrawal, and both LXD project placements |
+| `offer` | `test_lxd_offer.py` | the `lxd` machine charm's `https` offer, consumed cross-model |
+| `observability` | `test_observability.py` | the gateway target actually scraped by `opentelemetry-collector-k8s` |
+| `vault` | `test_vault.py` | the signing key migrating into `vault-k8s` unchanged, and rotation through it |
+| `scale` | `test_scale.py` | multi-unit scale and rolling restarts |
+
+Tests that create real sandboxes are off unless `OPENSHELL_ENABLE_SANDBOX_E2E=1`.
+The suite clones and packs `lxd-integrator-k8s` from its own repository unless
+`INTEGRATOR_CHARM_FILE` or `INTEGRATOR_CHARM_DIR` points at a build.
+
 ## Vendored Library Patches
 
 Libraries in `lib/` are vendored via `charmcraft fetch-libs`. When a vendored library crashes on a transient Juju condition that the charm itself already handles, it is acceptable to patch the vendored copy locally and cover the patch with a unit test.
@@ -232,7 +246,8 @@ rock. A newer CLI fails to decode the gateway's responses outright — `latest/e
 (0.0.117-dev) against a v0.0.116 gateway gives `failed to decode Protobuf message:
 NetworkEndpoint.tls ... invalid wire type` from `sandbox list`, and a misleading
 "sandbox not found" from `sandbox create`, on a sandbox that was created fine.
-Track `latest/stable` unless the rock is pinned to something newer.
+No channel carries 0.0.116 any more (`latest/stable` is 0.1.x), so pin the snap by
+revision, as `docs/reference/requirements.rst` lists, and move it together with the rock.
 
 ### `sandbox-image` is an OCI reference, not an LXD alias
 
