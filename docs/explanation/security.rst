@@ -66,6 +66,18 @@ The charm does not request the sandbox certificate over the
 relation: a second request would hand every sandbox the gateway's own
 server key.
 
+What the gateway can do in LXD
+------------------------------
+
+The integrator registers the gateway's LXD client certificate restricted to
+the sandbox project, so LXD refuses the gateway anything outside it. Inside
+the project, the gateway can do whatever the project allows. In an
+unrestricted project that includes creating a privileged container or
+attaching the host's root file system, which amounts to control of the
+host. The deploy guide therefore sets ``restricted=true`` on the project,
+together with limits on its networks, snapshots and backups; see
+:ref:`how-to-deploy-sandbox-project`.
+
 What a sandbox can reach
 ------------------------
 
@@ -84,11 +96,11 @@ Where credentials live
 ----------------------
 
 LXD credentials
-    ``lxd-integrator-k8s`` reads an administrative LXD client key from a Juju
-    secret that the operator creates. The Terraform modules take the
-    secret's URI, never the key, so the key does not end up in Terraform
-    state. The integrator registers the gateway's own LXD client
-    certificate with LXD, restricted to the sandbox project.
+    ``lxd-integrator-k8s`` reads an LXD administrator credential from a Juju
+    secret that the operator creates. It needs one: adding and removing
+    trust entries is an administrator's operation in LXD. The Terraform
+    modules take the secret's URI, never the key, so the key does not end
+    up in Terraform state.
 
 The token-signing key
     A Juju application secret, shared by every gateway unit. Relating
