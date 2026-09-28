@@ -200,22 +200,52 @@ to the project:
 
     lxc network list --project openshell
 
+Then restrict the project. The gateway's LXD certificate is limited to this
+project, and these restrictions limit what it can do inside it. Without
+them, anything that can create an instance in the project can create a
+privileged container or attach the host's root file system:
+
+.. code-block:: bash
+
+    lxc project set openshell \
+      restricted=true \
+      restricted.networks.uplinks=UPLINK \
+      restricted.networks.access=openshell-sandboxes \
+      limits.networks=1 \
+      restricted.snapshots=block \
+      restricted.backups=block
+
+``restricted=true`` refuses privileged and nested containers, low-level
+options such as ``raw.lxc``, host paths and passthrough devices. LXD refuses
+the setting unless the uplink the sandbox network uses is allowed, and
+``limits.networks=1`` stops the project from creating a second network on
+that uplink. ``restricted.networks.access`` keeps instances on the sandbox
+network. The driver uses neither snapshots nor backups.
+
 Sandbox images are OCI references that the driver pulls and converts on
 first use, so the project needs no images of its own.
 
-Create an administrative client certificate
+Create the integrator's client certificate
 -------------------------------------------
 
-The integrator authenticates to the MicroCloud with a dedicated client
-certificate, trusted by the LXD daemon, and verifies the MicroCloud's own
-server certificate. On a MicroCloud member, create the first, fetch the
-second, and hand both to the admin VM:
+The integrator authenticates to the MicroCloud with a client certificate of
+its own, and verifies the MicroCloud's server certificate. It uses its
+certificate to add the gateway's certificate to LXD's trust store,
+restricted to the ``openshell`` project, and to remove it again.
+
+That makes the integrator's certificate an LXD administrator credential.
+LXD has no narrower permission for managing trust entries: a certificate
+restricted to a project cannot add any, and an identity allowed to create
+them can create unrestricted ones. Keep it only in the Juju secret below.
+
+On a MicroCloud member, create the certificate, fetch the server's, and hand
+both to the admin VM:
 
 .. code-block:: bash
 
     openssl req -x509 -newkey rsa:4096 -keyout lxd-client.key -out lxd-client.crt \
-      -days 365 -nodes -subj "/CN=openshell-gateway"
-    lxc config trust add lxd-client.crt
+      -days 365 -nodes -subj "/CN=lxd-integrator-k8s"
+    lxc config trust add lxd-client.crt --name lxd-integrator-k8s
     lxc query /1.0 | jq -r '.environment.certificate' > lxd-server.crt
     lxc query /1.0 | jq -r '.environment.addresses[0]'
     for f in lxd-client.crt lxd-client.key lxd-server.crt; do
