@@ -35,6 +35,7 @@ Keep the guidance concise, accurate, and actionable.
 | `charms/openshell-gateway-k8s/src/config_model.py` | Pydantic v2 config model and TOML/env rendering (no ops imports) |
 | `charms/openshell-gateway-k8s/src/ingress.py` | Traefik route / ingress helpers |
 | `charms/openshell-gateway-k8s/src/vault_store.py` | Optional Vault-backed store for the JWT signing keypair |
+| `charms/openshell-gateway-k8s/src/lxd_join.py` | Decodes an LXD identity trust token and redeems it (no ops imports) |
 | `charms/openshell-gateway-k8s/charmcraft.yaml` | Charm metadata, relations, resources, and build config |
 | `charms/openshell-gateway-k8s/pyproject.toml` | Python tooling configuration (pytest, ruff, pyright, coverage) |
 | `charms/openshell-gateway-k8s/tox.ini` | Local test environments |
@@ -146,19 +147,18 @@ Integration tests live in `charms/openshell-gateway-k8s/tests/integration/` and 
 just integration-test-charm
 ```
 
-Select modules with pytest markers, for example `just integration-test-charm -m integrator`:
+Select modules with pytest markers, for example `just integration-test-charm -m lxd`:
 
 | Marker | Module | Covers |
 |---|---|---|
-| `integrator` | `test_lxd_integrator.py` | `lxd-integrator-k8s` in the same model, trust registration and withdrawal, and both LXD project placements |
-| `offer` | `test_lxd_offer.py` | the `lxd` machine charm's `https` offer, consumed cross-model |
+| `lxd` | `test_lxd_join.py` and every module that needs a joined gateway | the token join against the host LXD, the status for each LXD setting that is missing, and sandboxes landing in the project |
 | `observability` | `test_observability.py` | the gateway target actually scraped by `opentelemetry-collector-k8s` |
 | `vault` | `test_vault.py` | the signing key migrating into `vault-k8s` unchanged, and rotation through it |
 | `scale` | `test_scale.py` | multi-unit scale and rolling restarts |
 
-Tests that create real sandboxes are off unless `OPENSHELL_ENABLE_SANDBOX_E2E=1`.
-The suite clones and packs `lxd-integrator-k8s` from its own repository unless
-`INTEGRATOR_CHARM_FILE` or `INTEGRATOR_CHARM_DIR` points at a build.
+Tests that create real sandboxes are off unless `OPENSHELL_ENABLE_SANDBOX_E2E=1`. They
+need an OVN network, so CI runs the `lxd` marker on a single-member MicroCloud with
+`OPENSHELL_TEST_LXD_ADDRESS` naming it.
 
 ## Vendored Library Patches
 
@@ -202,13 +202,37 @@ When writing prose documentation:
 
 ## Gotchas Worth Knowing
 
-### The LXD project is not charm config
+### The gateway joins LXD with a trust token, not over a relation
 
-Which LXD project sandboxes are created in is the LXD administrator's decision and
-lives on `lxd-integrator-k8s` (`project`), arriving over the `lxd-https` relation as a
-`project` key. The gateway charm renders it as the driver's `--project`. Do not add a
-charm config option for it: `lxd-projects` existed once, only ever restricted the
-integrator's trust entry, and was removed for this reason.
+The LXD administrator creates a pending TLS identity in a group that has `operator` on
+the sandbox project, and the operator puts its trust token in a Juju user secret named
+by `lxd-join-secret` (key `token`); `lxd-project` names the project. The leader redeems
+the token with the charm's own LXD client key (`lxd_join.py`). There used to be an
+`lxd` relation to `lxd-integrator-k8s`; do not bring one back. Whatever adds trust
+entries on the gateway's behalf needs an LXD administrator credential: an identity with
+only `can_create_identities` can create identities in the `admins` group, as tested on
+LXD 5.21 and 6.9.
+
+- A client LXD already trusts gets 403 when it redeems a token, so `join()` asks
+  `GET /1.0` for `auth: trusted` first. A new token for a trusted gateway therefore
+  stays pending in LXD.
+- Tokens from `lxc config trust add` have an empty `type` and are redeemed at another
+  endpoint without groups; `decode_token` refuses them.
+- The leader records the outcome in peer app data under `lxd-join`, keyed by the
+  token's digest, never the token. The driver's address and fingerprint come from that
+  record, not from the token, so replacing the token cannot take a running workload
+  down while it is being redeemed.
+- `lxc auth identity create tls/<name>` without a certificate path reads one from
+  stdin when stdin is not a terminal, and hangs over ssh, in CI or in `subprocess`.
+  Run it with stdin at `/dev/null`; `--quiet` prints only the token.
+- The sandbox project needs `features.networks=true` and a network of its own. In a
+  project without it, networks and ACLs resolve to the `default` project: the driver's
+  `GET /1.0/networks/<name>` returns 404 to the project-scoped identity, and LXD lets
+  that identity change and delete the `default` project's ACLs. The test harnesses
+  share the `default` network anyway, so their groups also get `can_view` on the
+  `default` project and on that network; production follows the deploy guide.
+- Nothing fires when `juju grant-secret` lands. The gateway reads a newly granted
+  secret at its next `update-status`, so tests set `lxd-join-secret` after granting.
 
 ### The driver refuses to start without sandbox TLS material
 

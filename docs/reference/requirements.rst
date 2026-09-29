@@ -22,9 +22,9 @@ Platform
       - Any Kubernetes that Juju supports
       - Canonical Kubernetes 1.32
     * - LXD, for sandboxes
-      - An OVN network in the sandbox project, for sandbox egress
-        restriction
-      - MicroCloud 3, with LXD 6 and MicroOVN 24.03
+      - 5.21 or newer, for TLS identities in groups. An OVN network in the
+        sandbox project, for sandbox egress restriction
+      - MicroCloud 3, with LXD 6 and MicroOVN 24.03; LXD 5.21
     * - Architecture
       - ``amd64`` or ``arm64``
       - ``amd64``
