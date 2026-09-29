@@ -12,7 +12,6 @@ output "app_names" {
   description = "Names of every application deployed by this stack. Optional components are null when disabled."
   value = {
     gateway                  = module.gateway.app_name
-    integrator               = juju_application.integrator.name
     postgresql_gateway       = juju_application.postgresql_gateway.name
     traefik                  = juju_application.traefik.name
     self_signed_certificates = juju_application.self_signed_certificates.name

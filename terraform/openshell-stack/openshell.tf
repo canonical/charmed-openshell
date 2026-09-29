@@ -17,8 +17,8 @@ module "openshell" {
   external_hostname = var.openshell.external_hostname
   oidc              = var.openshell.oidc
 
+  lxd                      = var.openshell.lxd
   gateway                  = var.openshell.gateway
-  integrator               = var.openshell.integrator
   postgresql               = var.openshell.postgresql
   traefik                  = var.openshell.traefik
   self_signed_certificates = var.openshell.self_signed_certificates
