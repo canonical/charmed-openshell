@@ -19,7 +19,7 @@ from .helpers import (
     trust_self_signed_ca,
 )
 
-pytestmark = [pytest.mark.integrator]
+pytestmark = [pytest.mark.lxd]
 
 
 class TestClientAccess:
@@ -29,7 +29,7 @@ class TestClientAccess:
         self,
         juju: jubilant.Juju,
         gateway_url: str,
-        integrator_provider: None,
+        lxd_joined: None,
         openshell_available: None,
     ) -> None:
         """The ``openshell`` snap authenticates and connects to the gateway."""

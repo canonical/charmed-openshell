@@ -11,7 +11,7 @@ from .helpers import (
     wait_for_gateway_stack,
 )
 
-pytestmark = [pytest.mark.integrator]
+pytestmark = [pytest.mark.lxd]
 
 
 class TestCharmActions:
@@ -20,7 +20,7 @@ class TestCharmActions:
     def test_restart_action(
         self,
         juju: jubilant.Juju,
-        integrator_provider: None,
+        lxd_joined: None,
     ) -> None:
         """The ``restart`` action coordinates a rolling restart of the workload."""
         result = juju.run(f"{APP_NAME}/0", "restart")
@@ -32,7 +32,7 @@ class TestCharmActions:
     def test_rotate_sandbox_client_identity_action(
         self,
         juju: jubilant.Juju,
-        integrator_provider: None,
+        lxd_joined: None,
     ) -> None:
         """The ``rotate-sandbox-client-identity`` action rotates both CA and leaf."""
         result = juju.run(f"{APP_NAME}/0", "rotate-sandbox-client-identity")
@@ -48,7 +48,7 @@ class TestCharmActions:
     def test_rotate_jwt_signing_key_on_juju_secret_store(
         self,
         juju: jubilant.Juju,
-        integrator_provider: None,
+        lxd_joined: None,
     ) -> None:
         """The ``rotate-jwt-signing-key`` action rotates the key in Juju secret store."""
         before = gateway_status(juju)

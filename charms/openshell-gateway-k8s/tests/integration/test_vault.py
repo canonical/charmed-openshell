@@ -29,7 +29,7 @@ from .helpers import (
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.vault, pytest.mark.integrator]
+pytestmark = [pytest.mark.vault, pytest.mark.lxd]
 
 VAULT_APP = "vault-k8s"
 VAULT_RELATION = "vault-kv"
@@ -267,7 +267,7 @@ def _authorize_charm(juju: jubilant.Juju, root_token: str) -> None:
 @pytest.fixture(scope="module", autouse=True)
 def _vault_backed_gateway(
     juju: jubilant.Juju,
-    integrator_provider: None,
+    lxd_joined: None,
 ) -> None:
     """Bring the gateway up on Juju secrets, then stand Vault up beside it."""
     juju.deploy(VAULT_APP, channel="1.16/stable", trust=True)
