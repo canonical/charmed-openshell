@@ -1,8 +1,8 @@
 # Charmed OpenShell Terraform stack
 
-Deploys the whole of Charmed OpenShell into one Juju model: the gateway, the
-LXD integrator, PostgreSQL, Hydra and the login UI, Traefik and a certificate
-authority, and optionally Vault and an OpenTelemetry collector.
+Deploys the whole of Charmed OpenShell into one Juju model: the gateway,
+PostgreSQL, Hydra and the login UI, Traefik and a certificate authority, and
+optionally Vault and an OpenTelemetry collector.
 
 The layout follows the [COS product
 module](https://github.com/canonical/observability-stack/tree/track/3.0/terraform/cos),
@@ -19,12 +19,9 @@ module "openshell" {
 
   external_hostname = "10.221.97.2"
 
-  integrator = {
-    config = {
-      "lxd-endpoints"   = "192.168.1.166:8443"
-      "lxd-credentials" = "secret:d6mlp2o0p26r50dt2sd0"
-      "project"         = "openshell"
-    }
+  lxd = {
+    join_secret = "secret:d6mlp2o0p26r50dt2sd0"
+    project     = "openshell"
   }
 }
 ```
@@ -36,20 +33,32 @@ terraform apply -var='model={name="openshell"}'
 
 ## What you have to do yourself
 
-- **Create the LXD credentials secret.** `integrator.config.lxd-credentials`
-  names a Juju secret holding `client-cert`, `client-key` and `server-cert`.
-  Terraform does not create it: the secret carries an administrative LXD client
-  key, which should not pass through Terraform state.
+- **Create the LXD project** named in `lxd.project`, with a `default` profile
+  that names a network and a storage pool. The driver reads sandbox placement
+  from that profile and never creates the project itself.
+
+- **Create the gateway's LXD identity and its join secret.** On the LXD, create
+  a group with access to the project only and a pending TLS identity in it;
+  `lxc auth identity create` prints a single-use trust token (with stdin at
+  `/dev/null`: without a certificate argument it otherwise waits for one on stdin
+  whenever stdin is not a terminal). `lxd.join_secret`
+  names a Juju secret holding that token under `token`. Terraform does not
+  create the secret, so the token does not pass through Terraform state.
 
   ```console
-  juju add-secret lxd-credentials \
-      client-cert#file=client.crt client-key#file=client.key server-cert#file=server.crt
-  juju grant-secret lxd-credentials lxd-integrator-k8s
+  lxc auth group create openshell-gateway
+  lxc auth group permission add openshell-gateway project openshell operator
+  lxc auth identity create tls/openshell-gateway --group openshell-gateway --quiet < /dev/null > lxd-join.token
+  juju add-secret lxd-join token#file=lxd-join.token
   ```
 
-- **Create the LXD project** named in `integrator.config.project`, with a
-  `default` profile that names a network and a storage pool. The driver reads
-  sandbox placement from that profile and never creates the project itself.
+- **Grant the secret to the gateway** after the apply, once the application
+  exists. Nothing fires on a grant: the gateway reads the secret and redeems the
+  token at its next `update-status` hook.
+
+  ```console
+  juju grant-secret lxd-join openshell-gateway-k8s
+  ```
 
 - **Initialise, unseal and authorise Vault** when `vault.enabled` is true.
   Vault serves nothing until then, and the gateway waits rather than falling
@@ -59,7 +68,7 @@ terraform apply -var='model={name="openshell"}'
 
 `ha = true` raises the default unit count for every component that can
 genuinely run more than one unit — gateway 3, PostgreSQL 3, Vault 3, Hydra 2,
-Traefik 2, integrator 2, collector 2. A component's own `units` still wins, so
+Traefik 2, collector 2. A component's own `units` still wins, so
 the switch is a floor rather than a constraint:
 
 ```hcl

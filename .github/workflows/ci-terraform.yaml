@@ -149,12 +149,16 @@ jobs:
           sudo tar -C "$GITHUB_WORKSPACE" -cf - . \
             | sudo lxc exec "$VM_NAME" -- tar -xf - -C /root/charmed-openshell
 
-          # The MicroCloud LXD's client identity, trusted here, and the
-          # server certificate the integrator will verify the endpoint
+          # An administrative client identity for the MicroCloud LXD, trusted
+          # here, and the server certificate the tests pin the endpoint
           # against — both minted and read on the host. The pytest module
-          # provisions the LXD project with them over the REST API, because
-          # the VM has no lxc client. MicroCloud's LXD is clustered, so its
-          # API presents the cluster certificate, not the member's server.crt.
+          # does the LXD administrator's part with them over the REST API,
+          # because the VM has no lxc client: the sandbox project, and the
+          # gateway's pending TLS identity in a group limited to that project,
+          # whose trust token becomes the gateway's join secret. The gateway
+          # itself never sees this identity. MicroCloud's LXD is clustered,
+          # so its API presents the cluster certificate, not the member's
+          # server.crt.
           sudo openssl req -x509 -newkey rsa:3072 -keyout /tmp/lxd-client.key \
             -out /tmp/lxd-client.crt -days 2 -nodes -subj "/CN=openshell-stack-ci"
           sudo lxc config trust add /tmp/lxd-client.crt
@@ -202,8 +206,9 @@ jobs:
           SCRIPT
 
       # The stack's deployment and assertions, as pytest: the module
-      # provisions the documented manual steps (the LXD credentials secret
-      # and project), applies the stack module, grants the secret, waits
+      # provisions the documented manual steps (the LXD project, the
+      # gateway's LXD identity and the join secret holding its token),
+      # applies the stack module, grants the secret, waits
       # for the four models to converge, and proves SSO, telemetry and a
       # sandbox round-trip end to end.
       - name: Run the stack integration tests

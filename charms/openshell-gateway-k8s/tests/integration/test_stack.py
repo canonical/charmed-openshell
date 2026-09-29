@@ -5,7 +5,8 @@ Identity Platform and cos-lite across four Juju models. These tests deploy
 that stack on the session's controller and assert on the behaviors that only
 exist once the pillars are wired: the models converge with their SAAS
 relations, SSO works end to end through the identity platform, telemetry
-reaches cos-lite, and a sandbox round-trips on the integrator's LXD. They
+reaches cos-lite, and a sandbox round-trips on the MicroCloud LXD the gateway
+joined. They
 are the Python form of the stack CI's deployment setup and runtime
 assertions, and skip themselves when the stack CI's environment is absent,
 so plain charm-suite runs are unaffected.
@@ -16,11 +17,13 @@ Environment (set by the ``integration`` job of
 - ``STACK_IDENTITY_HOSTNAME``: the hostname the issuer is published on.
 - ``STACK_EXTERNAL_HOSTNAME``: the hostname the gateway's ingress is
   published on.
-- ``STACK_LXD_ENDPOINT``: the HTTPS endpoint of the LXD the integrator
-  manages sandboxes on (the CI runner's MicroCloud LXD).
+- ``STACK_LXD_ENDPOINT``: the HTTPS endpoint of the LXD the gateway creates
+  sandboxes on (the CI runner's MicroCloud LXD).
 - ``STACK_LXD_CLIENT_CERT``, ``STACK_LXD_CLIENT_KEY`` and
-  ``STACK_LXD_SERVER_CERT``: the client identity and server certificate for
-  that endpoint.
+  ``STACK_LXD_SERVER_CERT``: an administrative client identity and the server
+  certificate for that endpoint. The tests use them to do the LXD
+  administrator's part: the project, and the gateway's pending identity whose
+  trust token goes into the join secret. The gateway never sees them.
 - ``STACK_LXD_PROJECT`` (optional): the sandbox project, default
   ``openshell``.
 - ``STACK_OPENSHELL_MODEL`` (optional): the pre-created openshell model's
@@ -86,6 +89,13 @@ SUPERVISOR_IMAGE = yaml.safe_load((CHARM_DIR / "charmcraft.yaml").read_text())["
 logger = logging.getLogger(__name__)
 
 pytestmark = [pytest.mark.stack]
+
+#: The LXD group and pending TLS identity the gateway joins as. The group
+#: grants ``operator`` on the sandbox project and nothing else.
+LXD_GROUP = "openshell-stack"
+LXD_IDENTITY = "openshell-stack-gateway"
+#: The Juju user secret holding the identity's trust token.
+JOIN_SECRET = "lxd-join"
 
 #: The CLI gateway registrations these tests create and remove again.
 GATEWAY_NAME = "stack"
@@ -298,13 +308,14 @@ def stack_environment() -> dict[str, str]:
 def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeployment, None, None]:
     """Deploy the composed stack and destroy it again at session end.
 
-    The LXD credentials secret follows the charm suite's order: the secret is
-    added to the model before the apply, because its URI is part of the
-    integrator's config, and granted after it, because granting needs the
-    integrator application to exist. Nothing fires when the grant lands: the
-    integrator reads the secret at its next ``update-status`` hook (every five
-    minutes by default), and re-setting a config key to its current value is
-    a no-op that runs no hook, so the convergence wait covers that interval.
+    The LXD join secret follows the documented order: the secret is added to
+    the model before the apply, because its URI is part of the gateway's
+    config, and granted after it, because granting needs the gateway
+    application to exist. Nothing fires when the grant lands: the gateway
+    reads the secret and redeems the token at its next ``update-status`` hook
+    (every five minutes by default), and re-setting a config key to its
+    current value is a no-op that runs no hook, so the convergence wait
+    covers that interval.
     """
     tf_dir = Path(os.environ.get("STACK_TF_DIR") or (REPO_ROOT / "terraform" / "openshell-stack"))
     var_file = Path(os.environ.get("STACK_VARS_FILE") or "/root/stack-vars.tfvars.json")
@@ -324,9 +335,9 @@ def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeploy
         if "already exists" not in (exc.stderr or ""):
             pytest.fail(f"juju add-model {model_name} failed: {exc.stderr}")
 
-    # The LXD project and its driver-read profile: the module's documented
-    # manual steps, driven over the REST API because
-    # the VM has no lxc client.
+    # The LXD project, its driver-read profile and the gateway's identity: the
+    # module's documented manual steps, driven over the REST API because the
+    # VM has no lxc client.
     lxd = StackLxd(
         StackLxdConfig(
             endpoint=stack_environment["STACK_LXD_ENDPOINT"],
@@ -336,21 +347,20 @@ def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeploy
         )
     )
     lxd.ensure_project(project)
-    lxd.ensure_project_profile(project)
+    network = lxd.ensure_project_profile(project)
+
+    lxd.ensure_project_group(LXD_GROUP, project, network)
 
     handle = jubilant.Juju(model=model_name)
     # A named user secret is created once: a re-run against a deployed
-    # model reuses the one the earlier run minted.
-    secret_uri = _user_secret_uri(handle, "lxd-credentials")
+    # model reuses the one the earlier run minted, whose token the gateway
+    # has already redeemed. A fresh model gets a fresh identity, replacing
+    # whatever an earlier, torn-down run left behind under the same name.
+    secret_uri = _user_secret_uri(handle, JOIN_SECRET)
     if secret_uri is None:
-        secret_uri = handle.add_secret(
-            "lxd-credentials",
-            {
-                "client-cert": Path(stack_environment["STACK_LXD_CLIENT_CERT"]).read_text(),
-                "client-key": Path(stack_environment["STACK_LXD_CLIENT_KEY"]).read_text(),
-                "server-cert": Path(stack_environment["STACK_LXD_SERVER_CERT"]).read_text(),
-            },
-        )
+        lxd.delete_tls_identity(LXD_IDENTITY)
+        token = lxd.create_pending_identity(LXD_IDENTITY, LXD_GROUP)
+        secret_uri = handle.add_secret(JOIN_SECRET, {"token": token})
 
     payload: dict[str, Any] = {
         "models": {"openshell": {"uuid": _model_uuid(model_name)}},
@@ -383,19 +393,7 @@ def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeploy
                 "config": {"supervisor-image": SUPERVISOR_IMAGE},
                 "resources": {"gateway-image": GATEWAY_IMAGE},
             },
-            "integrator": {
-                "channel": "latest/edge",
-                "config": {
-                    # The integrator's config takes a scheme-less host:port
-                    # list; the environment's endpoint is an HTTPS URL
-                    # because the LXD REST client here dials it directly.
-                    "lxd-endpoints": stack_environment["STACK_LXD_ENDPOINT"].removeprefix(
-                        "https://"
-                    ),
-                    "lxd-credentials": secret_uri,
-                    "project": project,
-                },
-            },
+            "lxd": {"join_secret": secret_uri, "project": project},
         },
     }
     var_file.write_text(json.dumps(payload))
@@ -431,7 +429,7 @@ def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeploy
         var_file.write_text(json.dumps(payload))
         _terraform(tf_dir, "apply", "-auto-approve", "-input=false", f"-var-file={var_file}")
 
-    handle.grant_secret("lxd-credentials", app_names["openshell"]["integrator"])
+    handle.grant_secret(JOIN_SECRET, app_names["openshell"]["gateway"])
 
     _await_convergence(models)
 
@@ -461,6 +459,14 @@ def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeploy
         return
     if result.returncode != 0:
         logger.warning("the stack destroy failed: %s", result.stderr)
+        return
+    # The gateway's identity outlives the deployment in LXD; drop it with its
+    # group, as an operator removing the gateway would.
+    try:
+        lxd.delete_tls_identity(LXD_IDENTITY)
+        lxd.delete_group(LXD_GROUP)
+    except RuntimeError:
+        logger.warning("could not remove the gateway's LXD identity", exc_info=True)
 
 
 @pytest.fixture(scope="session")
@@ -713,7 +719,7 @@ def test_gateway_and_identity_dashboards_in_cos_lite_grafana(
 def test_sandbox_round_trip(
     identity_login: dict[str, str], stack_deployment: StackDeployment
 ) -> None:
-    """Create, run and delete a sandbox on the integrator's MicroCloud LXD.
+    """Create, run and delete a sandbox on the MicroCloud LXD the gateway joined.
 
     The CI builds MicroCloud precisely to supply the OVN network the
     driver's default ``restrict-sandbox-egress=true`` requires, so the

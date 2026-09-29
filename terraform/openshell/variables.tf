@@ -51,7 +51,7 @@ variable "risk" {
 variable "ha" {
   description = <<-EOT
     Raise the default unit count for every component that can genuinely run
-    more than one unit: the gateway, the integrator, PostgreSQL, Traefik, the
+    more than one unit: the gateway, PostgreSQL, Traefik, the
     certificate provider, Vault and the collector. Identity is not deployed by
     this stack and has its own. A component's own `units` still wins, so this
     is a floor rather than a constraint.
@@ -89,6 +89,37 @@ variable "oidc" {
     roles_claim = optional(string, "groups")
   })
   default = {}
+}
+
+variable "lxd" {
+  description = <<-EOT
+    How the gateway joins the LXD its sandboxes run on.
+
+    `join_secret` is the URI of a Juju user secret in the gateway's model that
+    holds, under the key `token`, the trust token of a pending LXD TLS
+    identity, as printed by `lxc auth identity create tls/<name> --group
+    <group>`. Give the group access to the sandbox project only. Terraform
+    neither creates nor grants the secret, so the token never passes through
+    Terraform state: create it with `juju add-secret lxd-join
+    token#file=<file>` before the apply, and grant it to the gateway after
+    the apply with `juju grant-secret lxd-join openshell-gateway-k8s`.
+
+    `project` is the LXD project the driver creates sandboxes in.
+  EOT
+  type = object({
+    join_secret = string
+    project     = string
+  })
+
+  validation {
+    condition     = startswith(var.lxd.join_secret, "secret:")
+    error_message = "lxd.join_secret must be a Juju secret URI (secret:...)."
+  }
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9._-]{1,63}$", var.lxd.project))
+    error_message = "lxd.project must be 1-63 letters, digits, dots, hyphens or underscores."
+  }
 }
 
 variable "identity" {
@@ -143,30 +174,6 @@ variable "gateway" {
     constraints = optional(string, "arch=amd64")
     config      = optional(map(string), {})
     resources   = optional(map(string), {})
-  })
-  default = {}
-}
-
-variable "integrator" {
-  description = <<-EOT
-    LXD integrator application configuration. `config.lxd-credentials` must name
-    a Juju secret granted to the application; Terraform does not create it,
-    because the secret carries an administrative LXD client key that should not
-    pass through Terraform state.
-
-    `config.project` names the LXD project the gateway's sandboxes are created
-    in, and restricts the gateway's LXD trust entry to it. It belongs here
-    rather than on the gateway: which project a requirer may use is the LXD
-    administrator's decision.
-  EOT
-  type = object({
-    app_name    = optional(string, "lxd-integrator-k8s")
-    base        = optional(string, "ubuntu@24.04")
-    channel     = optional(string)
-    revision    = optional(number)
-    units       = optional(number)
-    constraints = optional(string, "arch=amd64")
-    config      = optional(map(string), {})
   })
   default = {}
 }
