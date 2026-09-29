@@ -19,6 +19,7 @@ import json
 import os
 import ssl
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 from config_model import _parse_lxd_address, _parse_lxd_fingerprint
@@ -29,6 +30,13 @@ from config_model import _parse_lxd_address, _parse_lxd_fingerprint
 IDENTITY_TOKEN_TYPE = "Client certificate"
 
 DEFAULT_TIMEOUT_SECS = 10.0
+# The most one join may take across all of the token's addresses. A join runs
+# in a hook and is retried on later ones, so an unreachable server must not
+# hold every hook for minutes.
+DEFAULT_DEADLINE_SECS = 30.0
+# LXD's error text reaches unit status; the server is only as trustworthy as
+# the token that named it.
+_MAX_ERROR_LEN = 200
 
 
 class TokenError(ValueError):
@@ -138,19 +146,45 @@ def _request(
         conn.close()
 
 
+def _check_identity(
+    address: str, context: ssl.SSLContext, token: TrustToken, timeout: float
+) -> None:
+    """Refuse a trusted certificate that is not the token's fine-grained identity.
+
+    Joining is meant to put the gateway in the administrator's group. A
+    certificate LXD trusts for another reason, such as a leftover
+    ``lxc config trust add`` entry, would otherwise count as joined while
+    holding whatever that entry grants.
+    """
+    _, current = _request(
+        address, "GET", "/1.0/auth/identities/current", context, token.fingerprint, timeout
+    )
+    identity = current.get("metadata") or {}
+    if identity.get("fine_grained") is True and identity.get("name") == token.client_name:
+        return
+    name = str(identity.get("name", ""))[:_MAX_ERROR_LEN]
+    raise JoinError(
+        f"LXD already trusts this certificate as {name!r}, not as the token's identity "
+        f"{token.client_name!r}; remove that trust entry"
+    )
+
+
 def join(
     token: TrustToken,
     certificate_pem: str,
     private_key_pem: str,
     timeout: float = DEFAULT_TIMEOUT_SECS,
+    deadline: float = DEFAULT_DEADLINE_SECS,
 ) -> str:
     """Make LXD trust *certificate_pem* and return the address it answered on.
 
-    Tries the token's addresses in order; a server lists every address it
-    listens on, and not all of them are reachable from here. A certificate
-    LXD already trusts is not redeemed again: LXD answers a trusted client's
-    redemption with 403, and the token is then left for the administrator to
-    revoke.
+    Tries the token's addresses in order, within *deadline* seconds in all; a
+    server lists every address it listens on, and not all of them are
+    reachable from here. A certificate that is already the token's identity
+    is not redeemed again: LXD answers a trusted client's redemption with
+    403, and the token is then left for the administrator to revoke. A
+    certificate trusted any other way, such as a legacy trust entry, is
+    refused rather than taken for the identity the token grants.
 
     Raises ``JoinError`` when no address answers or LXD refuses the token.
     """
@@ -168,10 +202,17 @@ def join(
         context.load_cert_chain(cert_path, key_path)
 
         failures: list[str] = []
+        end = time.monotonic() + deadline
         for address in token.addresses:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                failures.append(f"{address}: not tried, out of time")
+                continue
+            step = min(timeout, remaining)
             try:
-                _, server = _request(address, "GET", "/1.0", context, token.fingerprint, timeout)
+                _, server = _request(address, "GET", "/1.0", context, token.fingerprint, step)
                 if (server.get("metadata") or {}).get("auth") == "trusted":
+                    _check_identity(address, context, token, step)
                     return address
                 status, result = _request(
                     address,
@@ -179,7 +220,7 @@ def join(
                     "/1.0/auth/identities/tls",
                     context,
                     token.fingerprint,
-                    timeout,
+                    step,
                     {"trust_token": token.raw},
                 )
             except _FingerprintMismatchError:
@@ -193,7 +234,7 @@ def join(
                 return address
             # The server answered and refused: every address is the same
             # server, so asking again elsewhere gets the same answer.
-            error = result.get("error") or f"HTTP {status}"
+            error = str(result.get("error") or f"HTTP {status}")[:_MAX_ERROR_LEN]
             raise JoinError(f"LXD refused the token: {error}")
 
     raise JoinError("cannot reach LXD: " + "; ".join(failures))

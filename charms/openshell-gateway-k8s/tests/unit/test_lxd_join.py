@@ -7,8 +7,10 @@ import datetime
 import hashlib
 import http.server
 import json
+import socket
 import ssl
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -112,8 +114,10 @@ class _FakeLxd:
     address: str
     fingerprint: str
     pending_secret: str
-    trusted: set[str] = field(default_factory=set)
+    # Trusted client fingerprints, mapped to (identity name, fine-grained).
+    trusted: dict[str, tuple[str, bool]] = field(default_factory=dict)
     posts: list[dict] = field(default_factory=list)
+    refusal: str = "No pending identities found with given secret"
 
 
 @pytest.fixture
@@ -149,7 +153,15 @@ def fake_lxd(tmp_path: Path, client: tuple[str, str]) -> Iterator[_FakeLxd]:
             self.wfile.write(data)
 
         def do_GET(self) -> None:  # noqa: N802
-            auth = "trusted" if self._client() in state.trusted else "untrusted"
+            client = self._client()
+            if self.path == "/1.0/auth/identities/current":
+                name, fine_grained = state.trusted[client]
+                self._reply(
+                    200,
+                    {"type": "sync", "metadata": {"name": name, "fine_grained": fine_grained}},
+                )
+                return
+            auth = "trusted" if client in state.trusted else "untrusted"
             self._reply(200, {"type": "sync", "metadata": {"auth": auth}})
 
         def do_POST(self) -> None:  # noqa: N802
@@ -165,13 +177,13 @@ def fake_lxd(tmp_path: Path, client: tuple[str, str]) -> Iterator[_FakeLxd]:
                     500,
                     {
                         "type": "error",
-                        "error": "No pending identities found with given secret",
+                        "error": state.refusal,
                         "error_code": 500,
                     },
                 )
                 return
             state.pending_secret = ""
-            state.trusted.add(client)
+            state.trusted[client] = ("openshell-gateway", True)
             self._reply(200, {"type": "sync", "metadata": {}})
 
         def log_message(self, format: str, *args: object) -> None:
@@ -194,8 +206,6 @@ def fake_lxd(tmp_path: Path, client: tuple[str, str]) -> Iterator[_FakeLxd]:
 
 
 def _closed_port_address() -> str:
-    import socket
-
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return f"127.0.0.1:{s.getsockname()[1]}"
@@ -205,7 +215,7 @@ class TestJoin:
     def test_the_token_is_redeemed_and_the_certificate_trusted(self, fake_lxd, client):
         token = decode_token(_token([fake_lxd.address], fake_lxd.fingerprint))
         assert join(token, *client) == fake_lxd.address
-        assert fake_lxd.trusted == {_fingerprint(client[0])}
+        assert set(fake_lxd.trusted) == {_fingerprint(client[0])}
         assert fake_lxd.posts == [{"trust_token": token.raw}]
 
     def test_unreachable_addresses_are_skipped(self, fake_lxd, client):
@@ -214,10 +224,42 @@ class TestJoin:
         assert join(token, *client, timeout=2) == fake_lxd.address
 
     def test_a_trusted_certificate_does_not_redeem_again(self, fake_lxd, client):
-        fake_lxd.trusted.add(_fingerprint(client[0]))
+        fake_lxd.trusted[_fingerprint(client[0])] = ("openshell-gateway", True)
         token = decode_token(_token([fake_lxd.address], fake_lxd.fingerprint))
         assert join(token, *client) == fake_lxd.address
         assert fake_lxd.posts == []
+
+    @pytest.mark.parametrize(
+        "identity", [("openshell-gateway", False), ("someone-else", True)], ids=["legacy", "other"]
+    )
+    def test_trust_that_is_not_the_tokens_identity_is_refused(self, fake_lxd, client, identity):
+        # A leftover `lxc config trust add` entry would otherwise count as
+        # joined, with whatever that entry grants instead of the group.
+        fake_lxd.trusted[_fingerprint(client[0])] = identity
+        token = decode_token(_token([fake_lxd.address], fake_lxd.fingerprint))
+        with pytest.raises(JoinError, match="already trusts this certificate"):
+            join(token, *client)
+        assert fake_lxd.posts == []
+
+    def test_lxds_error_text_is_capped(self, fake_lxd, client):
+        fake_lxd.refusal = "x" * 5000
+        token = decode_token(_token([fake_lxd.address], fake_lxd.fingerprint, secret="spent"))
+        with pytest.raises(JoinError) as raised:
+            join(token, *client)
+        assert len(str(raised.value)) < 300
+
+    def test_a_server_that_never_answers_cannot_hold_the_hook(self, fake_lxd, client):
+        # A listener that never completes the handshake stands in for a
+        # blackholed address; the deadline covers every address together.
+        with socket.socket() as silent:
+            silent.bind(("127.0.0.1", 0))
+            silent.listen()
+            address = f"127.0.0.1:{silent.getsockname()[1]}"
+            token = decode_token(_token([address, fake_lxd.address], fake_lxd.fingerprint))
+            started = time.monotonic()
+            with pytest.raises(JoinError, match="not tried, out of time"):
+                join(token, *client, timeout=10, deadline=1)
+        assert time.monotonic() - started < 5
 
     def test_a_spent_token_is_refused_with_lxds_reason(self, fake_lxd, client):
         token = decode_token(_token([fake_lxd.address], fake_lxd.fingerprint, secret="spent"))

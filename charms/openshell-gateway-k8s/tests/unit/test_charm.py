@@ -2761,6 +2761,20 @@ class TestLxdJoin:
         assert out.unit_status == BlockedStatus("cannot join LXD: LXD refused the token: expired")
         assert "--lxd-url" not in self._driver_command(out)
 
+    def test_a_failed_join_is_retried_on_the_next_event(self):
+        # The administrator may fix the LXD side without replacing the token.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        token = _lxd_token()
+        failed = {"token": decode_token(token).digest, "error": "cannot reach LXD: x"}
+        with (
+            _all_ready(lxd_connection=False),
+            patch("charm.join", return_value="10.0.0.1:8443") as join_mock,
+        ):
+            out = ctx.run(ctx.on.update_status(), self._state(token=token, join_state=failed))
+        join_mock.assert_called_once()
+        assert "error" not in self._join_state(out)
+        assert out.unit_status == ActiveStatus()
+
     def test_a_failed_rejoin_keeps_the_address_that_worked(self):
         # A replaced token that cannot be redeemed yet must not take down a
         # workload that is connected with the identity LXD already trusts.
