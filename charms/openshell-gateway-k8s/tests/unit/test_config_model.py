@@ -15,7 +15,6 @@ from config_model import (
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CERT_PATH,
     METRICS_DISABLED,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
@@ -51,6 +50,8 @@ BOTH_ROLES_MINIMAL = {
     "oidc-user-role": "user",
 }
 
+_FP = "c" * 64
+
 
 # ---------------------------------------------------------------------------
 # VP-1: Config surface
@@ -77,11 +78,31 @@ class TestConfigSurface:
         assert "/" in cfg.sandbox_image
         assert cfg.lxd_operation_timeout_secs == 60
 
-    def test_no_lxd_projects_field(self):
-        # Which LXD projects the gateway may reach is the integrator's
-        # decision and arrives over the lxd-https relation. This charm must
-        # never grow a config option for it again.
-        assert "lxd_projects" not in GatewayConfig.model_fields
+    def test_lxd_join_settings_are_unset_by_default(self):
+        cfg, err = load_config({**BOTH_ROLES_MINIMAL, "lxd-join-secret": "", "lxd-project": ""})
+        assert err is None
+        assert cfg is not None
+        assert cfg.lxd_join_secret is None
+        assert cfg.lxd_project is None
+
+    @pytest.mark.parametrize("name", ["openshell", "sandboxes_1", "a.b-c"])
+    def test_lxd_project_accepts_a_project_name(self, name):
+        cfg, err = load_config({**BOTH_ROLES_MINIMAL, "lxd-project": name})
+        assert err is None
+        assert cfg is not None
+        assert cfg.lxd_project == name
+
+    @pytest.mark.parametrize(
+        "name",
+        ["open shell", "openshell --allow-plaintext-gateway", "a/b", " openshell", "x" * 64],
+    )
+    def test_lxd_project_rejects_what_the_command_line_cannot_carry(self, name):
+        # The project is interpolated into the driver's command line, which
+        # Pebble splits on whitespace.
+        cfg, err = load_config({**BOTH_ROLES_MINIMAL, "lxd-project": name})
+        assert cfg is None
+        assert err is not None
+        assert "lxd-project" in err
 
     @pytest.mark.parametrize("field", ["sandbox-image"])
     def test_lxd_string_fields_reject_control_chars(self, field):
@@ -483,7 +504,7 @@ class TestRenderConfigToml:
 
 
 class TestRenderDriverCommand:
-    def test_golden_command_with_ca(self):
+    def test_golden_command(self):
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
@@ -491,7 +512,8 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_cert=LXD_SERVER_CERT_PATH,
+            server_fingerprint=_FP,
+            project="openshell",
         )
         assert cmd == (
             "/usr/bin/openshell-driver-lxd"
@@ -499,7 +521,8 @@ class TestRenderDriverCommand:
             " --lxd-url https://10.0.0.1:8443"
             f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
             f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
-            f" --lxd-server-cert {LXD_SERVER_CERT_PATH}"
+            f" --lxd-server-fingerprint {_FP}"
+            " --project openshell"
             " --restrict-sandbox-egress --default-image openshell-sandbox"
             " --supervisor-image ghcr.io/nvidia/openshell/supervisor:0.0.116"
             " --operation-timeout-secs 60"
@@ -510,7 +533,7 @@ class TestRenderDriverCommand:
             f" --guest-tls-key {SANDBOX_TLS_KEY_PATH}"
         )
 
-    def test_project_is_rendered_when_the_provider_names_one(self):
+    def test_project_is_rendered(self):
         cmd = render_driver_command(
             "https://10.0.0.1:8443",
             "openshell-sandbox",
@@ -518,22 +541,10 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://gw:8443",
-            server_cert=LXD_SERVER_CERT_PATH,
+            server_fingerprint=_FP,
             project="openshell",
         )
         assert " --project openshell" in cmd
-
-    def test_project_is_absent_when_the_provider_names_none(self):
-        cmd = render_driver_command(
-            "https://10.0.0.1:8443",
-            "openshell-sandbox",
-            "ghcr.io/nvidia/openshell/supervisor:0.0.116",
-            60,
-            "info",
-            "https://gw:8443",
-            server_cert=LXD_SERVER_CERT_PATH,
-        )
-        assert "--project" not in cmd
 
     def test_sandbox_tls_material_is_always_passed(self):
         # The driver refuses to start without it unless plaintext is allowed,
@@ -545,7 +556,8 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://gw:8443",
-            server_fingerprint="abcdef",
+            server_fingerprint=_FP,
+            project="openshell",
         )
         assert f"--guest-tls-ca {SANDBOX_TLS_CA_PATH}" in cmd
         assert f"--guest-tls-cert {SANDBOX_TLS_CERT_PATH}" in cmd
@@ -560,23 +572,11 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_fingerprint="ab:cd:ef:12:34:56",
+            server_fingerprint=_FP,
+            project="openshell",
         )
-        assert "--lxd-server-fingerprint ab:cd:ef:12:34:56" in cmd
+        assert f"--lxd-server-fingerprint {_FP}" in cmd
         assert "--lxd-server-ca" not in cmd
-
-    def test_ca_and_fingerprint_mutually_exclusive(self):
-        with pytest.raises(ValueError):
-            render_driver_command(
-                "https://10.0.0.1:8443",
-                "openshell-sandbox",
-                "ghcr.io/nvidia/openshell/supervisor:0.0.116",
-                60,
-                "info",
-                "https://openshell-gateway.my-model.svc.cluster.local:8443",
-                server_cert=LXD_SERVER_CERT_PATH,
-                server_fingerprint="ab:cd",
-            )
 
     def test_rendered_command_has_no_socket_reference(self):
         cmd = render_driver_command(
@@ -586,7 +586,8 @@ class TestRenderDriverCommand:
             60,
             "info",
             "https://openshell-gateway.my-model.svc.cluster.local:8443",
-            server_cert=LXD_SERVER_CERT_PATH,
+            server_fingerprint=_FP,
+            project="openshell",
         )
         assert "--lxd-socket" not in cmd
         assert "LXD_HOST_SOCKET" not in cmd
@@ -602,7 +603,8 @@ class TestRenderDriverCommand:
             60,
             "info",
             endpoint,
-            server_cert=LXD_SERVER_CERT_PATH,
+            server_fingerprint=_FP,
+            project="openshell",
         )
         assert f"--gateway-endpoint {endpoint}" in cmd
 
@@ -728,7 +730,8 @@ class TestSupervisorImage:
             60,
             "info",
             "https://gw:8443",
-            server_fingerprint="abcdef",
+            server_fingerprint=_FP,
+            project="openshell",
         )
         assert " --supervisor-image 192.168.1.166:5000/openshell-supervisor:v0.0.116" in cmd
 
@@ -814,7 +817,8 @@ class TestSandboxEgressOption:
             "operation_timeout_secs": 60,
             "log_level": "info",
             "gateway_endpoint": "https://gw:8443",
-            "server_fingerprint": "ab" * 32,
+            "server_fingerprint": _FP,
+            "project": "openshell",
         }
         assert "--restrict-sandbox-egress" in render_driver_command(**common)
         assert "--restrict-sandbox-egress" not in render_driver_command(
@@ -836,21 +840,3 @@ class TestSandboxImageOptionName:
         assert err is None
         assert cfg is not None
         assert cfg.sandbox_image == "reg.example/base:1"
-
-
-class TestServerCertificateIsPinnedNotTrustedAsACa:
-    def test_the_published_certificate_is_pinned(self):
-        # --lxd-server-ca loads the file as a trust anchor and then verifies
-        # chain and hostname, which LXD's self-signed certificate cannot
-        # satisfy for the routable address this pod dials.
-        cmd = render_driver_command(
-            url="https://10.0.0.1:8443",
-            default_image="img",
-            supervisor_image="sup",
-            operation_timeout_secs=60,
-            log_level="info",
-            gateway_endpoint="https://gw:8443",
-            server_cert=LXD_SERVER_CERT_PATH,
-        )
-        assert f"--lxd-server-cert {LXD_SERVER_CERT_PATH}" in cmd
-        assert "--lxd-server-ca" not in cmd
