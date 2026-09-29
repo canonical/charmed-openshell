@@ -326,11 +326,20 @@ variable "openshell" {
     collector is enabled by default, because this stack always deploys the
     downstream it forwards to; set `opentelemetry_collector.enabled = false`
     to opt out of gateway metrics.
+
+    `lxd` is required: the gateway joins LXD with the trust token in the
+    `join_secret` Juju secret and creates sandboxes in `project`. See the
+    `terraform/openshell` module's `lxd` variable.
   EOT
   type = object({
     risk              = optional(string, "stable")
     ha                = optional(bool, false)
     external_hostname = optional(string)
+
+    lxd = object({
+      join_secret = string
+      project     = string
+    })
 
     oidc = optional(object({
       admin_role  = optional(string)
@@ -348,16 +357,6 @@ variable "openshell" {
       constraints = optional(string, "arch=amd64")
       config      = optional(map(string), {})
       resources   = optional(map(string), {})
-    }), {})
-
-    integrator = optional(object({
-      app_name    = optional(string)
-      base        = optional(string, "ubuntu@24.04")
-      channel     = optional(string)
-      revision    = optional(number)
-      units       = optional(number)
-      constraints = optional(string, "arch=amd64")
-      config      = optional(map(string), {})
     }), {})
 
     postgresql = optional(object({
@@ -412,7 +411,6 @@ variable "openshell" {
       config      = optional(map(string), {})
     }), {})
   })
-  default = {}
 }
 
 variable "core" {

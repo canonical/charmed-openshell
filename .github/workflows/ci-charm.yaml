@@ -89,117 +89,15 @@ jobs:
           path: charms/openshell-gateway-k8s/*.charm
           if-no-files-found: error
 
-  integration-suite:
-    name: Integration test suite (${{ matrix.suite.name }})
-    needs: [build-charm]
-    runs-on: [self-hosted-linux-amd64-noble-large]
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        # The integrator suite creates sandboxes, which need OVN; it runs on
-        # MicroCloud in its own job below.
-        suite:
-          - name: offer
-            args: -m offer
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Free up disk space
-        timeout-minutes: 10
-        run: |
-          sudo rm -rf \
-            /opt/google \
-            /opt/hostedtoolcache \
-            /opt/microsoft/powershell \
-            /opt/microsoft/msedge \
-            "$AGENT_TOOLSDIRECTORY" \
-            /usr/lib/firefox \
-            /usr/lib/mono \
-            /usr/local/julia* \
-            /usr/local/lib/android \
-            /usr/local/share/chromium \
-            /usr/local/share/powershell \
-            /usr/share/dotnet \
-            /usr/share/gradle* \
-            /usr/share/miniconda \
-            /usr/share/sbt \
-            /usr/share/swift \
-            /home/linuxbrew
-          printf '\nDisk usage\n'
-          df --human-readable
-
-      - name: Install concierge
-        run: sudo snap install --classic concierge
-
-      - name: Bootstrap Juju/K8s environment
-        run: sudo concierge prepare -c concierge.yaml
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
-
-      - name: Install just and tox
-        run: sudo apt install -y just tox
-
-      # The CLI has to match the gateway rock's OpenShell release (0.0.116,
-      # snap revision 1041); latest/stable has moved on to 0.1.x, which
-      # cannot decode this gateway's responses. concierge installs the snap
-      # from its channel first, so move it to the revision and hold it.
-      - name: Install OpenShell client
-        run: |
-          if snap list openshell >/dev/null 2>&1; then
-            sudo snap refresh openshell --revision=1041
-          else
-            sudo snap install openshell --revision=1041
-          fi
-          sudo snap refresh --hold openshell
-
-      - name: Download charm artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.9
-        with:
-          name: charm
-          path: artifacts/charm
-
-      - name: Resolve artifact paths
-        id: artifacts
-        run: |
-          charm="$(realpath artifacts/charm/*.charm | head -n1)"
-          echo "charm=$charm" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Run integration tests
-        run: just integration-test-charm ${{ matrix.suite.args }}
-        env:
-          CHARM_FILE: ${{ steps.artifacts.outputs.charm }}
-          OPENSHELL_ENABLE_SANDBOX_E2E: "true"
-
-      - name: Upload diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: diagnostics-${{ matrix.suite.name }}
-          path: artifacts/diagnostics/
-          if-no-files-found: ignore
-
-  # The integrator suite creates sandboxes, and the driver refuses to create
+  # The LXD suite creates sandboxes, and the driver refuses to create
   # one off an OVN network (restrict-sandbox-egress puts every sandbox NIC
   # behind a network ACL). So the runner becomes a single-member MicroCloud,
   # Kubernetes and the Juju controllers run in a VM on its OVN network, and
   # the suite runs inside that VM with the VM's lxc client pointed at the
   # MicroCloud. Sandboxes land on the same OVN network as the VM, where the
   # load-balancer addresses the gateway is published on are routed to it.
-  integration-integrator:
-    name: Integration test suite (integrator, MicroCloud)
+  integration-lxd:
+    name: Integration test suite (LXD, MicroCloud)
     needs: [build-charm]
     runs-on: [self-hosted-linux-amd64-noble-large]
     timeout-minutes: 120
@@ -333,7 +231,7 @@ jobs:
             env CHARM_FILE="/home/ubuntu/charmed-openshell/artifacts/charm/${charm}" \
                 OPENSHELL_TEST_LXD_ADDRESS="${MICROCLOUD_INTERNAL_ADDR}:8443" \
                 OPENSHELL_ENABLE_SANDBOX_E2E=true \
-            bash -c 'cd ~/charmed-openshell && just integration-test-charm -m integrator -rs'
+            bash -c 'cd ~/charmed-openshell && just integration-test-charm -m lxd -rs'
 
       - name: Collect diagnostics
         if: failure()
@@ -348,13 +246,13 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: diagnostics-integrator
+          name: diagnostics-lxd
           path: artifacts/diagnostics/
           if-no-files-found: ignore
 
   integration:
     name: Integration tests
-    needs: [integration-suite, integration-integrator]
+    needs: [integration-lxd]
     runs-on: ubuntu-26.04
     steps:
       - name: Confirm test success

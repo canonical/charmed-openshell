@@ -16,7 +16,6 @@ HYDRA_APP = "hydra"
 LOGIN_UI_APP = "login-ui"
 TRAEFIK_APP = "traefik-k8s"
 TLS_APP = "self-signed-certificates"
-INTEGRATOR_APP = "lxd-integrator-k8s"
 
 INFRA_APPS = [
     DB_GATEWAY_APP,
@@ -33,6 +32,11 @@ OIDC_AUDIENCE = "openshell-cli"
 OIDC_ROLES_CLAIM = "scp"
 
 IT_PROJECT = os.environ.get("OPENSHELL_TEST_LXD_PROJECT", "openshell-it")
+# The LXD group that grants the gateway's identity access to IT_PROJECT and
+# nothing else, and the pending identity the gateway redeems a token for.
+IT_GROUP = "openshell-it"
+IT_IDENTITY = "openshell-it-gateway"
+# The Juju user secret that carries the identity's trust token.
+LXD_JOIN_SECRET = "lxd-join"
 
 K8S_CONTROLLER = os.environ.get("JUJU_CONTROLLER", "concierge-k8s")
-LXD_CONTROLLER = os.environ.get("JUJU_LXD_CONTROLLER", "concierge-lxd")

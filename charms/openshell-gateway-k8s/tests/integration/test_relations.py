@@ -20,7 +20,7 @@ from .helpers import (
     wait_for_workload_running,
 )
 
-pytestmark = [pytest.mark.integrator]
+pytestmark = [pytest.mark.lxd]
 
 
 class TestRelationResilience:
@@ -29,7 +29,7 @@ class TestRelationResilience:
     def test_relation_resilience_database(
         self,
         juju: jubilant.Juju,
-        integrator_provider: None,
+        lxd_joined: None,
     ) -> None:
         """Removing and re-adding the database relation recovers automatically."""
         juju.cli("remove-relation", f"{APP_NAME}:database", f"{DB_GATEWAY_APP}:database")
@@ -58,7 +58,7 @@ class TestRelationResilience:
         self,
         juju: jubilant.Juju,
         gateway_url: str,
-        integrator_provider: None,
+        lxd_joined: None,
         openshell_available: None,
     ) -> None:
         """Removing and re-adding the oauth relation recovers automatically."""

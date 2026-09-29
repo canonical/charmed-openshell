@@ -4,11 +4,12 @@ This module deploys the `openshell-gateway-k8s` Juju charm as a single
 `juju_application`. It wraps only the gateway charm; callers are responsible for
 wiring the required integrations through the exposed endpoint outputs:
 
-- `requires`: `database`, `certificates`, `oauth`, `ingress`, `lxd`
+- `requires`: `database`, `certificates`, `oauth`, `ingress`
 - `provides`: `send-ca-cert`
 
-The `lxd` endpoint is mandatory: the gateway remains blocked until it is wired
- to an `lxd-https` provider such as `lxd-integrator-k8s`.
+The gateway also needs the `lxd-join-secret` and `lxd-project` options in
+`config`: it joins LXD with the trust token that secret holds, and remains
+blocked until both are set and the secret is granted to the application.
 
 ## Inputs
 

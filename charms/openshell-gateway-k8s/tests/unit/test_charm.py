@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import json
@@ -44,9 +45,8 @@ from charm import (
     DRIVER_CHECK_NAME,
     DRIVER_SERVICE_NAME,
     GATEWAY_CMD,
-    LXD_INTERFACE_VERSION,
-    LXD_RELATION,
     METRICS_RELATION,
+    PEER_LXD_JOIN_KEY,
     PEER_RELATION,
     PEER_SANDBOX_SECRET_ID_KEY,
     PEER_SANDBOX_SECRET_LABEL,
@@ -56,6 +56,7 @@ from charm import (
     RESTART_RELATION,
     SERVICE_NAME,
     OpenshellGatewayK8sCharm,
+    _Gap,
     _generate_jwt_keypair,
     _LxdConnection,
 )
@@ -66,13 +67,13 @@ from config_model import (
     GATEWAY_PORT,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CERT_PATH,
     SANDBOX_CLIENT_CA_PATH,
     SANDBOX_TLS_CA_PATH,
     SANDBOX_TLS_CERT_PATH,
     SANDBOX_TLS_KEY_PATH,
     TLS_DIR,
 )
+from lxd_join import JoinError, decode_token
 
 RBAC_REQUIRED_MSG = "both oidc-admin-role and oidc-user-role must be set (RBAC required)"
 TOGETHER_ADMIN_MSG = (
@@ -118,11 +119,21 @@ _LXD_URL = "https://10.0.0.1:8443"
 _APP_FP = "a" * 64
 _UNIT_FP = "b" * 64
 
-_LXD_CONN = _LxdConnection(
-    url=_LXD_URL,
-    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
-    fingerprint="ab:cd:ef",
-)
+_LXD_CONN = _LxdConnection(url=_LXD_URL, fingerprint="c" * 64, project="openshell")
+
+
+@contextlib.contextmanager
+def _lxd_joined(conn: _LxdConnection | None = _LXD_CONN):
+    """Patch the unit as joined to LXD (or, with None, as not joined yet)."""
+    with (
+        patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=conn),
+        patch.object(
+            OpenshellGatewayK8sCharm,
+            "_lxd_gap",
+            return_value=None if conn else _Gap("waiting to join LXD", "waiting"),
+        ),
+    ):
+        yield
 
 
 def _all_relations():
@@ -131,7 +142,6 @@ def _all_relations():
         Relation("database"),
         Relation("certificates"),
         Relation("oauth"),
-        Relation(LXD_RELATION),
     ]
 
 
@@ -179,9 +189,7 @@ def _all_ready(*, jwt: bool = True, lxd_connection: bool = True, extra: Sequence
             patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
         ]
     if lxd_connection:
-        patches.append(
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN)
-        )
+        patches.append(_lxd_joined())
 
     with contextlib.ExitStack() as stack:
         for patcher in (*patches, *extra):
@@ -326,6 +334,7 @@ class TestRelationDataResilience:
             "_ensure_sandbox_client_identity": _FAKE_SANDBOX_IDENTITY,
             "_read_sandbox_client_identity": _FAKE_SANDBOX_IDENTITY,
             "_lxd_connection": _LXD_CONN,
+            "_lxd_gap": None,
         }
         defaults.update(overrides)
         for name, value in defaults.items():
@@ -385,7 +394,6 @@ class TestRelationDataResilience:
                 db_rel,
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
 
@@ -422,9 +430,7 @@ class TestRelationDataResilience:
                     return_value=_FAKE_LXD_IDENTITY,
                 )
             )
-            stack.enter_context(
-                patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN)
-            )
+            stack.enter_context(_lxd_joined())
             out = ctx.run(ctx.on.relation_changed(relation=db_rel), state)
         assert isinstance(out.unit_status, WaitingStatus)
         assert "database credentials" in out.unit_status.message.lower()
@@ -608,7 +614,7 @@ class TestGatewayEndpoint:
                 "_read_sandbox_client_identity",
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            _lxd_joined(),
         ):
             ctx.run(ctx.on.config_changed(), state)
         args = mock_cert.call_args
@@ -626,7 +632,6 @@ class TestGatewayEndpoint:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                Relation(LXD_RELATION),
                 *extra_relations,
             ],
             model=Model(name="prod"),
@@ -740,7 +745,7 @@ class TestTeardown:
                 "_read_sandbox_client_identity",
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            _lxd_joined(),
         ):
             stopped = ctx.run(ctx.on.config_changed(), running)
 
@@ -915,7 +920,6 @@ class TestJwtRotationConvergence:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
             secrets=[secret],
             leader=True,
@@ -965,7 +969,7 @@ class TestJwtRotationConvergence:
                 "_read_sandbox_client_identity",
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            _lxd_joined(),
         ):
             out = ctx.run(ctx.on.secret_changed(secret), state)
         fs = out.get_container(CONTAINER_NAME).get_filesystem(ctx)
@@ -1105,10 +1109,8 @@ class TestWorkloadConfigHash:
         kid = "kid1"
         lxd_cert = "LXDCERT"
         lxd_key = "LXDKEY"
-        lxd_ca = "SERVERCA"
-        lxd_url = "https://10.0.0.1:8443"
         h1 = charm._workload_config_hash(
-            layer, toml, cert, signing, public, kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+            layer, toml, cert, signing, public, kid, lxd_cert, lxd_key
         )
 
         # Reordered dict keys inside the layer produce the same hash.
@@ -1129,38 +1131,38 @@ class TestWorkloadConfigHash:
             },
         }
         h2 = charm._workload_config_hash(
-            layer2, toml, cert, signing, public, kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+            layer2, toml, cert, signing, public, kid, lxd_cert, lxd_key
         )
         assert h1 == h2
 
         # Changing any component changes the hash.
         assert (
             charm._workload_config_hash(
-                layer, toml + "#", cert, signing, public, kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+                layer, toml + "#", cert, signing, public, kid, lxd_cert, lxd_key
             )
             != h1
         )
         assert (
             charm._workload_config_hash(
-                layer, toml, cert + "X", signing, public, kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+                layer, toml, cert + "X", signing, public, kid, lxd_cert, lxd_key
             )
             != h1
         )
         assert (
             charm._workload_config_hash(
-                layer, toml, cert, signing + "X", public, kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+                layer, toml, cert, signing + "X", public, kid, lxd_cert, lxd_key
             )
             != h1
         )
         assert (
             charm._workload_config_hash(
-                layer, toml, cert, signing, public + "X", kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+                layer, toml, cert, signing, public + "X", kid, lxd_cert, lxd_key
             )
             != h1
         )
         assert (
             charm._workload_config_hash(
-                layer, toml, cert, signing, public, kid + "X", lxd_cert, lxd_key, lxd_ca, lxd_url
+                layer, toml, cert, signing, public, kid + "X", lxd_cert, lxd_key
             )
             != h1
         )
@@ -1178,7 +1180,6 @@ class TestRollingRestartLifecycle:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
 
@@ -1405,10 +1406,8 @@ class TestPebbleChecks:
         kid = "kid1"
         lxd_cert = "LXDCERT"
         lxd_key = "LXDKEY"
-        lxd_ca = "SERVERCA"
-        lxd_url = "https://10.0.0.1:8443"
         h_with = charm._workload_config_hash(
-            layer_with_checks, toml, cert, signing, public, kid, lxd_cert, lxd_key, lxd_ca, lxd_url
+            layer_with_checks, toml, cert, signing, public, kid, lxd_cert, lxd_key
         )
         h_without = charm._workload_config_hash(
             layer_without_checks,
@@ -1419,8 +1418,6 @@ class TestPebbleChecks:
             kid,
             lxd_cert,
             lxd_key,
-            lxd_ca,
-            lxd_url,
         )
         assert h_with != h_without
 
@@ -1443,7 +1440,6 @@ class TestLxdIdentity:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
         with (
@@ -1456,7 +1452,7 @@ class TestLxdIdentity:
             patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
             patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
             patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            _lxd_joined(),
         ):
             out1 = ctx.run(ctx.on.relation_created(relation=peer_rel), state)
 
@@ -1478,7 +1474,7 @@ class TestLxdIdentity:
             patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
             patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
             patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            _lxd_joined(),
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
 
@@ -1487,323 +1483,9 @@ class TestLxdIdentity:
         assert lxd_secrets2[0].id == secret_id
 
 
-class TestLxdDatabag:
-    def test_lxd_databag_published(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-        )
-        with _all_ready():
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
-        assert lxd_rel_out.local_app_data["version"] == LXD_INTERFACE_VERSION
-        assert lxd_rel_out.local_app_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
-        assert "projects" not in lxd_rel_out.local_app_data
-        assert lxd_rel_out.local_unit_data["version"] == LXD_INTERFACE_VERSION
-        assert lxd_rel_out.local_unit_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
-        assert "projects" not in lxd_rel_out.local_unit_data
-
-    def test_lxd_databag_clears_a_legacy_projects_key(self):
-        # An older revision published a config-derived "projects" restriction.
-        # After upgrade the key is the integrator's to decide, so the charm
-        # removes what it used to own instead of leaving it to rot.
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(
-            LXD_RELATION,
-            local_app_data={"projects": "default,project-a"},
-            local_unit_data={"projects": "default,project-a"},
-        )
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-        )
-        with _all_ready():
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
-        assert "projects" not in lxd_rel_out.local_app_data
-        assert "projects" not in lxd_rel_out.local_unit_data
-
-    def test_lxd_databag_unit_data_published_when_not_leader(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
-        state = State(
-            config=BOTH_ROLES,
-            leader=False,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-        )
-        with _all_ready():
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        lxd_rel_out = next(r for r in out.relations if r.endpoint == LXD_RELATION)
-        assert lxd_rel_out.local_app_data == {}
-        assert lxd_rel_out.local_unit_data["version"] == LXD_INTERFACE_VERSION
-        assert lxd_rel_out.local_unit_data["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
-
-
-class TestLxdConnection:
-    def _make_relation(self, app_data=None, unit_data=None):
-        rel = Relation(LXD_RELATION, remote_app_data=app_data or {})
-        if unit_data:
-            rel = Relation(
-                LXD_RELATION,
-                remote_app_data=app_data or {},
-                remote_units_data={0: unit_data},
-            )
-        return rel
-
-    def _run_action(self, rel):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            containers=[_CONN_CONTAINER],
-            relations=[rel],
-        )
-        with (
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_lxd_client_identity",
-                return_value=_FAKE_LXD_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-        ):
-            ctx.run(ctx.on.action("get-lxd-client-cert"), state)
-        return ctx.action_results
-
-    def test_lxd_connection_prefers_app_bag(self):
-        rel = self._make_relation(
-            app_data={
-                "version": "1.0",
-                "certificate": "APPCA",
-                "certificate_fingerprint": _APP_FP,
-                "addresses": "10.0.0.1:8443",
-            },
-            unit_data={
-                "certificate": "UNITCA",
-                "certificate_fingerprint": _UNIT_FP,
-                "addresses": "10.0.0.2:8443",
-            },
-        )
-        results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == _APP_FP
-
-    def test_lxd_connection_falls_back_to_unit_bag(self):
-        rel = self._make_relation(
-            app_data={},
-            unit_data={
-                "version": "1.0",
-                "certificate": "UNITCA",
-                "certificate_fingerprint": _UNIT_FP,
-                "addresses": "10.0.0.2:8443",
-            },
-        )
-        results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == _UNIT_FP
-
-    def test_lxd_connection_reads_the_unit_bag_that_has_the_details(self):
-        # A non-clustered provider publishes to its leader's unit bag only, and
-        # the leader is not necessarily the first unit iteration yields.
-        rel = Relation(
-            LXD_RELATION,
-            remote_app_data={},
-            remote_units_data={
-                0: {},
-                1: {
-                    "version": "1.0",
-                    "certificate": "UNITCA",
-                    "certificate_fingerprint": _UNIT_FP,
-                    "addresses": "10.0.0.2:8443",
-                },
-            },
-        )
-        results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == _UNIT_FP
-
-    def test_lxd_connection_rejects_an_unusable_fingerprint(self):
-        # The fingerprint is interpolated into the driver's command line, which
-        # Pebble splits on whitespace: a value carrying a space would otherwise
-        # become extra arguments to the driver.
-        for bad in (f"{_APP_FP} --sandbox-nesting", "ab", "z" * 64, f"{_APP_FP}x"):
-            rel = self._make_relation(
-                app_data={
-                    "version": "1.0",
-                    "certificate_fingerprint": bad,
-                    "addresses": "10.0.0.1:8443",
-                }
-            )
-            results = self._run_action(rel)
-            assert results["certificate-fingerprint"] == "", bad
-
-    def test_lxd_connection_normalises_a_colon_separated_fingerprint(self):
-        colons = ":".join("ab" for _ in range(32))
-        rel = self._make_relation(
-            app_data={
-                "version": "1.0",
-                "certificate_fingerprint": colons,
-                "addresses": "10.0.0.1:8443",
-            }
-        )
-        results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == "ab" * 32
-
-    def test_lxd_connection_none_when_incomplete(self):
-        rel = self._make_relation(app_data={"certificate": "CA"})
-        results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == ""
-
-    def test_lxd_connection_url_scheme(self):
-        rel = self._make_relation(
-            app_data={
-                "certificate": "CA",
-                "addresses": "10.0.0.1:8443",
-            }
-        )
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                rel,
-            ],
-        )
-        with _all_ready():
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert "--lxd-url https://10.0.0.1:8443" in cmd
-
-    def test_lxd_connection_accepts_json_list_addresses(self):
-        rel = self._make_relation(
-            app_data={
-                "certificate": "CA",
-                "addresses": '["10.0.0.1:8443", "10.0.0.2:8443"]',
-            }
-        )
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                rel,
-            ],
-        )
-        with _all_ready():
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert "--lxd-url https://10.0.0.1:8443" in cmd
-
-    def test_lxd_connection_rejects_malformed_address(self):
-        rel = self._make_relation(
-            app_data={
-                "certificate": "CA",
-                "addresses": "10.0.0.1;rm -rf",
-            }
-        )
-        results = self._run_action(rel)
-        assert results["certificate-fingerprint"] == ""
-
-    def test_lxd_connection_ipv6_comma_separated(self):
-        rel = Relation(
-            LXD_RELATION,
-            remote_app_data={
-                "certificate": "CA",
-                "addresses": "[::1]:8443",
-            },
-        )
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                rel,
-            ],
-        )
-        with (
-            patch.object(OpenshellGatewayK8sCharm, "_database_uri", return_value=_DB_URI),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_tls_material",
-                return_value=(_FAKE_TLS_CERT, _FAKE_TLS_KEY),
-            ),
-            patch.object(OpenshellGatewayK8sCharm, "_oauth_issuer", return_value=_ISSUER),
-            patch.object(OpenshellGatewayK8sCharm, "_ensure_jwt_keypair", return_value=_FAKE_JWT),
-            patch.object(OpenshellGatewayK8sCharm, "_read_jwt_keypair", return_value=_FAKE_JWT),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_lxd_client_identity",
-                return_value=_FAKE_LXD_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_lxd_client_identity",
-                return_value=_FAKE_LXD_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-        ):
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert "--lxd-url https://[::1]:8443" in cmd
-
-
 class TestLxdFilesAndLayer:
     def test_lxd_cert_files_written(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
             leader=True,
@@ -1813,7 +1495,6 @@ class TestLxdFilesAndLayer:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                lxd_rel,
             ],
         )
         with _all_ready():
@@ -1825,7 +1506,7 @@ class TestLxdFilesAndLayer:
         assert (fs / "etc" / "openshell" / "lxd" / "client.key").read_text() == _FAKE_LXD_IDENTITY[
             "private-key"
         ]
-        assert (fs / "etc" / "openshell" / "lxd" / "server.crt").read_text() == _LXD_CONN.server_ca
+        assert not (fs / "etc" / "openshell" / "lxd" / "server.crt").exists()
         mode_key = stat.S_IMODE(os.stat(fs / "etc/openshell/lxd/client.key").st_mode)
         assert mode_key == 0o600, f"client.key mode {oct(mode_key)} != 0o600"
         mode_cert = stat.S_IMODE(os.stat(fs / "etc/openshell/lxd/client.crt").st_mode)
@@ -1833,7 +1514,6 @@ class TestLxdFilesAndLayer:
 
     def test_driver_layer_uses_remote_args(self):
         ctx = Context(OpenshellGatewayK8sCharm, app_name="my-gateway")
-        lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
             leader=True,
@@ -1843,7 +1523,6 @@ class TestLxdFilesAndLayer:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                lxd_rel,
             ],
             model=Model(name="prod"),
         )
@@ -1864,7 +1543,6 @@ class TestLxdFilesAndLayer:
 
     def test_sandbox_tls_files_written(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
             leader=True,
@@ -1874,7 +1552,6 @@ class TestLxdFilesAndLayer:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                lxd_rel,
             ],
         )
         with _all_ready():
@@ -1891,7 +1568,6 @@ class TestLxdFilesAndLayer:
         # The LXD client certificate is an administrative credential. It must
         # stay in the gateway pod, never in the material copied into sandboxes.
         ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
             leader=True,
@@ -1901,7 +1577,6 @@ class TestLxdFilesAndLayer:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                lxd_rel,
             ],
         )
         with _all_ready():
@@ -1915,7 +1590,6 @@ class TestLxdFilesAndLayer:
 
     def test_driver_layer_passes_guest_tls_material(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
             leader=True,
@@ -1925,7 +1599,6 @@ class TestLxdFilesAndLayer:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                lxd_rel,
             ],
         )
         with _all_ready():
@@ -1936,202 +1609,8 @@ class TestLxdFilesAndLayer:
         assert f"--guest-tls-key {SANDBOX_TLS_KEY_PATH}" in cmd
         assert "--allow-plaintext-gateway" not in cmd
 
-    def test_driver_layer_uses_project_from_the_provider(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(
-            LXD_RELATION,
-            remote_app_data={
-                "certificate_fingerprint": "cd" * 32,
-                "addresses": "10.0.0.1:8443",
-                "project": "openshell",
-            },
-        )
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-        )
-        with _all_ready(lxd_connection=False):
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert "--project openshell" in cmd
-
-    def test_driver_layer_omits_project_when_the_provider_names_none(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(
-            LXD_RELATION,
-            remote_app_data={
-                "certificate_fingerprint": "cd" * 32,
-                "addresses": "10.0.0.1:8443",
-            },
-        )
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-        )
-        with _all_ready(lxd_connection=False):
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert "--project" not in cmd
-
-    def test_unusable_project_blocks_instead_of_falling_back(self):
-        # Silently dropping the project would place sandboxes in LXD's
-        # "default" project, outside the isolation the operator asked for.
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(
-            LXD_RELATION,
-            remote_app_data={
-                "certificate_fingerprint": "cd" * 32,
-                "addresses": "10.0.0.1:8443",
-                "project": "bad/project",
-            },
-        )
-        state = State(
-            config=BOTH_ROLES,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-        )
-        with _all_ready(lxd_connection=False):
-            out = ctx.run(ctx.on.collect_unit_status(), state)
-        assert isinstance(out.unit_status, WaitingStatus)
-        assert "lxd connection details" in out.unit_status.message
-
-    def test_driver_layer_uses_fingerprint_when_ca_omitted(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(
-            LXD_RELATION,
-            remote_app_data={
-                "certificate_fingerprint": "cd" * 32,
-                "addresses": "10.0.0.1:8443",
-            },
-        )
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                lxd_rel,
-            ],
-            model=Model(name="prod"),
-        )
-        with (
-            _all_ready(lxd_connection=False),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_lxd_connection",
-                return_value=_LxdConnection(
-                    url="https://10.0.0.1:8443",
-                    server_ca=None,
-                    fingerprint="abc:def",
-                ),
-            ),
-        ):
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        plan = out.get_container(CONTAINER_NAME).plan
-        cmd = plan.services[DRIVER_SERVICE_NAME].command
-        assert "--lxd-server-fingerprint abc:def" in cmd
-        assert "--lxd-server-ca" not in cmd
-
-    def test_driver_layer_prefers_fingerprint_over_ca(self):
-        """BG-021: a published fingerprint wins even when a certificate is present.
-
-        LXD's self-signed server certificate carries only the hostname and the
-        loopback addresses as SANs, so CA verification rejects the routable
-        address the pod dials. Preferring the digest pin is what makes the
-        connection work, and lxd-integrator-k8s always publishes both fields.
-        """
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                Relation(LXD_RELATION),
-            ],
-            model=Model(name="prod"),
-        )
-        with (
-            _all_ready(lxd_connection=False),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_lxd_connection",
-                return_value=_LxdConnection(
-                    url="https://10.0.0.1:8443",
-                    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
-                    fingerprint="abc:def",
-                ),
-            ),
-        ):
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert "--lxd-server-fingerprint abc:def" in cmd
-        assert "--lxd-server-ca" not in cmd
-
-    def test_driver_layer_falls_back_to_ca_without_fingerprint(self):
-        """A provider that publishes only a certificate still gets CA verification."""
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            leader=True,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                PeerRelation(PEER_RELATION),
-                Relation(LXD_RELATION),
-            ],
-            model=Model(name="prod"),
-        )
-        with (
-            _all_ready(lxd_connection=False),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_lxd_connection",
-                return_value=_LxdConnection(
-                    url="https://10.0.0.1:8443",
-                    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
-                    fingerprint="",
-                ),
-            ),
-        ):
-            out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
-        cmd = out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
-        assert f"--lxd-server-cert {LXD_SERVER_CERT_PATH}" in cmd
-        assert "--lxd-server-fingerprint" not in cmd
-
     def test_driver_layer_socket_only_when_no_connection(self):
         ctx = Context(OpenshellGatewayK8sCharm)
-        lxd_rel = Relation(LXD_RELATION)
         state = State(
             config=BOTH_ROLES,
             leader=True,
@@ -2141,12 +1620,11 @@ class TestLxdFilesAndLayer:
                 Relation("certificates"),
                 Relation("oauth"),
                 PeerRelation(PEER_RELATION),
-                lxd_rel,
             ],
         )
         with (
             _all_ready(lxd_connection=False),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=None),
+            _lxd_joined(None),
         ):
             out = ctx.run(ctx.on.pebble_ready(_CONN_CONTAINER), state)
         plan = out.get_container(CONTAINER_NAME).plan
@@ -2156,18 +1634,6 @@ class TestLxdFilesAndLayer:
 
 
 class TestLxdReadinessGaps:
-    def test_lxd_gap_blocked_no_relation(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            containers=[_CONN_CONTAINER],
-            relations=[Relation("database"), Relation("certificates"), Relation("oauth")],
-        )
-        with _all_ready():
-            out = ctx.run(ctx.on.collect_unit_status(), state)
-        assert isinstance(out.unit_status, BlockedStatus)
-        assert "lxd relation missing" in out.unit_status.message
-
     def test_lxd_gap_waiting_no_identity(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = State(
@@ -2177,7 +1643,6 @@ class TestLxdReadinessGaps:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
         with (
@@ -2210,7 +1675,6 @@ class TestLxdReadinessGaps:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
         with (
@@ -2228,26 +1692,6 @@ class TestLxdReadinessGaps:
         assert isinstance(out.unit_status, WaitingStatus)
         assert "sandbox client identity" in out.unit_status.message
 
-    def test_lxd_gap_waiting_empty_databag(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            containers=[_CONN_CONTAINER],
-            relations=[
-                Relation("database"),
-                Relation("certificates"),
-                Relation("oauth"),
-                Relation(LXD_RELATION),
-            ],
-        )
-        with (
-            _all_ready(lxd_connection=False),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=None),
-        ):
-            out = ctx.run(ctx.on.collect_unit_status(), state)
-        assert isinstance(out.unit_status, WaitingStatus)
-        assert "lxd connection details" in out.unit_status.message
-
     def test_lxd_gap_absent_when_ready(self):
         ctx = Context(OpenshellGatewayK8sCharm)
         state = State(
@@ -2257,7 +1701,6 @@ class TestLxdReadinessGaps:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
         with _all_ready():
@@ -2276,7 +1719,6 @@ class TestLxdHash:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
 
@@ -2362,14 +1804,10 @@ class TestLxdHash:
         peer_rel1 = next(r for r in out1.relations if r.endpoint == RESTART_RELATION)
         hash_before = peer_rel1.local_unit_data[APPLIED_HASH_KEY]
 
-        new_conn = _LxdConnection(
-            url="https://10.0.0.2:8443",
-            server_ca=_LXD_CONN.server_ca,
-            fingerprint=_LXD_CONN.fingerprint,
-        )
+        new_conn = dataclasses.replace(_LXD_CONN, url="https://10.0.0.2:8443")
         with (
             _all_ready(lxd_connection=False),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=new_conn),
+            _lxd_joined(new_conn),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.config_changed(), out1)
@@ -2527,37 +1965,6 @@ class TestPebbleUnreachable:
             ctx.run(ctx.on.action("get-gateway-status"), _all_ready_state())
         assert ctx.action_results is not None
         assert ctx.action_results["workload-running"] == "False"
-
-
-class TestLxdAction:
-    def test_get_lxd_client_cert_action(self):
-        ctx = Context(OpenshellGatewayK8sCharm)
-        state = State(
-            config=BOTH_ROLES,
-            containers=[_CONN_CONTAINER],
-            relations=[Relation(LXD_RELATION)],
-        )
-        with (
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_lxd_client_identity",
-                return_value=_FAKE_LXD_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_ensure_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-            patch.object(
-                OpenshellGatewayK8sCharm,
-                "_read_sandbox_client_identity",
-                return_value=_FAKE_SANDBOX_IDENTITY,
-            ),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
-        ):
-            ctx.run(ctx.on.action("get-lxd-client-cert"), state)
-        assert ctx.action_results["certificate"] == _FAKE_LXD_IDENTITY["certificate"]
-        assert ctx.action_results["certificate-fingerprint"] == _LXD_CONN.fingerprint
 
 
 class TestMetricsEndpoint:
@@ -3201,7 +2608,7 @@ class TestSandboxClientCa:
                 "_read_lxd_client_identity",
                 return_value=_FAKE_LXD_IDENTITY,
             ),
-            patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            _lxd_joined(),
         ):
             out = ctx.run(ctx.on.config_changed(), state)
 
@@ -3232,3 +2639,226 @@ class TestMetricsScrapeConfiguration:
                 for target in static.get("targets", [])
             ]
             assert targets == ["*:9090"]
+
+
+def _lxd_token(
+    addresses: Sequence[str] = ("10.0.0.1:8443",),
+    fingerprint: str = "c" * 64,
+    type_: str = "Client certificate",
+    secret: str = "joinsecret",
+) -> str:
+    """Encode a trust token shaped the way ``lxc auth identity create`` prints one."""
+    body = {
+        "client_name": "openshell-gateway",
+        "fingerprint": fingerprint,
+        "addresses": list(addresses),
+        "secret": secret,
+        "expires_at": "2026-10-13T20:35:45Z",
+        "type": type_,
+    }
+    return base64.b64encode(json.dumps(body).encode()).decode()
+
+
+class TestLxdJoin:
+    """Joining LXD with the operator's trust token, end to end through the charm."""
+
+    def _state(
+        self,
+        *,
+        token: str | None = None,
+        content: dict[str, str] | None = None,
+        project: str | None = "openshell",
+        join_state: dict[str, str] | None = None,
+        leader: bool = True,
+        grant: bool = True,
+    ) -> State:
+        secret = Secret(tracked_content=content or {"token": token or _lxd_token()})
+        config: dict[str, str] = {**BOTH_ROLES, "lxd-join-secret": secret.id}
+        if project is not None:
+            config["lxd-project"] = project
+        peer_data = {PEER_LXD_JOIN_KEY: json.dumps(join_state)} if join_state else {}
+        return State(
+            config=config,
+            leader=leader,
+            containers=[_CONN_CONTAINER],
+            secrets=[secret] if grant else [],
+            relations=[
+                *_all_relations(),
+                PeerRelation(PEER_RELATION, local_app_data=peer_data),
+                _restart_relation(),
+            ],
+        )
+
+    @staticmethod
+    def _join_state(out: State) -> dict[str, str]:
+        peer = next(r for r in out.relations if r.endpoint == PEER_RELATION)
+        return json.loads(peer.local_app_data.get(PEER_LXD_JOIN_KEY, "{}"))
+
+    @staticmethod
+    def _driver_command(out: State) -> str:
+        return out.get_container(CONTAINER_NAME).plan.services[DRIVER_SERVICE_NAME].command
+
+    def test_the_leader_joins_and_the_driver_uses_what_the_token_names(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        token = _lxd_token(addresses=("10.9.9.9:8443", "192.168.1.166:8443"))
+        with (
+            _all_ready(lxd_connection=False),
+            patch("charm.join", return_value="192.168.1.166:8443") as join_mock,
+        ):
+            out = ctx.run(ctx.on.config_changed(), self._state(token=token))
+
+        (called_token, cert, key), _ = join_mock.call_args
+        assert called_token.raw == token
+        assert (cert, key) == (
+            _FAKE_LXD_IDENTITY["certificate"],
+            _FAKE_LXD_IDENTITY["private-key"],
+        )
+        # The token is secret and single-use; only its digest is recorded.
+        assert self._join_state(out) == {
+            "token": decode_token(token).digest,
+            "address": "192.168.1.166:8443",
+            "fingerprint": "c" * 64,
+        }
+        assert token not in json.dumps(self._join_state(out))
+        cmd = self._driver_command(out)
+        assert "--lxd-url https://192.168.1.166:8443" in cmd
+        assert f"--lxd-server-fingerprint {'c' * 64}" in cmd
+        assert "--project openshell" in cmd
+        assert out.unit_status == ActiveStatus()
+
+    def test_the_same_token_is_not_redeemed_twice(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        token = _lxd_token()
+        joined = {
+            "token": decode_token(token).digest,
+            "address": "10.0.0.1:8443",
+            "fingerprint": "c" * 64,
+        }
+        with _all_ready(lxd_connection=False), patch("charm.join") as join_mock:
+            ctx.run(ctx.on.update_status(), self._state(token=token, join_state=joined))
+        join_mock.assert_not_called()
+
+    def test_a_new_token_is_redeemed(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        old = {"token": "0" * 64, "address": "10.0.0.1:8443", "fingerprint": "c" * 64}
+        state = self._state(join_state=old)
+        (secret,) = state.secrets
+        with (
+            _all_ready(lxd_connection=False),
+            patch("charm.join", return_value="10.0.0.1:8443") as join_mock,
+        ):
+            out = ctx.run(ctx.on.secret_changed(secret), state)
+        join_mock.assert_called_once()
+        assert self._join_state(out)["token"] == decode_token(_lxd_token()).digest
+
+    def test_a_refused_token_blocks_with_the_reason_and_keeps_the_workload_down(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with (
+            _all_ready(lxd_connection=False),
+            patch("charm.join", side_effect=JoinError("LXD refused the token: expired")),
+        ):
+            out = ctx.run(ctx.on.config_changed(), self._state())
+        assert out.unit_status == BlockedStatus("cannot join LXD: LXD refused the token: expired")
+        assert "--lxd-url" not in self._driver_command(out)
+
+    def test_a_failed_join_is_retried_on_the_next_event(self):
+        # The administrator may fix the LXD side without replacing the token.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        token = _lxd_token()
+        failed = {"token": decode_token(token).digest, "error": "cannot reach LXD: x"}
+        with (
+            _all_ready(lxd_connection=False),
+            patch("charm.join", return_value="10.0.0.1:8443") as join_mock,
+        ):
+            out = ctx.run(ctx.on.update_status(), self._state(token=token, join_state=failed))
+        join_mock.assert_called_once()
+        assert "error" not in self._join_state(out)
+        assert out.unit_status == ActiveStatus()
+
+    def test_a_failed_rejoin_keeps_the_address_that_worked(self):
+        # A replaced token that cannot be redeemed yet must not take down a
+        # workload that is connected with the identity LXD already trusts.
+        ctx = Context(OpenshellGatewayK8sCharm)
+        old = {"token": "0" * 64, "address": "10.0.0.1:8443", "fingerprint": "c" * 64}
+        with (
+            _all_ready(lxd_connection=False),
+            patch(
+                "charm.join", side_effect=JoinError("cannot reach LXD: 10.0.0.1:8443: timed out")
+            ),
+        ):
+            out = ctx.run(ctx.on.config_changed(), self._state(join_state=old))
+        assert "--lxd-url https://10.0.0.1:8443" in self._driver_command(out)
+        assert isinstance(out.unit_status, BlockedStatus)
+        assert "cannot reach LXD" in out.unit_status.message
+        assert self._join_state(out)["address"] == "10.0.0.1:8443"
+
+    def test_a_follower_waits_for_the_leader_and_never_redeems(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with _all_ready(lxd_connection=False), patch("charm.join") as join_mock:
+            out = ctx.run(ctx.on.config_changed(), self._state(leader=False))
+        join_mock.assert_not_called()
+        assert out.unit_status == WaitingStatus("waiting to join LXD")
+
+    def test_a_follower_uses_the_leaders_join(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        token = _lxd_token()
+        joined = {
+            "token": decode_token(token).digest,
+            "address": "10.0.0.7:8443",
+            "fingerprint": "d" * 64,
+        }
+        with _all_ready(lxd_connection=False), patch("charm.join") as join_mock:
+            out = ctx.run(
+                ctx.on.config_changed(),
+                self._state(token=token, join_state=joined, leader=False),
+            )
+        join_mock.assert_not_called()
+        cmd = self._driver_command(out)
+        assert "--lxd-url https://10.0.0.7:8443" in cmd
+        assert f"--lxd-server-fingerprint {'d' * 64}" in cmd
+
+    def test_a_recorded_address_is_revalidated_before_reaching_the_command_line(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        token = _lxd_token()
+        joined = {
+            "token": decode_token(token).digest,
+            "address": "10.0.0.1:8443 --allow-plaintext-gateway",
+            "fingerprint": "c" * 64,
+        }
+        with _all_ready(lxd_connection=False), patch("charm.join"):
+            out = ctx.run(
+                ctx.on.config_changed(),
+                self._state(token=token, join_state=joined, leader=False),
+            )
+        assert "--lxd-url" not in self._driver_command(out)
+        assert out.unit_status == WaitingStatus("waiting to join LXD")
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"project": None}, "lxd-project not set"),
+            ({"grant": False}, "cannot read lxd-join-secret; grant it to this application"),
+            ({"content": {"other": "x"}}, "lxd-join-secret has no 'token' key"),
+            ({"token": "not a token"}, "lxd-join-secret: token is not base64-encoded JSON"),
+            (
+                {"token": _lxd_token(type_="")},
+                "lxd-join-secret: token is not a TLS identity token; "
+                "create one with lxc auth identity create",
+            ),
+        ],
+    )
+    def test_what_is_wrong_with_the_lxd_settings_blocks(self, kwargs, message):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        with _all_ready(lxd_connection=False), patch("charm.join", return_value="10.0.0.1:8443"):
+            out = ctx.run(ctx.on.config_changed(), self._state(**kwargs))
+        assert out.unit_status == BlockedStatus(message)
+        assert "--lxd-url" not in self._driver_command(out)
+
+    def test_the_join_secret_unset_blocks(self):
+        ctx = Context(OpenshellGatewayK8sCharm)
+        state = dataclasses.replace(
+            self._state(), config={**BOTH_ROLES, "lxd-project": "openshell"}
+        )
+        with _all_ready(lxd_connection=False):
+            out = ctx.run(ctx.on.collect_unit_status(), state)
+        assert out.unit_status == BlockedStatus("lxd-join-secret not set")

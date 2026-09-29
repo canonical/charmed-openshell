@@ -53,11 +53,9 @@ What the gateway is related to
       - Traefik
       - A route to port 8443 in TLS passthrough, so the gateway terminates
         TLS itself
-    * - ``lxd``
-      - ``lxd-integrator-k8s``
-      - The LXD endpoint, credentials and project to create sandboxes in
 
-The charm stays blocked until all five exist. The remaining relations are
+The charm stays blocked until all four exist and it has joined LXD, as
+described below. The remaining relations are
 optional: ``receive-ca-cert`` for issuers the workload has to trust,
 ``vault-kv`` to keep the token-signing key in Vault, and
 ``metrics-endpoint`` and ``grafana-dashboard`` for observability.
@@ -66,10 +64,19 @@ Where sandboxes run
 -------------------
 
 Sandboxes are LXD instances, not Kubernetes pods. The driver creates them in
-the LXD project that ``lxd-integrator-k8s`` names, and takes their network and
-storage pool from that project's ``default`` profile. It never creates the
-project or the profile: the LXD administrator does, and the charm only reads
-what the integrator passes on.
+the LXD project named by the ``lxd-project`` option, and takes their network
+and storage pool from that project's ``default`` profile. It never creates
+the project or the profile: the LXD administrator does.
+
+The gateway reaches LXD as a TLS identity of its own. The LXD administrator
+creates the identity in a group that has access to the sandbox project, and
+hands the operator the single-use trust token LXD prints for it. The operator
+puts the token in a Juju secret, grants the secret to the gateway, and names
+it in the ``lxd-join-secret`` option. The charm's leader unit redeems the
+token with a client certificate the charm generated, so LXD binds the
+identity to that certificate, and the certificate's private key never leaves
+the charm. The token also carries the LXD server's addresses and certificate
+fingerprint, which is how the driver finds and verifies the server.
 
 By default, the charm puts every sandbox NIC behind an LXD network ACL that
 lets it reach the gateway and the public internet and nothing else. LXD
@@ -125,7 +132,7 @@ controller:
     * - Model
       - What it runs
     * - ``openshell``
-      - The gateway, the LXD integrator, PostgreSQL, Traefik and a
+      - The gateway, PostgreSQL, Traefik and a
         certificate authority, and optionally Vault and an OpenTelemetry
         collector
     * - ``iam``
