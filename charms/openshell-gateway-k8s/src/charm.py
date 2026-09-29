@@ -48,7 +48,6 @@ from config_model import (
     JWT_DIR,
     LXD_CLIENT_CERT_PATH,
     LXD_CLIENT_KEY_PATH,
-    LXD_SERVER_CERT_PATH,
     METRICS_DISABLED,
     PRISTINE_CA_BUNDLE_PATH,
     REGISTRIES_CONF_PATH,
@@ -61,7 +60,6 @@ from config_model import (
     GatewayConfig,
     _parse_lxd_address,
     _parse_lxd_fingerprint,
-    _parse_lxd_project,
     load_config,
     parse_insecure_registries,
     render_config_toml,
@@ -70,6 +68,7 @@ from config_model import (
     render_registries_conf,
 )
 from ingress import GatewayIngress
+from lxd_join import JoinError, TokenError, TrustToken, decode_token, join
 from vault_store import VaultJwtStore, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -86,8 +85,12 @@ PEER_LXD_SECRET_LABEL = "lxd-client-identity"
 PEER_LXD_SECRET_ID_KEY = "lxd-secret-id"
 PEER_SANDBOX_SECRET_LABEL = "sandbox-client-identity"
 PEER_SANDBOX_SECRET_ID_KEY = "sandbox-secret-id"
-LXD_INTERFACE_VERSION = "1.0"
-LXD_RELATION = "lxd"
+# Peer app data key under which the leader records the outcome of joining LXD
+# with the operator's trust token. The token itself is single-use and secret,
+# so what is recorded is its digest, next to the address LXD answered on or
+# the reason it did not.
+PEER_LXD_JOIN_KEY = "lxd-join"
+LXD_JOIN_SECRET_KEY = "token"
 METRICS_RELATION = "metrics-endpoint"
 DASHBOARD_RELATION = "grafana-dashboard"
 RECEIVE_CA_RELATION = "receive-ca-cert"
@@ -121,10 +124,7 @@ def _can_connect(container: ops.Container) -> bool:
 class _LxdConnection:
     url: str
     fingerprint: str
-    server_ca: str | None = None
-    # LXD project the provider tells requirers to operate in. None means the
-    # provider published none and the driver uses LXD's "default" project.
-    project: str | None = None
+    project: str
 
 
 def _generate_jwt_keypair() -> dict[str, str]:
@@ -258,8 +258,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             self.certificates.on.certificate_available,
             self.oauth.on.oauth_info_changed,
             self.oauth.on.oauth_info_removed,
-            self.on[LXD_RELATION].relation_changed,
-            self.on[LXD_RELATION].relation_joined,
             self.on[RECEIVE_CA_RELATION].relation_changed,
             self.on[RECEIVE_CA_RELATION].relation_broken,
             self.vault.requires.on.ready,
@@ -271,13 +269,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         self.framework.observe(self.on.database_relation_broken, self._reconcile)
         self.framework.observe(self.on.certificates_relation_broken, self._reconcile)
         self.framework.observe(self.on.oauth_relation_broken, self._reconcile)
-        self.framework.observe(self.on.lxd_relation_broken, self._reconcile)
 
         self.framework.observe(self.on.collect_unit_status, self._on_collect_unit_status)
         self.framework.observe(
             self.on.get_oidc_client_config_action, self._on_get_oidc_client_config
         )
-        self.framework.observe(self.on.get_lxd_client_cert_action, self._on_get_lxd_client_cert)
         self.framework.observe(self.on.get_gateway_status_action, self._on_get_gateway_status)
         self.framework.observe(
             self.on.rotate_jwt_signing_key_action, self._on_rotate_jwt_signing_key
@@ -552,8 +548,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         """Generate a self-signed EC P-384 client certificate for LXD mTLS.
 
         Returns a dict with ``certificate`` (PEM) and ``private-key`` (PEM).
-        The CN is ``<app>-<model UUID>`` so the provider can identify the source
-        application in the LXD trust store.
+        The CN is ``<app>-<model UUID>``, which ``lxc auth identity show``
+        reports next to the identity the administrator named.
         """
         return self._generate_client_identity(f"{self.app.name}-{self.model.uuid}")
 
@@ -801,119 +797,100 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         return identity
 
-    def _lxd_connection(self) -> _LxdConnection | None:
-        """Consume the provider's lxd-https databag and return a validated connection.
+    def _lxd_join_token(self) -> tuple[TrustToken | None, str | None]:
+        """Return the operator's LXD trust token, or None and what is wrong.
 
-        Prefers the app bag, then falls back to the unit bag. Returns None unless
-        both ``addresses`` and ``certificate`` are published and the first address
-        passes sanitisation.
+        The token lives in a user secret named by ``lxd-join-secret`` and
+        granted to this application. It stays readable after it has been
+        redeemed: the recorded join outcome is keyed by its digest, so
+        replacing it is how an operator makes the charm join again.
         """
-        rel = self.model.get_relation(LXD_RELATION)
-        if rel is None:
-            return None
+        cfg = self._model_cfg
+        if cfg is None or cfg.lxd_join_secret is None:
+            return None, "lxd-join-secret not set"
+        try:
+            content = self.model.get_secret(id=cfg.lxd_join_secret).get_content(refresh=True)
+        except (ops.SecretNotFoundError, ops.ModelError):
+            return None, "cannot read lxd-join-secret; grant it to this application"
+        raw = content.get(LXD_JOIN_SECRET_KEY)
+        if not raw:
+            return None, f"lxd-join-secret has no {LXD_JOIN_SECRET_KEY!r} key"
+        try:
+            return decode_token(raw), None
+        except TokenError as e:
+            return None, f"lxd-join-secret: {e}"
 
-        data = rel.data.get(rel.app, {}) or {}
-        if not data.get("addresses"):
-            # A non-clustered provider publishes to its *leader's* unit bag, so
-            # every joined unit has to be tried: the leader is not necessarily
-            # the first one iteration yields, and picking a follower's empty bag
-            # would leave this charm waiting for details that are already there.
-            for unit in rel.units:
-                unit_data = rel.data.get(unit, {}) or {}
-                if unit_data.get("addresses"):
-                    data = unit_data
-                    break
+    def _lxd_join_state(self) -> dict[str, str]:
+        """Return the leader's recorded join outcome, or an empty dict."""
+        peer_rel = self.model.get_relation(PEER_RELATION)
+        if peer_rel is None:
+            return {}
+        try:
+            state = json.loads(peer_rel.data[self.app].get(PEER_LXD_JOIN_KEY, "{}"))
+        except ValueError:
+            return {}
+        return state if isinstance(state, dict) else {}
 
-        addresses_raw = data.get("addresses", "")
-        server_ca = data.get("certificate", "")
-        fingerprint_raw = data.get("certificate_fingerprint", "")
-        project_raw = data.get("project", "")
+    def _ensure_lxd_joined(self, identity: dict[str, str]) -> None:
+        """Redeem the trust token with this application's LXD identity (leader only).
 
-        if not addresses_raw or not (server_ca or fingerprint_raw):
-            return None
-
-        # The fingerprint is interpolated into the driver's command line, which
-        # Pebble splits on whitespace, so a value carrying a space would become
-        # extra arguments to the driver. An unusable one is a hard stop rather
-        # than something to drop: silently falling back to CA verification
-        # would change how the server is trusted without saying so.
-        fingerprint = ""
-        if fingerprint_raw:
-            parsed_fingerprint = _parse_lxd_fingerprint(fingerprint_raw)
-            if parsed_fingerprint is None:
-                logger.warning(
-                    "lxd: provider published an unusable certificate fingerprint %r; "
-                    "refusing to build a driver command line from it",
-                    fingerprint_raw,
-                )
-                return None
-            fingerprint = parsed_fingerprint
-
-        # A published-but-unusable project is a hard stop, not something to
-        # silently drop: falling back to LXD's "default" project would place
-        # sandboxes outside the isolation the operator asked for.
-        project: str | None = None
-        if project_raw:
-            project = _parse_lxd_project(project_raw)
-            if project is None:
-                logger.warning(
-                    "lxd: provider published an unusable project name %r; "
-                    "refusing to fall back to the default project",
-                    project_raw,
-                )
-                return None
-
-        # addresses may be a comma-separated list or a JSON list. A single
-        # bracketed IPv6 value such as "[::1]:8443" is not a JSON list, so on
-        # decode failure we fall back to plain comma splitting.
-        addresses = addresses_raw
-        if addresses_raw.startswith("["):
-            with contextlib.suppress(json.JSONDecodeError):
-                addresses = ",".join(json.loads(addresses_raw))
-
-        first = addresses.split(",")[0].strip()
-        parsed = _parse_lxd_address(first)
-        if parsed is None:
-            return None
-
-        return _LxdConnection(
-            url=f"https://{parsed}",
-            server_ca=server_ca or None,
-            fingerprint=fingerprint,
-            project=project,
-        )
-
-    def _publish_lxd_databag(self, identity: dict[str, str]) -> None:
-        """Publish this requirer's certificate and version on the lxd relation.
-
-        Writes to both the application databag (leader-only) and the unit
-        databag. The unit-level copy is required for compatibility with the
-        canonical ``lxd`` charm, which reads the requirer's certificate from
-        the remote unit bag in non-clustered deployments.
+        Runs until joining with the current token succeeds; a failure is
+        recorded and retried on the next event, since the administrator may
+        fix it on the LXD side. The last working address is kept through a
+        failure, so a replaced token that cannot be redeemed yet does not take
+        a running workload down.
         """
-        rel = self.model.get_relation(LXD_RELATION)
-        if rel is None:
-            return
-
-        bag: dict[str, str] = {
-            "version": LXD_INTERFACE_VERSION,
-            "certificate": identity["certificate"],
-        }
-
-        # Unit data can be written by every unit; it is needed by providers
-        # that inspect the remote unit bag (e.g. the canonical lxd charm).
-        rel.data[self.unit].update(bag)
-        # Older revisions of this charm published a "projects" restriction
-        # derived from charm config. Which projects a requirer may reach is the
-        # LXD administrator's decision and now lives on the integrator, so an
-        # upgraded unit clears the key it used to own.
-        rel.data[self.unit].pop("projects", None)
-
         if not self.unit.is_leader():
             return
+        peer_rel = self.model.get_relation(PEER_RELATION)
+        token, _ = self._lxd_join_token()
+        if peer_rel is None or token is None:
+            return
+        state = self._lxd_join_state()
+        if state.get("token") == token.digest and not state.get("error"):
+            return
+        try:
+            address = join(token, identity["certificate"], identity["private-key"])
+            new_state = {
+                "token": token.digest,
+                "address": address,
+                "fingerprint": token.fingerprint,
+            }
+            logger.info("joined LXD at %s as %r", address, token.client_name)
+        except JoinError as e:
+            new_state = {k: v for k, v in state.items() if k in ("address", "fingerprint")}
+            new_state.update(token=token.digest, error=str(e))
+            logger.warning("cannot join LXD: %s", e)
+        peer_rel.data[self.app][PEER_LXD_JOIN_KEY] = json.dumps(new_state, sort_keys=True)
 
-        rel.data[self.app].update(bag)
-        rel.data[self.app].pop("projects", None)
+    def _lxd_connection(self) -> _LxdConnection | None:
+        """Return the LXD connection the leader last joined, or None."""
+        cfg = self._model_cfg
+        if cfg is None or cfg.lxd_project is None:
+            return None
+        state = self._lxd_join_state()
+        # Re-validated on the way out: the values reach the driver's command line.
+        address = _parse_lxd_address(state.get("address", ""))
+        fingerprint = _parse_lxd_fingerprint(state.get("fingerprint", ""))
+        if address is None or fingerprint is None:
+            return None
+        return _LxdConnection(
+            url=f"https://{address}", fingerprint=fingerprint, project=cfg.lxd_project
+        )
+
+    def _lxd_gap(self) -> _Gap | None:
+        """Return what stands between this unit and a joined LXD, or None."""
+        if self._model_cfg is not None and self._model_cfg.lxd_project is None:
+            return _Gap("lxd-project not set", "blocked")
+        token, problem = self._lxd_join_token()
+        if token is None:
+            return _Gap(problem or "lxd-join-secret not set", "blocked")
+        state = self._lxd_join_state()
+        if state.get("token") == token.digest and state.get("error"):
+            return _Gap(f"cannot join LXD: {state['error']}", "blocked")
+        if self._lxd_connection() is None:
+            return _Gap("waiting to join LXD", "waiting")
+        return None
 
     def _readiness_gaps(self) -> list[_Gap]:
         """Return the list of readiness gaps; empty means the unit can be Active.
@@ -951,12 +928,10 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if self._read_sandbox_client_identity() is None:
             gaps.append(_Gap("waiting for sandbox client identity", "waiting"))
 
-        if not self.model.get_relation(LXD_RELATION):
-            gaps.append(_Gap("lxd relation missing", "blocked"))
-        elif self._read_lxd_client_identity() is None:
+        if self._read_lxd_client_identity() is None:
             gaps.append(_Gap("waiting for lxd client identity", "waiting"))
-        elif self._lxd_connection() is None:
-            gaps.append(_Gap("waiting for lxd connection details", "waiting"))
+        elif (lxd_gap := self._lxd_gap()) is not None:
+            gaps.append(lxd_gap)
 
         gaps.extend(self._workload_gaps(container))
 
@@ -1067,13 +1042,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         env["OPENSHELL_DB_URL"] = db_uri
 
         if lxd_connection is not None:
-            # Prefer the fingerprint pin whenever the provider publishes one.
-            # Falling back to the published certificate pins that certificate
-            # (--lxd-server-cert), not a CA: LXD's self-signed certificate
-            # lists only the hostname and the loopback addresses as SANs, so
-            # chain-and-hostname verification rejects the routable address this
-            # pod dials whichever of the two files it is handed.
-            pin_fingerprint = bool(lxd_connection.fingerprint)
             driver_command = render_driver_command(
                 url=lxd_connection.url,
                 default_image=self._model_cfg.sandbox_image,
@@ -1081,8 +1049,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 operation_timeout_secs=self._model_cfg.lxd_operation_timeout_secs,
                 log_level=self._model_cfg.log_level,
                 gateway_endpoint=self._gateway_endpoint(),
-                server_cert=(None if pin_fingerprint else LXD_SERVER_CERT_PATH),
-                server_fingerprint=(lxd_connection.fingerprint if pin_fingerprint else None),
+                server_fingerprint=lxd_connection.fingerprint,
                 project=lxd_connection.project,
                 restrict_sandbox_egress=self._model_cfg.restrict_sandbox_egress,
             )
@@ -1224,7 +1191,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         issuer_url: str,
         lxd_client_cert_pem: str,
         lxd_client_key_pem: str,
-        lxd_server_ca_pem: str | None,
         sandbox_client_cert_pem: str,
         sandbox_client_key_pem: str,
         sandbox_client_ca_pem: str,
@@ -1250,8 +1216,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         # LXD mTLS material for the remote HTTPS driver.
         push(LXD_CLIENT_CERT_PATH, lxd_client_cert_pem, 0o644)
         push(LXD_CLIENT_KEY_PATH, lxd_client_key_pem, 0o600)
-        if lxd_server_ca_pem is not None:
-            push(LXD_SERVER_CERT_PATH, lxd_server_ca_pem, 0o644)
 
         # Sandbox TLS material. The CA is the gateway's own issuer, so a
         # sandbox supervisor can verify the certificate the gateway presents;
@@ -1432,13 +1396,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         jwt = self._ensure_jwt_keypair()
         lxd_identity = self._ensure_lxd_client_identity()
         sandbox_identity = self._ensure_sandbox_client_identity()
+        # Joined as soon as the identity and the token exist, whatever else is
+        # still missing, so an LXD-side problem surfaces early.
+        if lxd_identity is not None:
+            self._ensure_lxd_joined(lxd_identity)
         lxd_conn = self._lxd_connection()
-
-        # Publish the requirer databag as soon as the identity exists and the
-        # relation is present, even if the provider has not yet published its
-        # connection details or other mandatory relations are still missing.
-        if self._model_cfg is not None and lxd_identity is not None:
-            self._publish_lxd_databag(lxd_identity)
 
         if (
             db_uri is None
@@ -1466,7 +1428,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             issuer_url=issuer,
             lxd_client_cert_pem=lxd_identity["certificate"],
             lxd_client_key_pem=lxd_identity["private-key"],
-            lxd_server_ca_pem=lxd_conn.server_ca,
             sandbox_client_cert_pem=sandbox_identity["certificate"],
             sandbox_client_key_pem=sandbox_identity["private-key"],
             sandbox_client_ca_pem=sandbox_identity.get("ca-certificate", ""),
@@ -1483,8 +1444,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             jwt["kid"],
             lxd_identity["certificate"],
             lxd_identity["private-key"],
-            lxd_conn.server_ca or "",
-            lxd_conn.url,
             sandbox_identity["certificate"],
             sandbox_identity["private-key"],
             self._transferred_trust(),
@@ -1506,8 +1465,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         jwt_kid: str,
         lxd_client_cert_pem: str,
         lxd_client_key_pem: str,
-        lxd_server_ca_pem: str,
-        lxd_url: str,
         sandbox_client_cert_pem: str = "",
         sandbox_client_key_pem: str = "",
         transferred_trust: str = "",
@@ -1530,8 +1487,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             + jwt_kid
             + lxd_client_cert_pem
             + lxd_client_key_pem
-            + lxd_server_ca_pem
-            + lxd_url
             + sandbox_client_cert_pem
             + sandbox_client_key_pem
             + transferred_trust
@@ -1655,8 +1610,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 jwt["kid"],
                 lxd_identity["certificate"],
                 lxd_identity["private-key"],
-                lxd_conn.server_ca or "",
-                lxd_conn.url,
                 sandbox_identity["certificate"],
                 sandbox_identity["private-key"],
                 self._transferred_trust(),
@@ -1720,19 +1673,6 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
             }
         )
 
-    def _on_get_lxd_client_cert(self, event: ops.ActionEvent) -> None:
-        identity = self._read_lxd_client_identity()
-        if identity is None:
-            event.fail("LXD client identity not initialised yet")
-            return
-        conn = self._lxd_connection()
-        event.set_results(
-            {
-                "certificate": identity["certificate"],
-                "certificate-fingerprint": conn.fingerprint if conn else "",
-            }
-        )
-
     def _on_get_gateway_status(self, event: ops.ActionEvent) -> None:
         gaps = self._readiness_gaps()
         container = self.unit.get_container(CONTAINER_NAME)
@@ -1755,9 +1695,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
                 "jwt-kid": jwt.get("kid", "") if jwt else "",
                 "workload-running": str(running),
                 "readiness-gaps": ", ".join(g.message for g in gaps) or "none",
-                # The LXD project the provider named, empty when it named none
-                # and the driver therefore uses LXD's own default.
-                "lxd-project": (lxd_conn.project or "") if lxd_conn else "",
+                "lxd-project": (cfg.lxd_project or "") if cfg else "",
+                # Where the driver reaches LXD, empty until the token is redeemed.
+                "lxd-url": lxd_conn.url if lxd_conn else "",
                 # The address sandbox supervisors are told to dial back on.
                 # Operators need to see this: it has to be reachable from the
                 # sandbox network, which an in-cluster address rarely is.

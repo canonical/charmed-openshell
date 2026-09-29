@@ -11,7 +11,6 @@ from charm import (
     APPLIED_HASH_KEY,
     CONTAINER_NAME,
     DRIVER_SERVICE_NAME,
-    LXD_RELATION,
     PEER_RELATION,
     PEER_SANDBOX_SECRET_ID_KEY,
     PEER_SANDBOX_SECRET_LABEL,
@@ -47,11 +46,7 @@ _FAKE_SANDBOX_IDENTITY = {
     "certificate": "-----BEGIN CERTIFICATE-----\nSBXCERT\n-----END CERTIFICATE-----",
     "private-key": "-----BEGIN PRIVATE KEY-----\nSBXKEY\n-----END PRIVATE KEY-----",
 }
-_LXD_CONN = _LxdConnection(
-    url="https://10.0.0.1:8443",
-    server_ca="-----BEGIN CERTIFICATE-----\nSERVERCA\n-----END CERTIFICATE-----",
-    fingerprint="ab:cd:ef",
-)
+_LXD_CONN = _LxdConnection(url="https://10.0.0.1:8443", fingerprint="c" * 64, project="openshell")
 
 
 def _fake_provider_info():
@@ -151,7 +146,6 @@ class TestRestartAction:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
         )
         with (
@@ -196,6 +190,7 @@ class TestRestartAction:
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_gap", return_value=None),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out = ctx.run(ctx.on.action("restart"), state)
@@ -286,6 +281,7 @@ class TestRotateJwtSigningKey:
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_gap", return_value=None),
         ):
             out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
         results = ctx.action_results
@@ -329,6 +325,7 @@ class TestRotateJwtSigningKey:
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_gap", return_value=None),
         ):
             out = ctx.run(ctx.on.action("rotate-jwt-signing-key"), state)
         results = ctx.action_results
@@ -363,7 +360,6 @@ class TestRotateJwtSigningKey:
                 Relation("database"),
                 Relation("certificates"),
                 Relation("oauth"),
-                Relation(LXD_RELATION),
             ],
             secrets=[secret],
         )
@@ -398,6 +394,7 @@ class TestRotateJwtSigningKey:
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_gap", return_value=None),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out1 = ctx.run(ctx.on.pebble_ready(Container(CONTAINER_NAME, can_connect=True)), state)
@@ -436,6 +433,7 @@ class TestRotateJwtSigningKey:
                 return_value=_FAKE_SANDBOX_IDENTITY,
             ),
             patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN),
+            patch.object(OpenshellGatewayK8sCharm, "_lxd_gap", return_value=None),
             patch("ops.model.Container.restart") as restart_mock,
         ):
             out2 = ctx.run(ctx.on.action("rotate-jwt-signing-key"), out1)
@@ -503,6 +501,13 @@ class TestGatewayStatusReportsWhatStatusCannotSay:
     def test_the_number_of_transferred_trust_anchors_is_reported(self):
         assert self._results()["received-ca-certificates"] == "0"
 
+    def test_where_the_driver_reaches_lxd_is_reported(self):
+        results = self._results(**{"lxd-project": "openshell"})
+        assert results["lxd-project"] == "openshell"
+        assert results["lxd-url"] == ""
+        with patch.object(OpenshellGatewayK8sCharm, "_lxd_connection", return_value=_LXD_CONN):
+            assert self._results(**{"lxd-project": "openshell"})["lxd-url"] == _LXD_CONN.url
+
 
 class TestRotateSandboxClientIdentity:
     """Rotating the sandbox identity has to rotate the CA, not just the leaf."""
@@ -512,7 +517,6 @@ class TestRotateSandboxClientIdentity:
             Relation("database"),
             Relation("certificates"),
             Relation("oauth"),
-            Relation(LXD_RELATION),
         ]
         secrets = []
         if with_secret:

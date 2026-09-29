@@ -76,12 +76,6 @@ requires:
   ingress:
     interface: traefik_route
     limit: 1
-  lxd:
-    interface: lxd-https
-    limit: 1
-    # The provider also names the LXD project sandboxes are created in. That
-    # is the LXD administrator's decision, so it arrives over this relation
-    # rather than through this charm's config.
   receive-ca-cert:
     interface: certificate_transfer
     optional: true
@@ -113,12 +107,11 @@ provides:
 actions:
   get-oidc-client-config:
     description: Return the OIDC client configuration for CLI consumers.
-  get-lxd-client-cert:
-    description: Return this application's LXD client certificate and the provider's fingerprint.
   get-gateway-status:
     description: >
       Report the current readiness, health and configuration state of the
-      gateway: the LXD project sandboxes are created in, the endpoint sandbox
+      gateway: the LXD project sandboxes are created in and the LXD address
+      the driver uses, the endpoint sandbox
       supervisors are told to dial back on, whether each workload service and
       Pebble check is up, and the settings that govern what a sandbox can
       reach and which registries are trusted.
@@ -244,6 +237,24 @@ config:
         workloads, so this is on by default. LXD applies network ACLs to
         individual NICs only on OVN networks; set it to false when sandboxes
         run on a bridge, where the driver cannot enforce it.
+    lxd-join-secret:
+      type: secret
+      description: >
+        URI of a Juju user secret holding, under the key "token", the trust
+        token of a pending LXD TLS identity, as printed by
+        "lxc auth identity create tls/<name> --group <group>". Grant the
+        secret to this application with "juju grant-secret". The leader
+        redeems the token with the application's own LXD client certificate,
+        so its private key never leaves the charm; the group decides what the
+        gateway may do in LXD. The token carries the server's addresses and
+        certificate fingerprint. To join again, for example after the identity
+        was deleted in LXD, put a new token in the secret.
+    lxd-project:
+      type: string
+      description: >
+        LXD project the driver creates sandboxes in. The identity behind
+        lxd-join-secret needs access to it, and should have access to nothing
+        else.
     lxd-operation-timeout-secs:
       type: int
       default: 60
