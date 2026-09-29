@@ -153,7 +153,7 @@ runs:
         echo "MICROCLOUD_INTERNAL_ADDR=${internal_addr}" >> "$GITHUB_ENV"
 
     # MicroCloud falls back to a FAN network when it cannot set up OVN; the
-    # integrator suite cannot create sandboxes off OVN, so fail here instead.
+    # LXD suite cannot create sandboxes off OVN, so fail here instead.
     - name: Initialize MicroCloud
       shell: bash
       env:

@@ -100,22 +100,6 @@ def fail_on_app_error(
     return _error
 
 
-def wait_for_gateway_blocked(
-    juju: jubilant.Juju,
-    message: str = "lxd relation missing",
-    timeout: int = 300,
-) -> None:
-    """Wait until the gateway reports a blocked status containing *message*."""
-
-    def _blocked(status: jubilant.Status) -> bool:
-        app = status.apps.get(APP_NAME)
-        if app is None:
-            return False
-        return app.app_status.current == "blocked" and message in (app.app_status.message or "")
-
-    juju.wait(_blocked, timeout=timeout)
-
-
 def wait_for_workload_running(juju: jubilant.Juju, timeout: int = 900) -> dict[str, str]:
     """Wait until the gateway action reports workload-running=True."""
     deadline = time.monotonic() + timeout

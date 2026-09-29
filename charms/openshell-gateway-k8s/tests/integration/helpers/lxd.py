@@ -1,4 +1,4 @@
-"""LXD trust store and project inspection helpers."""
+"""LXD identity, join-secret and project inspection helpers."""
 
 from __future__ import annotations
 
@@ -12,78 +12,97 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
-from .constants import APP_NAME
+from ..lxd_host import create_pending_identity
+from .constants import APP_NAME, IT_GROUP, IT_IDENTITY, IT_PROJECT, LXD_JOIN_SECRET
 from .juju_wait import gateway_status
 
 if TYPE_CHECKING:
     import jubilant
 
+#: The label the charm gives the peer secret holding its LXD client identity.
+LXD_CLIENT_IDENTITY_LABEL = "lxd-client-identity"
+
 
 def gateway_client_cert_fingerprint(juju: jubilant.Juju) -> str:
-    """Return the SHA-256 fingerprint of the gateway's LXD client certificate."""
-    result = juju.run(f"{APP_NAME}/0", "get-lxd-client-cert")
-    assert result.status == "completed", result
-    cert_pem = result.results.get("certificate")
-    assert cert_pem, "get-lxd-client-cert did not return a client certificate"
+    """Return the SHA-256 fingerprint of the gateway's LXD client certificate.
+
+    Read from the charm's own secret, which an admin can reveal: the
+    certificate is what LXD records as the identity's fingerprint once the
+    token is redeemed.
+    """
+    matches = [s for s in juju.secrets() if s.label == LXD_CLIENT_IDENTITY_LABEL]
+    assert matches, f"no secret labelled {LXD_CLIENT_IDENTITY_LABEL}"
+    revealed = juju.show_secret(matches[0].uri, reveal=True)
+    cert_pem = getattr(revealed, "content", {}).get("certificate")
+    assert cert_pem, f"secret {LXD_CLIENT_IDENTITY_LABEL} carries no certificate"
     cert = x509.load_pem_x509_certificate(cert_pem.encode())
-    der = cert.public_bytes(serialization.Encoding.DER)
-    return hashlib.sha256(der).hexdigest()
+    return hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()
 
 
-def lxc_trust_fingerprints(runner: Any) -> set[str]:
-    """Return the set of certificate fingerprints from ``lxc config trust list``."""
-    result = runner("query", "/1.0/certificates?recursion=1")
-    stdout = result.stdout if hasattr(result, "stdout") else str(result)
-    certs = json.loads(stdout)
-    return {cert["fingerprint"].lower() for cert in certs}
+def put_join_secret(juju: jubilant.Juju, token: str) -> str:
+    """Store *token* in the ``lxd-join`` user secret, grant it, and return its URI.
+
+    A secret left from an earlier run against the same model gets a new
+    revision instead of a second secret.
+    """
+    existing = [s for s in juju.secrets() if s.name == LXD_JOIN_SECRET]
+    if existing:
+        uri = str(existing[0].uri)
+        juju.update_secret(uri, {"token": token})
+    else:
+        uri = str(juju.add_secret(LXD_JOIN_SECRET, {"token": token}))
+    juju.grant_secret(uri, APP_NAME)
+    return uri
 
 
-def assert_trust_registered(
-    juju: jubilant.Juju,
-    fingerprint_source: Any,
-    *,
-    timeout: int = 300,
+def join_gateway_to_lxd(juju: jubilant.Juju, runner: Any) -> str:
+    """Create a fresh pending identity, hand its token to the gateway, and return the URI.
+
+    The secret is granted before the gateway's config names it: a grant fires
+    no hook, while the config change that follows reads the granted secret.
+    With the config already in place, the new secret revision fires
+    secret-changed instead.
+    """
+    token = create_pending_identity(runner, IT_IDENTITY, IT_GROUP)
+    uri = put_join_secret(juju, token)
+    juju.config(APP_NAME, {"lxd-join-secret": uri, "lxd-project": IT_PROJECT})
+    return uri
+
+
+def remove_join_secret(juju: jubilant.Juju) -> None:
+    """Remove the ``lxd-join`` user secret if it exists."""
+    for secret in juju.secrets():
+        if secret.name == LXD_JOIN_SECRET:
+            juju.remove_secret(secret.uri)
+
+
+def wait_for_gateway_message(
+    juju: jubilant.Juju, message: str, *, status: str = "blocked", timeout: int = 600
 ) -> None:
-    """Poll until the gateway's client certificate is trusted by the LXD."""
-    expected = gateway_client_cert_fingerprint(juju)
+    """Wait until the gateway's application status is *status* and names *message*."""
+
+    def _reached(s: jubilant.Status) -> bool:
+        app = s.apps.get(APP_NAME)
+        if app is None:
+            return False
+        return app.app_status.current == status and message in (app.app_status.message or "")
+
+    juju.wait(_reached, timeout=timeout)
+
+
+def wait_for_identity_trusted(
+    identity: Callable[[], dict[str, Any]], fingerprint: str, *, timeout: int = 600
+) -> dict[str, Any]:
+    """Poll until *identity* is redeemed by the certificate with *fingerprint*."""
     deadline = time.monotonic() + timeout
+    last: dict[str, Any] = {}
     while True:
-        fingerprints = fingerprint_source()
-        if expected in fingerprints:
-            return
+        last = identity()
+        if last.get("type") == "Client certificate" and last.get("id") == fingerprint:
+            return last
         if time.monotonic() > deadline:
-            pytest.fail(f"gateway cert {expected} not registered in LXD trust store")
+            pytest.fail(f"identity was not redeemed by {fingerprint} within {timeout}s: {last}")
         time.sleep(5)
-
-
-def assert_trust_withdrawn(
-    juju: jubilant.Juju,
-    fingerprint_source: Any,
-    *,
-    timeout: int = 300,
-) -> None:
-    """Poll until the gateway's client certificate is removed from the LXD trust store."""
-    expected = gateway_client_cert_fingerprint(juju)
-    deadline = time.monotonic() + timeout
-    while True:
-        fingerprints = fingerprint_source()
-        if expected not in fingerprints:
-            return
-        if time.monotonic() > deadline:
-            pytest.fail(f"gateway cert {expected} still present in LXD trust store")
-        time.sleep(5)
-
-
-def managed_lxd_trust_fingerprints(
-    machine_juju: jubilant.Juju,
-    app: str = "lxd",
-) -> set[str]:
-    """Read the trust store of the LXD charm's managed LXD via ``juju exec``."""
-
-    def runner(*args: str) -> Any:
-        return machine_juju.exec("lxc", *args, unit=f"{app}/0")
-
-    return lxc_trust_fingerprints(runner)
 
 
 def wait_for_lxd_project(juju: jubilant.Juju, expected: str, timeout: int = 300) -> dict[str, str]:
@@ -106,17 +125,6 @@ def wait_for_lxd_project(juju: jubilant.Juju, expected: str, timeout: int = 300)
                 f"after {timeout}s, expected {expected!r}"
             )
         time.sleep(5)
-
-
-def lxc_trust_entry(runner: Callable[..., Any], fingerprint: str) -> dict[str, Any]:
-    """Return the LXD trust-store entry for *fingerprint*, or an empty dict."""
-    result = runner("config", "trust", "list", "--format=json")
-    if result.returncode != 0:
-        pytest.fail(f"could not list the LXD trust store: {result.stderr}")
-    for entry in json.loads(result.stdout or "[]"):
-        if entry.get("fingerprint", "").lower() == fingerprint.lower():
-            return entry
-    return {}
 
 
 def lxc_instance_projects(runner: Callable[..., Any], name_prefix: str) -> dict[str, str]:
