@@ -352,15 +352,16 @@ def stack_deployment(stack_environment: dict[str, str]) -> Generator[StackDeploy
     lxd.ensure_project_group(LXD_GROUP, project, network)
 
     handle = jubilant.Juju(model=model_name)
-    # A named user secret is created once: a re-run against a deployed
-    # model reuses the one the earlier run minted, whose token the gateway
-    # has already redeemed. A fresh model gets a fresh identity, replacing
-    # whatever an earlier, torn-down run left behind under the same name.
+    # Always a fresh identity and token: a re-run against a surviving model
+    # deploys a new gateway, with a new client certificate, and the token the
+    # earlier run redeemed is spent. The secret itself is reused.
+    lxd.delete_tls_identity(LXD_IDENTITY)
+    token = lxd.create_pending_identity(LXD_IDENTITY, LXD_GROUP)
     secret_uri = _user_secret_uri(handle, JOIN_SECRET)
     if secret_uri is None:
-        lxd.delete_tls_identity(LXD_IDENTITY)
-        token = lxd.create_pending_identity(LXD_IDENTITY, LXD_GROUP)
         secret_uri = handle.add_secret(JOIN_SECRET, {"token": token})
+    else:
+        handle.cli("update-secret", JOIN_SECRET, f"token={token}")
 
     payload: dict[str, Any] = {
         "models": {"openshell": {"uuid": _model_uuid(model_name)}},
