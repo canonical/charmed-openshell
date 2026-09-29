@@ -483,3 +483,9 @@ The leader redeems a new token as soon as the secret changes. While the
 gateway's identity is still trusted, it does not redeem a new token at all:
 it keeps the identity it has, and the new token stays pending in LXD until
 you delete it.
+
+The gateway only counts itself as joined when LXD trusts its certificate as
+the token's identity. If LXD trusts the certificate some other way, for
+example through an ``lxc config trust add`` entry, the gateway stays blocked
+with ``cannot join LXD: LXD already trusts this certificate``: remove that
+entry, and it redeems the token.

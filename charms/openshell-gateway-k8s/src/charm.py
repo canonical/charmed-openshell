@@ -797,8 +797,11 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
 
         return identity
 
-    def _lxd_join_token(self) -> tuple[TrustToken | None, str | None]:
+    def _lxd_join_token(self, refresh: bool = False) -> tuple[TrustToken | None, str | None]:
         """Return the operator's LXD trust token, or None and what is wrong.
+
+        Only reconcile passes *refresh*, which moves this application on to
+        the secret's latest revision; status reads peek, without side effects.
 
         The token lives in a user secret named by ``lxd-join-secret`` and
         granted to this application. It stays readable after it has been
@@ -809,7 +812,8 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if cfg is None or cfg.lxd_join_secret is None:
             return None, "lxd-join-secret not set"
         try:
-            content = self.model.get_secret(id=cfg.lxd_join_secret).get_content(refresh=True)
+            secret = self.model.get_secret(id=cfg.lxd_join_secret)
+            content = secret.get_content(refresh=True) if refresh else secret.peek_content()
         except (ops.SecretNotFoundError, ops.ModelError):
             return None, "cannot read lxd-join-secret; grant it to this application"
         raw = content.get(LXD_JOIN_SECRET_KEY)
@@ -843,7 +847,7 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         if not self.unit.is_leader():
             return
         peer_rel = self.model.get_relation(PEER_RELATION)
-        token, _ = self._lxd_join_token()
+        token, _ = self._lxd_join_token(refresh=True)
         if peer_rel is None or token is None:
             return
         state = self._lxd_join_state()
@@ -1396,8 +1400,9 @@ class OpenshellGatewayK8sCharm(ops.CharmBase):
         jwt = self._ensure_jwt_keypair()
         lxd_identity = self._ensure_lxd_client_identity()
         sandbox_identity = self._ensure_sandbox_client_identity()
-        # Joined as soon as the identity and the token exist, whatever else is
-        # still missing, so an LXD-side problem surfaces early.
+        # Joined as soon as the container is reachable and the identity and the
+        # token exist, whatever relation is still missing, so an LXD-side
+        # problem surfaces early.
         if lxd_identity is not None:
             self._ensure_lxd_joined(lxd_identity)
         lxd_conn = self._lxd_connection()
