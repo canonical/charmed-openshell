@@ -1,10 +1,29 @@
 name: CI (terraform)
 
 on:
+  # On a pull request only the static checks run. The stack integration
+  # deploys the gateway from Charmhub, so it cannot pass until a revision
+  # carrying the current options is published; it runs post-merge instead
+  # (see the workflow_run and push triggers below).
   pull_request:
     paths:
       - terraform/**
       - concierge.yaml
+      - .github/workflows/ci-terraform.yaml
+      - .github/actions/setup-microcloud/**
+      - charms/openshell-gateway-k8s/tests/integration/test_stack.py
+  # After the charm is uploaded to latest/edge, exercise the stack module
+  # against the revision that was just published.
+  workflow_run:
+    workflows: ["Release (gateway)"]
+    types: [completed]
+  # A terraform-only landing on main runs the stack integration against
+  # whatever revision edge currently carries.
+  push:
+    branches:
+      - main
+    paths:
+      - terraform/**
       - .github/workflows/ci-terraform.yaml
       - .github/actions/setup-microcloud/**
       - charms/openshell-gateway-k8s/tests/integration/test_stack.py
@@ -43,6 +62,12 @@ jobs:
     needs: [validate]
     runs-on: [self-hosted-linux-amd64-noble-large]
     timeout-minutes: 240
+    # Static checks are the whole of a pull request. Post-merge, the stack
+    # integration runs after a successful charm release, or directly for a
+    # terraform-only landing.
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     env:
       VM_NAME: openshell-stack-k8s
       VM_CPU: "8"
