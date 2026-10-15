@@ -299,6 +299,22 @@ rolling-restart callback catch it and let the next event converge. Do not reintr
 a hook failure for it: the integration models run with `automatically-retry-hooks`
 off, so one slow call leaves the unit in error for good.
 
+### Status evaluation reaches Vault; keep that call short
+
+ops evaluates `collect-unit-status` at the end of *every* hook, and the unit
+status path reads the JWT keypair from whichever store is authoritative — an
+AppRole login plus a KV read against Vault when the `vault-kv` relation exists.
+A `vault-kv-relation-departed` hook therefore blocks on Vault while Juju holds
+every action queued behind it. hvac's 30s-per-request default lets a slow or
+unreachable Vault stretch one hook past the 60s an action waits for, so
+`vault_store._client` passes `VAULT_TIMEOUT_SECONDS` (well under that) and a
+failure surfaces as `VaultUnavailableError` for the charm to wait out. Do not
+drop the timeout, and do not add unbounded network calls to `_readiness_gaps`.
+An integration test that removes the relation must wait for the agents to go
+idle, not only for `all_active` — the app stays active for the whole of the
+departed hook, so an `all_active`-only wait returns on stale status and the
+action lands behind the hook.
+
 ### The sandbox client certificate gates connections; the JWT identifies sandboxes
 
 Every sandbox gets the same client certificate, and the gateway verifies it —

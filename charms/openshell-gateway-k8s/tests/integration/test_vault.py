@@ -341,7 +341,16 @@ class TestVaultStore:
         juju.cli(
             "remove-relation", f"{APP_NAME}:{VAULT_RELATION}", f"{VAULT_APP}:{VAULT_RELATION}"
         )
-        juju.wait(lambda s: jubilant.all_active(s, APP_NAME), timeout=1800)
+        # The removal runs a vault-kv-relation-departed hook on the gateway and
+        # then a broken hook that switches the store back. The app status stays
+        # active for the whole of that, so waiting on all_active alone returns
+        # on the pre-removal status and lets the status action queue behind the
+        # departed hook, where it hits the action wait. Wait for the agents to
+        # actually settle first.
+        juju.wait(
+            lambda s: jubilant.all_active(s, APP_NAME) and jubilant.all_agents_idle(s, APP_NAME),
+            timeout=1800,
+        )
 
         after = _wait_for_jwt_store(juju, "juju-secret")
         assert after["workload-running"] == "True", after
