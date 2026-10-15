@@ -70,11 +70,6 @@ TLS_DIR: str = "/etc/openshell/tls"
 LXD_DIR: str = "/etc/openshell/lxd"
 LXD_CLIENT_CERT_PATH: str = f"{LXD_DIR}/client.crt"
 LXD_CLIENT_KEY_PATH: str = f"{LXD_DIR}/client.key"
-# The certificate the LXD server presents, as the provider published it. It is
-# pinned with the driver's --lxd-server-cert, not trusted as a CA: LXD's own
-# certificate is self-signed and names only its hostname and the loopback
-# addresses, so CA verification rejects the routable address this pod dials.
-LXD_SERVER_CERT_PATH: str = f"{LXD_DIR}/server.crt"
 
 # The image's own CA bundle, and the charm's pristine copy of it.
 # The charm adds its CA to the system bundle so the workload trusts the
@@ -148,6 +143,8 @@ class GatewayConfig(pydantic.BaseModel):
     insecure_registries: str | None = Field(default=None, alias="insecure-registries")
     restrict_sandbox_egress: bool = Field(default=True, alias="restrict-sandbox-egress")
     lxd_operation_timeout_secs: int = Field(default=60, alias="lxd-operation-timeout-secs", gt=0)
+    lxd_join_secret: str | None = Field(default=None, alias="lxd-join-secret")
+    lxd_project: str | None = Field(default=None, alias="lxd-project")
 
     # ------------------------------------------------------------------
     # Field validators
@@ -158,6 +155,8 @@ class GatewayConfig(pydantic.BaseModel):
         "oidc_admin_role",
         "oidc_user_role",
         "insecure_registries",
+        "lxd_join_secret",
+        "lxd_project",
         mode="before",
     )
     @classmethod
@@ -182,6 +181,7 @@ class GatewayConfig(pydantic.BaseModel):
         "sandbox_image",
         "supervisor_image",
         "insecure_registries",
+        "lxd_join_secret",
         mode="after",
     )
     @classmethod
@@ -199,6 +199,19 @@ class GatewayConfig(pydantic.BaseModel):
             raise PydanticCustomError(
                 "control_characters",
                 "config value must not contain C0 control characters or DEL",
+            )
+        return v
+
+    @field_validator("lxd_project", mode="after")
+    @classmethod
+    def _lxd_project_name(cls, v: str | None) -> str | None:
+        """Reject a project name the driver's command line cannot carry safely."""
+        if v is None:
+            return v
+        if _parse_lxd_project(v) != v:
+            raise PydanticCustomError(
+                "lxd_project_name",
+                "lxd-project must be 1-63 letters, digits, dots, hyphens or underscores",
             )
         return v
 
@@ -450,25 +463,19 @@ def render_driver_command(
     operation_timeout_secs: int,
     log_level: str,
     gateway_endpoint: str,
-    server_cert: str | None = None,
-    server_fingerprint: str | None = None,
-    project: str | None = None,
+    server_fingerprint: str,
+    project: str,
     restrict_sandbox_egress: bool = True,
 ) -> str:
     """Return the full ``openshell-driver-lxd`` command line for remote HTTPS+mTLS.
 
     The local unix-socket path is intentionally absent; the driver is wired to
-    a remote LXD over HTTPS using the provider's address and pinned CA or
-    certificate fingerprint.
+    a remote LXD over HTTPS.
 
-    Exactly one of ``server_cert`` or ``server_fingerprint`` must be supplied.
-    ``server_cert`` is a path to the certificate the LXD server presents, which
-    the driver pins with ``--lxd-server-cert`` — trusted for whatever names it
-    carries, as ``lxc remote add`` does. It is deliberately not passed as
-    ``--lxd-server-ca``: that loads the file as a trust anchor and then does
-    ordinary chain and hostname verification, which LXD's self-signed
-    certificate — naming only its hostname and the loopback addresses — cannot
-    satisfy for the routable address this pod dials.
+    ``server_fingerprint`` pins the certificate the LXD server presents, as
+    ``lxc remote add`` does. LXD's certificate is self-signed and names only
+    its hostname and the loopback addresses, so chain and hostname
+    verification would reject the routable address this pod dials.
 
     ``gateway_endpoint`` is passed verbatim to the driver's ``--gateway-endpoint``
     flag and becomes each sandbox's ``OPENSHELL_ENDPOINT``. It must be a full URL
@@ -479,10 +486,8 @@ def render_driver_command(
     warns that a mismatched pair fails to sync policy and exits.
 
     ``project`` is the LXD project the driver places every sandbox, image and
-    operation in.  It comes from the provider over the ``lxd-https`` relation,
-    never from charm config: which project a requirer may use is the LXD
-    administrator's decision, and the integrator holds it.  Left unset, the
-    driver falls back to its own default (the LXD ``default`` project).
+    operation in. It is always passed: the driver's own fallback is LXD's
+    ``default`` project, which the gateway's identity has no access to.
 
     The sandbox TLS material is always passed.  The driver refuses to start
     without it unless plaintext is explicitly allowed, and this charm never
@@ -495,15 +500,6 @@ def render_driver_command(
     host and the LXD API itself.  It needs sandboxes on an OVN network, which
     is the only place LXD applies ACLs to individual NICs.
     """
-    if (server_cert is None) == (server_fingerprint is None):
-        raise ValueError("exactly one of server_cert or server_fingerprint must be set")
-
-    trust_arg = (
-        f" --lxd-server-cert {server_cert}"
-        if server_cert is not None
-        else f" --lxd-server-fingerprint {server_fingerprint}"
-    )
-    project_arg = f" --project {project}" if project is not None else ""
     egress_arg = " --restrict-sandbox-egress" if restrict_sandbox_egress else ""
 
     return (
@@ -512,8 +508,8 @@ def render_driver_command(
         f" --lxd-url {url}"
         f" --lxd-client-cert {LXD_CLIENT_CERT_PATH}"
         f" --lxd-client-key {LXD_CLIENT_KEY_PATH}"
-        f"{trust_arg}"
-        f"{project_arg}"
+        f" --lxd-server-fingerprint {server_fingerprint}"
+        f" --project {project}"
         f"{egress_arg}"
         f" --default-image {default_image}"
         f" --supervisor-image {supervisor_image}"
@@ -593,8 +589,8 @@ def _parse_lxd_address(raw: str) -> str | None:
 def _parse_lxd_project(raw: str) -> str | None:
     """Validate and return an LXD project name, or None.
 
-    The value arrives over the ``lxd-https`` relation from the integrator and
-    is interpolated into the driver's command line, so the accepted charset is
+    The value comes from the ``lxd-project`` option and is interpolated into
+    the driver's command line, so the accepted charset is
     deliberately narrow: letters, digits, dot, hyphen and underscore, up to the
     63 characters LXD allows. Anything else — whitespace, control characters,
     shell or path metacharacters, an over-long name — is rejected rather than
@@ -622,8 +618,8 @@ def _parse_lxd_project(raw: str) -> str | None:
 def _parse_lxd_fingerprint(raw: str) -> str | None:
     """Validate and return a lowercase SHA-256 hex fingerprint, or None.
 
-    The value arrives over the ``lxd-https`` relation and is interpolated into
-    the driver's command line, which Pebble splits on whitespace. A value
+    The value arrives in the LXD trust token and is interpolated into the
+    driver's command line, which Pebble splits on whitespace. A value
     carrying a space therefore becomes extra arguments to the driver, so the
     accepted form is exactly what a digest can be: 64 hex characters, with the
     colons LXD's own output uses optionally present.

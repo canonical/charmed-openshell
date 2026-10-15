@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -378,6 +380,25 @@ class TestVaultStoreUnit:
 
 
 class TestClientErrors:
+    def test_requests_to_vault_are_bounded(self):
+        # Status is evaluated at the end of every hook and reads the keypair,
+        # which with a vault-kv relation is a login plus a KV read against
+        # Vault. Leaving hvac's 30s-per-request default in place lets a slow or
+        # unreachable Vault hold a hook past the wait an operator action (or a
+        # queued relation-removal action) is allowed.
+        store = object.__new__(vault_store.VaultJwtStore)
+        hvac = MagicMock()
+        connection = ("https://vault.example:8200", "ca", "mount", "role", "role-secret")
+        with (
+            patch.object(vault_store.VaultJwtStore, "_connection", return_value=connection),
+            patch.dict(sys.modules, {"hvac": hvac}),
+            tempfile.TemporaryDirectory() as ca_dir,
+        ):
+            vault_store.VaultJwtStore._client(store, Path(ca_dir))
+
+        assert hvac.Client.call_args.kwargs["timeout"] == vault_store.VAULT_TIMEOUT_SECONDS
+        assert vault_store.VAULT_TIMEOUT_SECONDS < 30
+
     def test_a_login_failure_becomes_unavailable_not_a_crash(self):
         # Vault sealed, a CIDR restriction that does not yet match this pod, a
         # certificate mid-rotation: none of these should fail the hook.

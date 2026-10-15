@@ -7,7 +7,7 @@ its published module and in its own model:
 
 | Model | What it runs | Where it comes from |
 |---|---|---|
-| `openshell` | the gateway, its integrator, PostgreSQL, Traefik and CA, optionally Vault and the collector | the in-repo [`terraform/openshell`](../openshell) module, unchanged |
+| `openshell` | the gateway, PostgreSQL, Traefik and CA, optionally Vault and the collector | the in-repo [`terraform/openshell`](../openshell) module, unchanged |
 | `iam` | Hydra, Kratos and the login UI | [canonical/iam-bundle-integration](https://github.com/canonical/iam-bundle-integration), pinned and overridable |
 | `core` | PostgreSQL, Traefik and a CA the identity platform consumes offers from | declared by this module |
 | `cos-lite` | Prometheus, Loki, Grafana and friends | [canonical/observability-stack](https://github.com/canonical/observability-stack) `cos-lite`, pinned and overridable |
@@ -33,7 +33,7 @@ module "openshell-stack" {
   source = "git::https://github.com/canonical/charmed-openshell//terraform/openshell-stack"
 
   models = {
-    # Created beforehand, so the LXD credentials secret can live in it.
+    # Created beforehand, so the LXD join secret can live in it.
     openshell = { uuid = "744c5ae5-0183-4375-8b0f-aea59268f8f3" }
   }
 
@@ -45,13 +45,9 @@ module "openshell-stack" {
     # Both OpenShell charms publish to latest/edge only.
     gateway = { channel = "latest/edge" }
 
-    integrator = {
-      channel = "latest/edge"
-      config = {
-        "lxd-endpoints"   = "192.168.1.166:8443"
-        "lxd-credentials" = "secret:d6mlp2o0p26r50dt2sd0"
-        "project"         = "openshell"
-      }
+    lxd = {
+      join_secret = "secret:d6mlp2o0p26r50dt2sd0"
+      project     = "openshell"
     }
   }
 }
@@ -94,30 +90,7 @@ logins fail at authorization.
 
 ## What you have to do yourself
 
-- **Create the `openshell` model and the LXD credentials secret.**
-  `openshell.integrator.config.lxd-credentials` names a Juju secret holding
-  `client-cert`, `client-key` and `server-cert`. Terraform does not create it:
-  the secret carries an administrative LXD client key, which should not pass
-  through Terraform state. A secret lives in a model and its URI has to be in
-  the configuration before the apply, so create the model first and hand it to
-  the stack as `models.openshell.uuid`:
-
-  ```console
-  juju add-model openshell
-  juju add-secret lxd-credentials -m openshell \
-      client-cert#file=client.crt client-key#file=client.key server-cert#file=server.crt
-  ```
-
-  Grant it after the apply, once the integrator exists. The grant fires no
-  hook; the integrator reads the secret at a later `update-status` (every
-  five minutes by default, though close to 13 minutes passed in testing) and
-  stays blocked until then.
-
-  ```console
-  juju grant-secret lxd-credentials lxd-integrator-k8s -m openshell
-  ```
-
-- **Create the LXD project** named in `openshell.integrator.config.project`,
+- **Create the LXD project** named in `openshell.lxd.project`,
   with a `default` profile that names an OVN network and a storage pool. The
   driver reads sandbox placement from that profile and never creates the
   project itself. Create the project with `features.networks=true` when the
@@ -125,6 +98,34 @@ logins fail at authorization.
   silently creates the network in the `default` project. Sandbox images are
   OCI references the driver pulls itself, so the project needs no image
   alias.
+
+- **Create the gateway's LXD identity, the `openshell` model and the join
+  secret.** On the LXD, create a group with access to the sandbox project
+  only and a pending TLS identity in it; `lxc auth identity create` prints a
+  single-use trust token (with stdin at `/dev/null`: without a certificate
+  argument it otherwise waits for one on stdin whenever stdin is not a
+  terminal). `openshell.lxd.join_secret` names a Juju secret
+  holding that token under `token`. Terraform does not create it, so the
+  token does not pass through Terraform state. A secret lives in a model and
+  its URI has to be in the configuration before the apply, so create the
+  model first and hand it to the stack as `models.openshell.uuid`:
+
+  ```console
+  lxc auth group create openshell-gateway
+  lxc auth group permission add openshell-gateway project openshell operator
+  lxc auth identity create tls/openshell-gateway --group openshell-gateway --quiet < /dev/null > lxd-join.token
+  juju add-model openshell
+  juju add-secret lxd-join -m openshell token#file=lxd-join.token
+  ```
+
+  Grant it after the apply, once the gateway exists. The grant fires no
+  hook; the gateway reads the secret and redeems the token at a later
+  `update-status` (every five minutes by default) and stays blocked with
+  `cannot read lxd-join-secret; grant it to this application` until then.
+
+  ```console
+  juju grant-secret lxd-join openshell-gateway-k8s -m openshell
+  ```
 
 - **Make both hostnames routable.** `openshell.external_hostname` has to be
   routable from the sandbox network, as the existing module documents.

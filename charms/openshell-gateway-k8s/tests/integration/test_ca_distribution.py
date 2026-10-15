@@ -18,7 +18,7 @@ from .helpers import (
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.integrator]
+pytestmark = [pytest.mark.lxd]
 
 EXTRA_CA_APP = "extra-ca-certificates"
 
@@ -29,7 +29,7 @@ class TestCaDistribution:
     def test_receive_ca_cert_preserves_public_roots(
         self,
         juju: jubilant.Juju,
-        integrator_provider: None,
+        lxd_joined: None,
     ) -> None:
         """Adding a CA via receive-ca-cert updates the bundle without dropping roots."""
         logger.info("Deploying %s as extra CA provider", EXTRA_CA_APP)

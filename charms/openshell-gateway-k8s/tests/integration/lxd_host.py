@@ -2,8 +2,8 @@
 
 These helpers enable HTTPS on the concierge host LXD (or use an LXD that already
 serves HTTPS, such as a MicroCloud, when ``OPENSHELL_TEST_LXD_ADDRESS`` names
-it), mint a self-signed client identity for ``lxd-integrator-k8s``, and read the
-server certificate/fingerprint.
+it), read the server certificate/fingerprint, and create the group and pending
+TLS identity whose trust token the gateway redeems.
 They are intentionally free of pytest imports so they can be used from both
 ``conftest.py`` fixtures and the provider-path test modules.
 """
@@ -11,7 +11,6 @@ They are intentionally free of pytest imports so they can be used from both
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import hashlib
 import json
 import logging
@@ -20,37 +19,37 @@ import socket
 import ssl
 import subprocess
 import time
-from pathlib import Path
 from typing import Any
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
 class HostLxdEndpoint:
-    """Connection details for the concierge host LXD used by the integrator path."""
+    """Connection details for the host LXD the gateway joins."""
 
     address: str
     server_fingerprint: str
     server_cert_pem: str
-    client_cert_pem: str
-    client_key_pem: str
     host_runner: Any
-    integrator_cert_fingerprint: str
 
 
 def host_lxc_runner(*args: str) -> Any:
-    """Run an ``lxc`` command on the host and return the completed process."""
+    """Run an ``lxc`` command on the host and return the completed process.
+
+    stdin is always ``/dev/null``: ``lxc auth identity create`` with no
+    certificate path reads one from stdin whenever stdin is not a terminal,
+    and would otherwise wait on it forever.
+    """
     return subprocess.run(
         ["lxc", *args],
         capture_output=True,
         text=True,
         check=False,
+        stdin=subprocess.DEVNULL,
     )
 
 
@@ -58,34 +57,6 @@ def read_lxd_config(key: str) -> str:
     """Return the current value of an LXD server configuration key."""
     result = host_lxc_runner("config", "get", key)
     return result.stdout.strip()
-
-
-def generate_integrator_client_credentials() -> tuple[str, str, str]:
-    """Generate a self-signed client certificate for the integrator.
-
-    Returns ``(cert_pem, key_pem, fingerprint)``.
-    """
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "openshell-integrator")])
-    now = datetime.datetime.now(datetime.UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=1))
-        .sign(key, hashes.SHA256())
-    )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
-    key_pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode()
-    fingerprint = hashlib.sha256(cert.public_bytes(serialization.Encoding.DER)).hexdigest()
-    return cert_pem, key_pem, fingerprint
 
 
 def fetch_server_cert(address: str) -> tuple[str, str]:
@@ -237,11 +208,10 @@ def external_lxd_address() -> str | None:
 
 
 def setup_host_lxd_endpoint() -> HostLxdEndpoint:
-    """Enable HTTPS on the host LXD, trust an integrator identity, and return details.
+    """Enable HTTPS on the host LXD and return its connection details.
 
     With ``OPENSHELL_TEST_LXD_ADDRESS`` set, the LXD is someone else's, for
-    example a MicroCloud: its listener is left alone, and the given address
-    is the one the integrator is pointed at.
+    example a MicroCloud: its listener is left alone.
     """
     host_address = external_lxd_address()
     if host_address is None:
@@ -253,21 +223,6 @@ def setup_host_lxd_endpoint() -> HostLxdEndpoint:
         # Allow the listener a moment to come up.
         time.sleep(2)
 
-    client_cert_pem, client_key_pem, integrator_fingerprint = (
-        generate_integrator_client_credentials()
-    )
-
-    cert_file = Path("/tmp") / f"openshell-integrator-{os.getpid()}.crt"
-    cert_file.write_text(client_cert_pem)
-    try:
-        result = host_lxc_runner("config", "trust", "add", str(cert_file))
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"could not add integrator client cert to host LXD: {result.stderr}"
-            )
-    finally:
-        cert_file.unlink(missing_ok=True)
-
     address = f"https://{host_address}"
     server_cert_pem, server_fingerprint = fetch_server_cert(address)
 
@@ -275,16 +230,12 @@ def setup_host_lxd_endpoint() -> HostLxdEndpoint:
         address=address,
         server_fingerprint=server_fingerprint,
         server_cert_pem=server_cert_pem,
-        client_cert_pem=client_cert_pem,
-        client_key_pem=client_key_pem,
         host_runner=host_lxc_runner,
-        integrator_cert_fingerprint=integrator_fingerprint,
     )
 
 
-def teardown_host_lxd_endpoint(endpoint: HostLxdEndpoint, prior_address: str | None) -> None:
-    """Remove the integrator identity and restore the HTTPS listener setting."""
-    host_lxc_runner("config", "trust", "remove", endpoint.integrator_cert_fingerprint)
+def teardown_host_lxd_endpoint(prior_address: str | None) -> None:
+    """Restore the HTTPS listener setting, unless the LXD is an external one."""
     if external_lxd_address() is not None:
         # The listener was never touched.
         return
@@ -292,3 +243,68 @@ def teardown_host_lxd_endpoint(endpoint: HostLxdEndpoint, prior_address: str | N
         host_lxc_runner("config", "set", "core.https_address", prior_address)
     else:
         host_lxc_runner("config", "unset", "core.https_address")
+
+
+def ensure_join_group(runner: Any, group: str, project: str) -> None:
+    """Ensure *group* grants ``operator`` on *project*, and sight of its shared network.
+
+    ``ensure_lxd_project`` gives the project no networks of its own: its
+    sandboxes use the ``default`` project's network, which the driver looks up
+    before every create. LXD allows viewing that network only together with
+    viewing the ``default`` project, which does not show its instances. A
+    production project has its own network instead; see the deploy guide.
+    """
+    network = (_profile_devices(runner, "default").get("eth0") or {}).get("network", "")
+    grants = [("project", project, "operator"), ("project", "default", "can_view")]
+    if network:
+        grants.append(("network", network, "can_view", "project=default"))
+
+    result = runner("auth", "group", "create", group)
+    if result.returncode != 0 and "already exists" not in (result.stderr or ""):
+        raise RuntimeError(f"could not create LXD group {group}: {result.stderr}")
+    for grant in grants:
+        result = runner("auth", "group", "permission", "add", group, *grant)
+        if result.returncode != 0 and "already" not in (result.stderr or ""):
+            raise RuntimeError(f"could not grant {group} {' '.join(grant)}: {result.stderr}")
+
+
+def create_pending_identity(runner: Any, name: str, group: str) -> str:
+    """Create the pending TLS identity *name* in *group* and return its trust token.
+
+    An identity left over from an earlier run is deleted first, whether it is
+    still pending or was redeemed, so the token is always fresh.
+    """
+    delete_identity(runner, name)
+    result = runner("auth", "identity", "create", f"tls/{name}", "--group", group)
+    if result.returncode != 0:
+        raise RuntimeError(f"could not create LXD identity {name}: {result.stderr}")
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError(f"lxc printed no trust token for identity {name}")
+    return lines[-1]
+
+
+def delete_identity(runner: Any, name: str) -> None:
+    """Delete the TLS identity *name*, pending or not, if it exists."""
+    runner("auth", "identity", "delete", f"tls/{name}")
+
+
+def delete_group(runner: Any, group: str) -> None:
+    """Delete the LXD group *group* if it exists."""
+    runner("auth", "group", "delete", group)
+
+
+def lxd_identity(runner: Any, name: str) -> dict[str, Any]:
+    """Return the TLS identity called *name* from ``lxc auth identity list``, or ``{}``.
+
+    A pending identity's ``type`` ends in ``(pending)`` and its ``id`` is a
+    UUID; once redeemed, ``id`` is the SHA-256 fingerprint of the certificate
+    that redeemed it.
+    """
+    result = runner("auth", "identity", "list", "--format=json")
+    if result.returncode != 0:
+        raise RuntimeError(f"could not list LXD identities: {result.stderr}")
+    for entry in json.loads(result.stdout or "[]"):
+        if entry.get("authentication_method") == "tls" and entry.get("name") == name:
+            return entry
+    return {}

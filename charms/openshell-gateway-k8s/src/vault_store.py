@@ -34,6 +34,15 @@ JWT_SECRET_PATH = "gateway-jwt"
 # stores are interchangeable and migration is a straight copy.
 KEYPAIR_KEYS = ("signing-key", "public-key", "kid")
 
+# Bound every Vault request well below Juju's action wait. The charm reads the
+# keypair from Vault at the end of every hook (status evaluation), so a Vault
+# that is sealed, being reconfigured, or briefly unreachable during relation
+# churn must surface as ``VaultUnavailableError`` and let the charm wait on the
+# next event. hvac's 30s-per-request default lets a single login-plus-read hold
+# a hook open for a minute, which is exactly the action wait an operator (or a
+# removal hook's queued action) is blocked on.
+VAULT_TIMEOUT_SECONDS = 10
+
 
 class VaultUnavailableError(Exception):
     """Raised when Vault is related and ready but the call did not get through.
@@ -251,7 +260,7 @@ class VaultJwtStore(ops.Object):
 
         import hvac  # imported lazily: only a Vault-related charm needs it
 
-        client = hvac.Client(url=url, verify=str(ca_file))
+        client = hvac.Client(url=url, verify=str(ca_file), timeout=VAULT_TIMEOUT_SECONDS)
         login = client.auth.approle.login(
             role_id=role_id, secret_id=role_secret_id, use_token=False
         )

@@ -3,8 +3,7 @@ testpaths = ["tests/unit"]
 addopts = "--tb=short"
 pythonpath = ["src", "lib"]
 markers = [
-    "integrator: tests for the lxd-integrator-k8s provider path",
-    "offer: tests for the cross-model lxd charm offer provider path",
+    "lxd: tests that need the gateway joined to an LXD with a trust token",
     "observability: tests for the opentelemetry-collector-k8s metrics path",
     "vault: tests for the vault-k8s credentials store",
     "scale: tests for multi-unit scale and rolling operations",

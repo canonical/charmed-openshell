@@ -69,9 +69,18 @@ server key.
 What the gateway can do in LXD
 ------------------------------
 
-The integrator registers the gateway's LXD client certificate restricted to
-the sandbox project, so LXD refuses the gateway anything outside it. Inside
-the project, the gateway can do whatever the project allows. In an
+The gateway is an LXD TLS identity in a group that the LXD administrator
+creates, and the group's permissions are all it has. The deploy guide grants
+the group ``operator`` on the sandbox project and nothing else, so LXD
+refuses the gateway anything outside that project, and does not even show it
+the other projects. Inside the project, the gateway can do whatever the
+project allows.
+
+That holds only for a project with ``features.networks=true``. A project
+without it shares the ``default`` project's networks and network ACLs, and
+LXD then lets an identity with ``operator`` on the project change and delete
+the ``default`` project's network ACLs, which other instances may rely on.
+The deploy guide creates the project with its own networks for this reason. In an
 unrestricted project that includes creating a privileged container or
 attaching the host's root file system, which amounts to control of the
 host. The deploy guide therefore sets ``restricted=true`` on the project,
@@ -95,12 +104,19 @@ policies <https://docs.nvidia.com/openshell/v0.0.116/sandboxes/policies>`_.
 Where credentials live
 ----------------------
 
-LXD credentials
-    ``lxd-integrator-k8s`` reads an LXD administrator credential from a Juju
-    secret that the operator creates. It needs one: adding and removing
-    trust entries is an administrator's operation in LXD. The Terraform
-    modules take the secret's URI, never the key, so the key does not end
-    up in Terraform state.
+The gateway's LXD credential
+    The charm generates the client certificate and its private key, and
+    keeps them in a Juju application secret shared by every gateway unit.
+    The key never leaves the charm. No LXD administrator credential is
+    stored anywhere in the deployment.
+
+The LXD trust token
+    A Juju user secret that the operator creates and grants to the gateway.
+    The token can be redeemed once, and only until it expires, so after the
+    charm has redeemed it, it grants nothing. Until then, anyone who holds it
+    can join LXD as the gateway's identity. The Terraform modules take the
+    secret's URI, never the token, so the token does not end up in Terraform
+    state.
 
 The token-signing key
     A Juju application secret, shared by every gateway unit. Relating

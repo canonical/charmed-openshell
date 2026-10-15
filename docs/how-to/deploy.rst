@@ -23,7 +23,7 @@ Prerequisites
 - A `MicroCloud <https://canonical.com/microcloud>`_ cluster with OVN
   networking, that is, with an uplink network (``UPLINK`` by default) and a
   storage pool (``local`` by default).
-- Shell access to a MicroCloud member, with ``jq`` and ``openssl``.
+- Shell access to a MicroCloud member.
 
 Plan the network
 ----------------
@@ -181,9 +181,13 @@ The driver creates sandboxes in one LXD project and takes their network and
 storage pool from the project's ``default`` profile. The network has to be
 an OVN network for sandbox egress restriction to work.
 
-Create the project with ``features.networks=true``, so that it can hold a
-network of its own; without it, ``lxc network create --project`` creates the
-network in the ``default`` project instead. On a MicroCloud member:
+Create the project with ``features.networks=true``, so that it holds its
+own networks and network ACLs. The gateway's identity can use only a network
+that lives in its project. Without the feature, the project shares the
+``default`` project's networks and network ACLs, and the gateway's identity
+can then change or delete ACLs that other instances rely on, while
+``lxc network create --project`` creates the network in the ``default``
+project instead. On a MicroCloud member:
 
 .. code-block:: bash
 
@@ -200,8 +204,8 @@ to the project:
 
     lxc network list --project openshell
 
-Then restrict the project. The gateway's LXD certificate is limited to this
-project, and these restrictions limit what it can do inside it. Without
+Then restrict the project. The gateway's LXD identity reaches this project
+only, and these restrictions limit what it can do inside it. Without
 them, anything that can create an instance in the project can create a
 privileged container or attach the host's root file system:
 
@@ -225,45 +229,40 @@ network. The driver uses neither snapshots nor backups.
 Sandbox images are OCI references that the driver pulls and converts on
 first use, so the project needs no images of its own.
 
-Create the integrator's client certificate
--------------------------------------------
+Create the gateway's LXD identity
+---------------------------------
 
-The integrator authenticates to the MicroCloud with a client certificate of
-its own, and verifies the MicroCloud's server certificate. It uses its
-certificate to add the gateway's certificate to LXD's trust store,
-restricted to the ``openshell`` project, and to remove it again.
-
-That makes the integrator's certificate an LXD administrator credential.
-LXD has no narrower permission for managing trust entries: a certificate
-restricted to a project cannot add any, and an identity allowed to create
-them can create unrestricted ones. Keep it only in the Juju secret below.
-
-On a MicroCloud member, create the certificate, fetch the server's, and hand
-both to the admin VM:
+The gateway authenticates to the MicroCloud as an LXD TLS identity of its
+own. Its permissions come from the groups it belongs to, so create a group
+that can operate the ``openshell`` project and nothing else, and a pending
+identity in it. On a MicroCloud member:
 
 .. code-block:: bash
 
-    openssl req -x509 -newkey rsa:4096 -keyout lxd-client.key -out lxd-client.crt \
-      -days 365 -nodes -subj "/CN=lxd-integrator-k8s"
-    lxc config trust add lxd-client.crt --name lxd-integrator-k8s
-    lxc query /1.0 | jq -r '.environment.certificate' > lxd-server.crt
-    lxc query /1.0 | jq -r '.environment.addresses[0]'
-    for f in lxd-client.crt lxd-client.key lxd-server.crt; do
-      lxc file push --uid 1000 --gid 1000 --mode 0600 "$f" openshell-admin/home/ubuntu/
-    done
+    lxc auth group create openshell-gateway
+    lxc auth group permission add openshell-gateway project openshell operator
+    lxc auth identity create tls/openshell-gateway --group openshell-gateway --quiet > lxd-join.token
+    lxc file push --uid 1000 --gid 1000 --mode 0600 lxd-join.token openshell-admin/home/ubuntu/
+    rm lxd-join.token
 
-The ``addresses`` query prints the MicroCloud's API address, for example
-``192.168.1.166:8443``; the integrator's ``lxd-endpoints`` below takes it.
-The client key is an administrative LXD credential: remove the local copies
-once the secret below holds them.
+The identity has no certificate yet. LXD prints a trust token for it
+instead, which the gateway redeems with a client certificate it generates
+itself, so the certificate's private key never leaves the charm and the
+deployment holds no LXD administrator credential. The token also carries the
+MicroCloud's API addresses and the fingerprint of its server certificate,
+which is how the gateway finds and verifies it.
+
+The token works once, and only until it expires. Until the gateway has
+redeemed it, anyone holding it can join LXD as the gateway: keep it only in
+the Juju secret below.
 
 Create the gateway's model
 --------------------------
 
-The LXD credentials secret has to exist before the stack is applied, because
-its URI is part of the integrator's configuration, and a Juju secret lives
-in a model. In the admin VM, create the ``openshell`` model yourself and hand
-it to the stack by UUID:
+The token's secret has to exist before the stack is applied, because its URI
+is part of the gateway's configuration, and a Juju secret lives in a model.
+In the admin VM, create the ``openshell`` model yourself and hand it to the
+stack by UUID:
 
 .. code-block:: bash
 
@@ -273,19 +272,17 @@ it to the stack by UUID:
 Keep the UUID for the Terraform configuration below. The stack creates the
 ``iam``, ``core`` and ``cos-lite`` models itself.
 
-Store the LXD credentials in a Juju secret
-------------------------------------------
+Store the trust token in a Juju secret
+--------------------------------------
 
-The integrator reads the client certificate, its key, and the server
-certificate from a Juju secret, not from Terraform state. In the admin VM:
+The gateway reads the token from a Juju secret, not from Terraform state. In
+the admin VM:
 
 .. code-block:: bash
 
     cd ~
-    juju add-secret lxd-credentials -m openshell \
-      client-cert#file=lxd-client.crt \
-      client-key#file=lxd-client.key \
-      server-cert#file=lxd-server.crt
+    juju add-secret lxd-join -m openshell token#file=lxd-join.token
+    rm lxd-join.token
 
 The command prints the secret's URI (for example, ``secret:d6mlp2o0p26r50dt2sd0``);
 keep it for the Terraform configuration below.
@@ -360,20 +357,16 @@ In the admin VM, create a working directory and a ``main.tf`` that calls the
           }
         }
 
-        integrator = {
-          channel = "latest/edge"
-          config = {
-            "lxd-endpoints"   = "192.168.1.166:8443"
-            "lxd-credentials" = "secret:d6mlp2o0p26r50dt2sd0"
-            "project"         = "openshell"
-          }
+        # The trust token's secret and the project its identity can reach.
+        lxd = {
+          join_secret = "secret:d6mlp2o0p26r50dt2sd0"
+          project     = "openshell"
         }
       }
     }
 
-Replace ``<openshell-model-uuid>``, the planned addresses, ``lxd-endpoints``
-(the MicroCloud API address printed earlier) and ``lxd-credentials`` with the
-values from the previous steps.
+Replace ``<openshell-model-uuid>``, the planned addresses and
+``join_secret`` with the values from the previous steps.
 
 Set both images as shown until the charm's ``latest/edge`` revision
 ships them as its defaults. The revision published today bundles an
@@ -400,16 +393,17 @@ every application into them and into ``openshell``.
 Grant the secret
 ----------------
 
-In the admin VM, grant the integrator access to the secret you created
+In the admin VM, grant the gateway access to the secret you created
 earlier:
 
 .. code-block:: bash
 
-    juju grant-secret lxd-credentials lxd-integrator-k8s -m openshell
+    juju grant-secret lxd-join openshell-gateway-k8s -m openshell
 
-The integrator reads the secret at its next ``update-status`` hook, and
-stays blocked with ``exactly one of server-cert or lxd-server-fingerprint
-must be set`` until then. Allow up to 15 minutes on a fresh deployment.
+The gateway reads the secret at its next ``update-status`` hook, and stays
+blocked with ``cannot read lxd-join-secret; grant it to this application``
+until then. Allow up to 15 minutes on a fresh deployment. Its leader then
+redeems the token.
 
 Watch the deployment converge across all four models:
 
@@ -437,6 +431,7 @@ In the result:
 
 - ``workload-checks`` should read ``driver-ready=up, gateway-ready=up``.
 - ``lxd-project`` should read ``openshell``.
+- ``lxd-url`` should name the MicroCloud's API address.
 - ``sandbox-egress-restricted`` should read ``True``.
 - ``gateway-endpoint`` should name ``external_hostname`` on port 8443.
 
@@ -446,6 +441,11 @@ If a check is ``down``, read the workload's logs from a MicroCloud member:
 
     lxc exec k8s-vm -- k8s kubectl -n openshell exec openshell-gateway-k8s-0 -c gateway -- pebble logs -n 20
 
+A gateway blocked with ``cannot join LXD`` could not redeem the token: the
+message says whether it could not reach any of the token's addresses or
+LXD refused the token, for example because it expired or was already used.
+To issue a new one, see :ref:`how-to-deploy-join-lxd-again`.
+
 ``OIDC discovery request failed`` means the pods cannot reach
 ``identity_hostname``. A ``driver-lxd`` error about the project's
 ``default`` profile means the profile lacks the network or root disk from
@@ -453,3 +453,39 @@ If a check is ``down``, read the workload's logs from a MicroCloud member:
 
 To create a first sandbox, connect the CLI as described in
 :ref:`how-to-connect-with-openshell-snap`.
+
+.. _how-to-deploy-join-lxd-again:
+
+Join LXD again
+--------------
+
+The gateway keeps its LXD identity for good once it has redeemed the token.
+It needs a new token only when the token expired before the gateway redeemed
+it, or when the identity was deleted in LXD. On a MicroCloud member, replace
+the pending or deleted identity and print a new token:
+
+.. code-block:: bash
+
+    lxc auth identity delete tls/openshell-gateway
+    lxc auth identity create tls/openshell-gateway --group openshell-gateway --quiet > lxd-join.token
+    lxc file push --uid 1000 --gid 1000 --mode 0600 lxd-join.token openshell-admin/home/ubuntu/
+    rm lxd-join.token
+
+Skip the ``delete`` when the identity no longer exists. Then, in the admin
+VM, put the new token in the secret:
+
+.. code-block:: bash
+
+    juju update-secret lxd-join -m openshell token#file=lxd-join.token
+    rm lxd-join.token
+
+The leader redeems a new token as soon as the secret changes. While the
+gateway's identity is still trusted, it does not redeem a new token at all:
+it keeps the identity it has, and the new token stays pending in LXD until
+you delete it.
+
+The gateway only counts itself as joined when LXD trusts its certificate as
+the token's identity. If LXD trusts the certificate some other way, for
+example through an ``lxc config trust add`` entry, the gateway stays blocked
+with ``cannot join LXD: LXD already trusts this certificate``: remove that
+entry, and it redeems the token.

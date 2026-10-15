@@ -16,7 +16,7 @@ from .helpers import (
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.integrator, pytest.mark.scale]
+pytestmark = [pytest.mark.lxd, pytest.mark.scale]
 
 
 class TestScaleAndRollingOps:
@@ -25,7 +25,7 @@ class TestScaleAndRollingOps:
     def test_rolling_restart_across_units(
         self,
         juju: jubilant.Juju,
-        integrator_provider: None,
+        lxd_joined: None,
     ) -> None:
         """Adding a unit and triggering a rolling restart coordinates across units."""
         status = juju.status()

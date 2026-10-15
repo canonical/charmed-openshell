@@ -14,28 +14,6 @@ module "gateway" {
   resources   = var.gateway.resources
 }
 
-# Declared directly rather than through the integrator repository's own
-# Terraform module: a module `source` must be a literal, so pointing it at a
-# local checkout or an unreleased ref would mean editing this file rather than
-# passing a variable. The charm's interface is one relation, so there is little
-# the module would add here.
-
-resource "juju_application" "integrator" {
-  model_uuid = local.model_uuid
-  name       = var.integrator.app_name
-  units      = local.units.integrator
-
-  charm {
-    name     = "lxd-integrator-k8s"
-    channel  = local.channels.integrator
-    revision = var.integrator.revision
-    base     = var.integrator.base
-  }
-
-  constraints = var.integrator.constraints
-  config      = var.integrator.config
-}
-
 # -------------- # Persistence -------------- #
 
 # Only the gateway's own database. Identity lives in the Canonical Identity

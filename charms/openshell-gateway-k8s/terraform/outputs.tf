@@ -19,7 +19,6 @@ output "requires" {
     certificates    = "certificates"
     oauth           = "oauth"
     ingress         = "ingress"
-    lxd             = "lxd"
     vault_kv        = "vault-kv"
     receive_ca_cert = "receive-ca-cert"
   }

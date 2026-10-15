@@ -27,7 +27,7 @@ from .helpers import (
 
 logger = logging.getLogger(__name__)
 
-pytestmark = [pytest.mark.observability, pytest.mark.integrator]
+pytestmark = [pytest.mark.observability, pytest.mark.lxd]
 
 COLLECTOR_APP = "opentelemetry-collector-k8s"
 PROMETHEUS_APP = "prometheus-k8s"
@@ -38,7 +38,7 @@ METRICS_PORT = 9090
 @pytest.fixture(scope="module", autouse=True)
 def _observability_stack(
     juju: jubilant.Juju,
-    integrator_provider: None,
+    lxd_joined: None,
 ) -> None:
     """Bring the gateway to active, then deploy the collector, prometheus, and grafana."""
     juju.deploy(COLLECTOR_APP, channel="2/stable", trust=True)

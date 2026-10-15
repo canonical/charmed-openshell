@@ -86,7 +86,6 @@ preconfigured
 venv
 rtd
 dotfile
-integrator('s)?
 kubeconfig
 NICs?
 passthrough

@@ -102,26 +102,6 @@ resource "juju_integration" "certificates" {
   }
 }
 
-# -------------- # LXD compute -------------- #
-
-# The integrator also decides which LXD project the gateway's sandboxes are
-# created in, and restricts the gateway's trust entry to it. That is set on the
-# integrator's `project` config, not on the gateway.
-
-resource "juju_integration" "gateway_lxd" {
-  model_uuid = local.model_uuid
-
-  application {
-    name     = module.gateway.app_name
-    endpoint = module.gateway.requires.lxd
-  }
-
-  application {
-    name     = juju_application.integrator.name
-    endpoint = "https"
-  }
-}
-
 # -------------- # Optional: credentials store -------------- #
 
 resource "juju_integration" "gateway_vault" {
