@@ -69,10 +69,26 @@ jobs:
         working-directory: charms/openshell-gateway-k8s
 
   build-charm:
-    name: Build charm
-    runs-on: ubuntu-24.04
+    name: Build charm (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     needs: [lint, unit, static]
     timeout-minutes: 60
+    env:
+      CHARM_PATH: charms/openshell-gateway-k8s
+    strategy:
+      # Let both legs finish: when only one architecture breaks, the run should
+      # still report whether the other one builds.
+      fail-fast: false
+      matrix:
+        # charmcraft packs only for the architecture it runs on, so each one
+        # needs its own runner; the artifact is named after it for the
+        # downloaders below.
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -80,13 +96,27 @@ jobs:
       - name: Pack charm
         uses: canonical/craft-actions/charmcraft/pack@39a1fa1fd30fb8bef5abb80a24f3a06ad6261d17
         with:
-          path: charms/openshell-gateway-k8s
+          path: ${{ env.CHARM_PATH }}
+
+      # charmcraft names the file after the base and the architecture it packed,
+      # so a name without the runner's architecture means it packed the other one.
+      # The upload takes this file, not a glob, so only the checked charm ships.
+      - name: Check the packed charm is named for the runner architecture
+        id: packed
+        run: |
+          charm="$(find "$CHARM_PATH" -maxdepth 1 -name "*-${{ matrix.arch }}.charm" -print -quit)"
+          if [ -z "$charm" ]; then
+            echo "ERROR: no *-${{ matrix.arch }}.charm was packed"
+            exit 1
+          fi
+          echo "Packed $charm"
+          echo "path=$charm" >> "$GITHUB_OUTPUT"
 
       - name: Upload charm artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: charm
-          path: charms/openshell-gateway-k8s/*.charm
+          name: charm-${{ matrix.arch }}
+          path: ${{ steps.packed.outputs.path }}
           if-no-files-found: error
 
   # The LXD suite creates sandboxes, and the driver refuses to create
@@ -106,6 +136,9 @@ jobs:
       VM_CPU: "8"
       VM_MEMORY: 16GiB
       VM_DISK: 80GiB
+      # The suite runs on the amd64 self-hosted runner, so it consumes the
+      # amd64 charm; there is no arm64 runner to run it on.
+      CHARM_ARCH: amd64
     permissions:
       contents: read
     steps:
@@ -139,7 +172,7 @@ jobs:
       - name: Download charm artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.9
         with:
-          name: charm
+          name: charm-${{ env.CHARM_ARCH }}
           path: artifacts/charm
 
       - name: Set up MicroCloud
